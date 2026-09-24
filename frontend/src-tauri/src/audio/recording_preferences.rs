@@ -23,6 +23,13 @@ pub struct RecordingPreferences {
     #[cfg(target_os = "macos")]
     #[serde(default)]
     pub system_audio_backend: Option<String>,
+    /// Identify speakers automatically after a recording or import (needs the models).
+    #[serde(default = "default_true")]
+    pub auto_identify_speakers: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for RecordingPreferences {
@@ -35,6 +42,7 @@ impl Default for RecordingPreferences {
             preferred_system_device: None,
             #[cfg(target_os = "macos")]
             system_audio_backend: Some("coreaudio".to_string()),
+            auto_identify_speakers: true,
         }
     }
 }

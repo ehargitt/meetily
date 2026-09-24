@@ -137,6 +137,11 @@ pub struct MeetingTranscript {
     pub audio_end_time: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<f64>,
+    // Diarized speaker ("S<n>"); names are resolved separately via api_get_meeting_speakers
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_overlap: Option<f64>,
 }
 
 /// Meeting metadata without transcripts (for pagination)
@@ -753,6 +758,12 @@ pub async fn api_delete_meeting<R: Runtime>(
         auth_token.is_some()
     );
 
+    // Stop a speaker identification job first; if its save still races the delete, the
+    // save fails on the meeting foreign key and reports `meeting_deleted`.
+    if crate::diarization::job::cancel(&meeting_id) {
+        log_info!("Cancelled speaker identification for deleted meeting {}", meeting_id);
+    }
+
     let pool = state.db_manager.pool();
 
     match MeetingsRepository::delete_meeting(pool, &meeting_id).await {
@@ -878,6 +889,8 @@ pub async fn api_get_meeting_transcripts<R: Runtime>(
                     audio_start_time: t.audio_start_time,
                     audio_end_time: t.audio_end_time,
                     duration: t.duration,
+                    speaker_key: t.speaker_key,
+                    speaker_overlap: t.speaker_overlap,
                 })
                 .collect::<Vec<_>>();
 

@@ -1,0 +1,733 @@
+//! SQL for speaker identification: speaker turns, per-meeting speakers, per-segment labels,
+//! identification job rows and the self voiceprint.
+//!
+//! Turns are stored in the audio *file* clock; they are mapped to the transcript clock only
+//! when segments are (re)labelled, so a retranscription can re-attach labels without
+//! re-running the models.
+
+use chrono::Utc;
+use meetily_diarization::assign::{assign_segments, SegmentSpan};
+use meetily_diarization::relabel::{parse_speaker_key, stable_keys, PreviousTurn};
+use meetily_diarization::timeline::TranscriptClock;
+use meetily_diarization::voiceprint::{self, SelfMatch, MIN_ENROLL_SECS};
+use meetily_diarization::{DiarizationOutput, SpeakerTurn};
+use serde::Serialize;
+use sqlx::{Sqlite, SqliteConnection, SqlitePool};
+use tracing::{info, warn};
+
+/// Speaker colours cycle through this many palette entries (`color_index = (n - 1) % 8`).
+const SPEAKER_PALETTE_SIZE: usize = 8;
+const SELF_PROFILE_NAME: &str = "Me";
+
+#[derive(Debug, thiserror::Error)]
+pub enum SpeakerRepoError {
+    /// A write hit a foreign key: the meeting was deleted while identification ran.
+    #[error("meeting was deleted")]
+    MeetingDeleted,
+    #[error("{0}")]
+    NotFound(String),
+    #[error("{0}")]
+    Invalid(String),
+    #[error("database error: {0}")]
+    Database(sqlx::Error),
+}
+
+impl From<sqlx::Error> for SpeakerRepoError {
+    fn from(error: sqlx::Error) -> Self {
+        // Every speaker table references meetings(id), and transcript rows cannot disappear
+        // inside our transaction, so a foreign key failure means the meeting is gone.
+        if let sqlx::Error::Database(db_error) = &error {
+            if db_error.is_foreign_key_violation() {
+                return Self::MeetingDeleted;
+            }
+        }
+        Self::Database(error)
+    }
+}
+
+/// A diarized speaker of one meeting, as shown to the frontend.
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
+pub struct MeetingSpeaker {
+    pub speaker_key: String,
+    pub display_name: Option<String>,
+    pub is_self: bool,
+    /// The voice resembles the stored self voiceprint, but not closely enough to label it
+    /// "Me" automatically; the UI offers "Is this you?".
+    pub suggested_self: bool,
+    pub color_index: i64,
+    pub segment_count: i64,
+    pub talk_time_seconds: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl JobStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+/// The last stored identification run of a meeting.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct SpeakerIdJobRow {
+    pub status: String,
+    pub speaker_count: Option<i64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SavedIdentification {
+    pub speaker_count: usize,
+    pub labeled_segments: usize,
+}
+
+const SELECT_MEETING_SPEAKERS: &str = "
+    SELECT ms.speaker_key, ms.display_name, ms.is_self, ms.suggested_self, ms.color_index,
+           (SELECT COUNT(*) FROM transcript_speakers ts
+             WHERE ts.meeting_id = ms.meeting_id AND ts.speaker_key = ms.speaker_key) AS segment_count,
+           ms.speech_seconds AS talk_time_seconds
+    FROM meeting_speakers ms
+    WHERE ms.meeting_id = ?";
+
+pub struct SpeakerRepository;
+
+impl SpeakerRepository {
+    /// Speakers of a meeting, ordered S1, S2, …
+    pub async fn get_meeting_speakers(
+        pool: &SqlitePool,
+        meeting_id: &str,
+    ) -> Result<Vec<MeetingSpeaker>, SpeakerRepoError> {
+        let query = format!(
+            "{SELECT_MEETING_SPEAKERS} ORDER BY CAST(SUBSTR(ms.speaker_key, 2) AS INTEGER)"
+        );
+        Ok(sqlx::query_as::<_, MeetingSpeaker>(&query)
+            .bind(meeting_id)
+            .fetch_all(pool)
+            .await?)
+    }
+
+    /// Store a diarization result in one transaction: stable keys against the previous run,
+    /// turns, speakers (keeping names and "Me" of keys that carry over), the self-voiceprint
+    /// match, segment labels, and a `completed` job row.
+    pub async fn save_result(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        output: &DiarizationOutput,
+        clock: TranscriptClock,
+    ) -> Result<SavedIdentification, SpeakerRepoError> {
+        let mut tx = pool.begin().await?;
+
+        let previous: Vec<PreviousTurn> = sqlx::query_as::<_, (String, f64, f64)>(
+            "SELECT speaker_key, start_time, end_time FROM speaker_turns
+             WHERE meeting_id = ? ORDER BY start_time",
+        )
+        .bind(meeting_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|(speaker_key, start, end)| PreviousTurn {
+            speaker_key,
+            start,
+            end,
+        })
+        .collect();
+
+        let speaker_count = output.centroids.len();
+        let keys = if speaker_count == 0 {
+            Vec::new()
+        } else {
+            stable_keys(&output.turns, speaker_count, &previous)
+        };
+
+        replace_turns(&mut tx, meeting_id, &output.turns, &keys).await?;
+        upsert_speakers(&mut tx, meeting_id, output, &keys).await?;
+        apply_self_match(&mut tx, meeting_id, output, &keys).await?;
+        let labeled_segments = label_transcripts(&mut tx, meeting_id, clock).await?;
+        record_job(
+            &mut *tx,
+            meeting_id,
+            JobStatus::Completed,
+            Some(output.model_id),
+            Some(speaker_count as i64),
+            None,
+        )
+        .await?;
+
+        tx.commit().await?;
+        info!(
+            "Saved speaker identification for {}: {} speakers, {} labelled segments",
+            meeting_id, speaker_count, labeled_segments
+        );
+        Ok(SavedIdentification {
+            speaker_count,
+            labeled_segments,
+        })
+    }
+
+    /// Re-attach segment labels from the stored turns, e.g. after retranscription replaced
+    /// every transcript row. Does nothing when the meeting has no turns.
+    pub async fn realign_meeting(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        clock: TranscriptClock,
+    ) -> Result<usize, SpeakerRepoError> {
+        let mut tx = pool.begin().await?;
+        let has_turns = sqlx::query("SELECT 1 FROM speaker_turns WHERE meeting_id = ? LIMIT 1")
+            .bind(meeting_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+        if !has_turns {
+            return Ok(0);
+        }
+        let labeled = label_transcripts(&mut tx, meeting_id, clock).await?;
+        tx.commit().await?;
+        info!(
+            "Realigned {} transcript segments to speakers for {}",
+            labeled, meeting_id
+        );
+        Ok(labeled)
+    }
+
+    /// Rename a speaker (`Some("")` resets to the default label) and/or mark it as the local
+    /// user. Marking "Me" clears it from the meeting's other speakers and, when the speaker has
+    /// at least [`MIN_ENROLL_SECS`] of speech, folds its voice into the self voiceprint.
+    pub async fn update_meeting_speaker(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        speaker_key: &str,
+        display_name: Option<&str>,
+        is_self: Option<bool>,
+    ) -> Result<MeetingSpeaker, SpeakerRepoError> {
+        let mut tx = pool.begin().await?;
+        let current = fetch_speaker(&mut tx, meeting_id, speaker_key).await?;
+        let now = Utc::now();
+
+        if let Some(name) = display_name {
+            let name = name.trim();
+            sqlx::query(
+                "UPDATE meeting_speakers SET display_name = ?, updated_at = ?
+                 WHERE meeting_id = ? AND speaker_key = ?",
+            )
+            .bind((!name.is_empty()).then_some(name))
+            .bind(now)
+            .bind(meeting_id)
+            .bind(speaker_key)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        match is_self {
+            Some(true) if !current.is_self => {
+                sqlx::query(
+                    "UPDATE meeting_speakers
+                     SET is_self = (speaker_key = ?), suggested_self = 0, updated_at = ?
+                     WHERE meeting_id = ?",
+                )
+                .bind(speaker_key)
+                .bind(now)
+                .bind(meeting_id)
+                .execute(&mut *tx)
+                .await?;
+                enroll_self_voiceprint(&mut tx, meeting_id, speaker_key).await?;
+            }
+            Some(false) => {
+                sqlx::query(
+                    "UPDATE meeting_speakers SET is_self = 0, updated_at = ?
+                     WHERE meeting_id = ? AND speaker_key = ?",
+                )
+                .bind(now)
+                .bind(meeting_id)
+                .bind(speaker_key)
+                .execute(&mut *tx)
+                .await?;
+            }
+            _ => {}
+        }
+
+        let updated = fetch_speaker(&mut tx, meeting_id, speaker_key).await?;
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    /// Fold `from_key` into `into_key`: its turns and segment labels move over, talk time is
+    /// recomputed from the merged turns, and `into_key` keeps its name (adopting `from_key`'s
+    /// only when it has none).
+    pub async fn merge_meeting_speakers(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        from_key: &str,
+        into_key: &str,
+    ) -> Result<(), SpeakerRepoError> {
+        if from_key == into_key {
+            return Err(SpeakerRepoError::Invalid(
+                "Cannot merge a speaker into itself".to_string(),
+            ));
+        }
+        let mut tx = pool.begin().await?;
+        let from = fetch_speaker(&mut tx, meeting_id, from_key).await?;
+        fetch_speaker(&mut tx, meeting_id, into_key).await?;
+
+        for table in ["speaker_turns", "transcript_speakers"] {
+            sqlx::query(&format!(
+                "UPDATE {table} SET speaker_key = ? WHERE meeting_id = ? AND speaker_key = ?"
+            ))
+            .bind(into_key)
+            .bind(meeting_id)
+            .bind(from_key)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let merged_turns: Vec<(f64, f64)> = sqlx::query_as(
+            "SELECT start_time, end_time FROM speaker_turns
+             WHERE meeting_id = ? AND speaker_key = ? ORDER BY start_time",
+        )
+        .bind(meeting_id)
+        .bind(into_key)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE meeting_speakers
+             SET display_name = COALESCE(display_name, ?),
+                 is_self = MAX(is_self, ?),
+                 suggested_self = MAX(suggested_self, ?),
+                 speech_seconds = ?,
+                 updated_at = ?
+             WHERE meeting_id = ? AND speaker_key = ?",
+        )
+        .bind(from.display_name)
+        .bind(from.is_self)
+        .bind(from.suggested_self)
+        .bind(union_length(&merged_turns))
+        .bind(Utc::now())
+        .bind(meeting_id)
+        .bind(into_key)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM meeting_speakers WHERE meeting_id = ? AND speaker_key = ?")
+            .bind(meeting_id)
+            .bind(from_key)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Delete the self voiceprint and the "Is this you?" suggestions derived from it.
+    /// Speakers already marked "Me" keep that label.
+    pub async fn delete_self_voiceprint(pool: &SqlitePool) -> Result<(), SpeakerRepoError> {
+        let mut tx = pool.begin().await?;
+        sqlx::query("DELETE FROM speaker_profiles WHERE is_self = 1")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE meeting_speakers SET suggested_self = 0 WHERE suggested_self = 1")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn get_job(
+        pool: &SqlitePool,
+        meeting_id: &str,
+    ) -> Result<Option<SpeakerIdJobRow>, SpeakerRepoError> {
+        Ok(sqlx::query_as::<_, SpeakerIdJobRow>(
+            "SELECT status, speaker_count, error FROM speaker_identification_jobs WHERE meeting_id = ?",
+        )
+        .bind(meeting_id)
+        .fetch_optional(pool)
+        .await?)
+    }
+
+    /// Record a non-completed job state (`completed` is written by [`Self::save_result`]).
+    pub async fn set_job_status(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        status: JobStatus,
+        error: Option<&str>,
+    ) -> Result<(), SpeakerRepoError> {
+        record_job(pool, meeting_id, status, None, None, error).await
+    }
+}
+
+async fn record_job<'e, E>(
+    executor: E,
+    meeting_id: &str,
+    status: JobStatus,
+    engine: Option<&str>,
+    speaker_count: Option<i64>,
+    error: Option<&str>,
+) -> Result<(), SpeakerRepoError>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let now = Utc::now();
+    sqlx::query(
+        "INSERT INTO speaker_identification_jobs
+             (meeting_id, status, engine, speaker_count, error, started_at, completed_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(meeting_id) DO UPDATE SET
+             status = excluded.status,
+             engine = COALESCE(excluded.engine, engine),
+             speaker_count = excluded.speaker_count,
+             error = excluded.error,
+             started_at = COALESCE(excluded.started_at, started_at),
+             completed_at = excluded.completed_at,
+             updated_at = excluded.updated_at",
+    )
+    .bind(meeting_id)
+    .bind(status.as_str())
+    .bind(engine)
+    .bind(speaker_count)
+    .bind(error)
+    .bind((status == JobStatus::Running).then_some(now))
+    .bind(status.is_terminal().then_some(now))
+    .bind(now)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+async fn fetch_speaker(
+    conn: &mut SqliteConnection,
+    meeting_id: &str,
+    speaker_key: &str,
+) -> Result<MeetingSpeaker, SpeakerRepoError> {
+    let query = format!("{SELECT_MEETING_SPEAKERS} AND ms.speaker_key = ?");
+    sqlx::query_as::<_, MeetingSpeaker>(&query)
+        .bind(meeting_id)
+        .bind(speaker_key)
+        .fetch_optional(conn)
+        .await?
+        .ok_or_else(|| {
+            SpeakerRepoError::NotFound(format!(
+                "Speaker {speaker_key} not found in meeting {meeting_id}"
+            ))
+        })
+}
+
+async fn replace_turns(
+    conn: &mut SqliteConnection,
+    meeting_id: &str,
+    turns: &[SpeakerTurn],
+    keys: &[String],
+) -> Result<(), SpeakerRepoError> {
+    sqlx::query("DELETE FROM speaker_turns WHERE meeting_id = ?")
+        .bind(meeting_id)
+        .execute(&mut *conn)
+        .await?;
+    for turn in turns {
+        sqlx::query(
+            "INSERT INTO speaker_turns (meeting_id, start_time, end_time, speaker_key)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(meeting_id)
+        .bind(turn.start)
+        .bind(turn.end)
+        .bind(&keys[turn.speaker])
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Insert or refresh one row per speaker, keeping `display_name` and `is_self` of keys that
+/// carried over from the previous run, and drop speakers that no longer appear.
+async fn upsert_speakers(
+    conn: &mut SqliteConnection,
+    meeting_id: &str,
+    output: &DiarizationOutput,
+    keys: &[String],
+) -> Result<(), SpeakerRepoError> {
+    let now = Utc::now();
+    for (index, key) in keys.iter().enumerate() {
+        let color_index = parse_speaker_key(key).map_or(0, |n| n % SPEAKER_PALETTE_SIZE) as i64;
+        sqlx::query(
+            "INSERT INTO meeting_speakers
+                 (meeting_id, speaker_key, color_index, speech_seconds, embedding,
+                  embedding_model, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(meeting_id, speaker_key) DO UPDATE SET
+                 color_index = excluded.color_index,
+                 speech_seconds = excluded.speech_seconds,
+                 embedding = excluded.embedding,
+                 embedding_model = excluded.embedding_model,
+                 suggested_self = 0,
+                 updated_at = excluded.updated_at",
+        )
+        .bind(meeting_id)
+        .bind(key)
+        .bind(color_index)
+        .bind(output.speech_secs[index])
+        .bind(voiceprint::to_blob(&output.centroids[index]))
+        .bind(output.model_id)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+    }
+
+    let existing: Vec<String> =
+        sqlx::query_scalar("SELECT speaker_key FROM meeting_speakers WHERE meeting_id = ?")
+            .bind(meeting_id)
+            .fetch_all(&mut *conn)
+            .await?;
+    for stale in existing.iter().filter(|key| !keys.contains(key)) {
+        sqlx::query("DELETE FROM meeting_speakers WHERE meeting_id = ? AND speaker_key = ?")
+            .bind(meeting_id)
+            .bind(stale)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+/// When no speaker of the meeting is marked "Me" yet, compare the speakers with the stored
+/// self voiceprint: a close match is labelled "Me", a weaker one becomes a suggestion.
+async fn apply_self_match(
+    conn: &mut SqliteConnection,
+    meeting_id: &str,
+    output: &DiarizationOutput,
+    keys: &[String],
+) -> Result<(), SpeakerRepoError> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let has_self =
+        sqlx::query("SELECT 1 FROM meeting_speakers WHERE meeting_id = ? AND is_self = 1")
+            .bind(meeting_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .is_some();
+    if has_self {
+        return Ok(());
+    }
+    let profile: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT embedding FROM speaker_profiles WHERE is_self = 1 AND embedding_model = ?",
+    )
+    .bind(output.model_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(profile) = profile.as_deref().and_then(voiceprint::from_blob) else {
+        return Ok(());
+    };
+
+    let (column, index) = match voiceprint::match_self(&output.centroids, &profile) {
+        SelfMatch::Auto(index) => ("is_self", index),
+        SelfMatch::Suggest(index) => ("suggested_self", index),
+        SelfMatch::None => return Ok(()),
+    };
+    sqlx::query(&format!(
+        "UPDATE meeting_speakers SET {column} = 1 WHERE meeting_id = ? AND speaker_key = ?"
+    ))
+    .bind(meeting_id)
+    .bind(&keys[index])
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Replace the meeting's segment labels from its stored turns. Turns are mapped from the
+/// file clock to `clock` first; segments without both times stay unlabelled.
+async fn label_transcripts(
+    conn: &mut SqliteConnection,
+    meeting_id: &str,
+    clock: TranscriptClock,
+) -> Result<usize, SpeakerRepoError> {
+    sqlx::query("DELETE FROM transcript_speakers WHERE meeting_id = ?")
+        .bind(meeting_id)
+        .execute(&mut *conn)
+        .await?;
+
+    let rows: Vec<(String, f64, f64)> = sqlx::query_as(
+        "SELECT speaker_key, start_time, end_time FROM speaker_turns
+         WHERE meeting_id = ? ORDER BY start_time",
+    )
+    .bind(meeting_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    // assign_segments works on speaker indices; index into the keys seen in the turns.
+    let mut keys: Vec<String> = Vec::new();
+    let turns: Vec<SpeakerTurn> = rows
+        .into_iter()
+        .map(|(key, start, end)| {
+            let speaker = keys.iter().position(|k| *k == key).unwrap_or_else(|| {
+                keys.push(key);
+                keys.len() - 1
+            });
+            SpeakerTurn {
+                start,
+                end,
+                speaker,
+            }
+        })
+        .collect();
+    let turns = clock.map_turns(&turns);
+
+    let segments: Vec<SegmentSpan> = sqlx::query_as::<_, (String, f64, f64)>(
+        "SELECT id, audio_start_time, audio_end_time FROM transcripts
+         WHERE meeting_id = ? AND audio_start_time IS NOT NULL AND audio_end_time IS NOT NULL",
+    )
+    .bind(meeting_id)
+    .fetch_all(&mut *conn)
+    .await?
+    .into_iter()
+    .map(|(transcript_id, start, end)| SegmentSpan {
+        transcript_id,
+        start,
+        end,
+    })
+    .collect();
+
+    let assignments = assign_segments(&segments, &turns);
+    for assignment in &assignments {
+        sqlx::query(
+            "INSERT INTO transcript_speakers (transcript_id, meeting_id, speaker_key, overlap)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(&assignment.transcript_id)
+        .bind(meeting_id)
+        .bind(&keys[assignment.speaker])
+        .bind(assignment.overlap)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(assignments.len())
+}
+
+/// Fold the chosen speaker's centroid into the self voiceprint (one profile at most). Speakers
+/// with too little speech are marked "Me" without enrolling.
+async fn enroll_self_voiceprint(
+    conn: &mut SqliteConnection,
+    meeting_id: &str,
+    speaker_key: &str,
+) -> Result<(), SpeakerRepoError> {
+    let (speech_seconds, embedding, embedding_model): (f64, Option<Vec<u8>>, Option<String>) =
+        sqlx::query_as(
+            "SELECT speech_seconds, embedding, embedding_model FROM meeting_speakers
+             WHERE meeting_id = ? AND speaker_key = ?",
+        )
+        .bind(meeting_id)
+        .bind(speaker_key)
+        .fetch_one(&mut *conn)
+        .await?;
+    if speech_seconds < MIN_ENROLL_SECS {
+        info!(
+            "Not enrolling voiceprint from {} ({:.1}s of speech < {}s)",
+            speaker_key, speech_seconds, MIN_ENROLL_SECS
+        );
+        return Ok(());
+    }
+    let (Some(centroid), Some(model)) = (
+        embedding.as_deref().and_then(voiceprint::from_blob),
+        embedding_model,
+    ) else {
+        warn!(
+            "Speaker {} of {} has no usable embedding; not enrolling",
+            speaker_key, meeting_id
+        );
+        return Ok(());
+    };
+
+    let existing: Option<(String, Vec<u8>, String, f64)> = sqlx::query_as(
+        "SELECT id, embedding, embedding_model, speech_seconds FROM speaker_profiles WHERE is_self = 1",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    // A profile from a different embedding model is not comparable; start over from this voice.
+    let previous = existing
+        .as_ref()
+        .filter(|(_, _, profile_model, _)| *profile_model == model)
+        .and_then(|(_, blob, _, secs)| voiceprint::from_blob(blob).map(|v| (v, *secs)));
+    let (profile, total_secs) = voiceprint::update_profile(
+        previous.as_ref().map(|(v, secs)| (v.as_slice(), *secs)),
+        &centroid,
+        speech_seconds,
+    );
+
+    let now = Utc::now();
+    match existing {
+        Some((id, ..)) => {
+            sqlx::query(
+                "UPDATE speaker_profiles
+                 SET embedding = ?, embedding_model = ?, speech_seconds = ?, updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(voiceprint::to_blob(&profile))
+            .bind(&model)
+            .bind(total_secs)
+            .bind(now)
+            .bind(id)
+            .execute(&mut *conn)
+            .await?;
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO speaker_profiles
+                     (id, display_name, is_self, embedding, embedding_model, speech_seconds,
+                      created_at, updated_at)
+                 VALUES (?, ?, 1, ?, ?, ?, ?, ?)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(SELF_PROFILE_NAME)
+            .bind(voiceprint::to_blob(&profile))
+            .bind(&model)
+            .bind(total_secs)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *conn)
+            .await?;
+        }
+    }
+    info!(
+        "Enrolled {:.1}s of speech into the self voiceprint",
+        speech_seconds
+    );
+    Ok(())
+}
+
+/// Total length covered by `(start, end)` intervals sorted by start; overlaps count once.
+fn union_length(sorted: &[(f64, f64)]) -> f64 {
+    let mut total = 0.0;
+    let mut current: Option<(f64, f64)> = None;
+    for &(start, end) in sorted {
+        current = match current {
+            Some((s, e)) if start <= e => Some((s, e.max(end))),
+            Some((s, e)) => {
+                total += e - s;
+                Some((start, end))
+            }
+            None => Some((start, end)),
+        };
+    }
+    total + current.map_or(0.0, |(s, e)| e - s)
+}
+
+#[cfg(test)]
+#[path = "speaker_tests.rs"]
+mod tests;

@@ -1,11 +1,13 @@
 use crate::api::TranscriptSegment;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use log::{debug, info};
 use once_cell::sync::Lazy;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
+
+use super::constants::AUDIO_EXTENSIONS;
 
 static ENGINE_LIFECYCLE_LOCK: Lazy<Arc<AsyncMutex<()>>> =
     Lazy::new(|| Arc::new(AsyncMutex::new(())));
@@ -44,6 +46,38 @@ pub(crate) async fn unload_engine_after_batch(use_parakeet: bool) {
             e.unload_model().await;
         }
     }
+}
+
+/// Find audio file in meeting folder
+/// Tries common names first, then scans for any file with an audio extension
+pub(crate) fn find_audio_file(folder: &Path) -> Result<PathBuf> {
+    let candidates = [
+        "audio.mp4", "audio.m4a", "audio.wav", "audio.mp3",
+        "audio.flac", "audio.ogg", "recording.mp4",
+        "audio.mkv", "audio.webm", "audio.wma",
+    ];
+
+    for name in candidates {
+        let path = folder.join(name);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    // Fallback: scan folder for any file with an audio extension
+    if let Ok(entries) = std::fs::read_dir(folder) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(ext) = path.extension() {
+                let ext = ext.to_string_lossy().to_lowercase();
+                if AUDIO_EXTENSIONS.contains(&ext.as_str()) {
+                    return Ok(path);
+                }
+            }
+        }
+    }
+
+    Err(anyhow!("No audio file found in: {}", folder.display()))
 }
 
 /// Create transcript segments from transcription results.
@@ -232,5 +266,66 @@ mod tests {
 
         acquired_rx.await.unwrap();
         waiter.await.unwrap();
+    }
+
+    #[test]
+    fn test_find_audio_file_common_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // No audio file → error
+        assert!(find_audio_file(dir.path()).is_err());
+
+        // Create audio.mp4 — should be found first
+        std::fs::write(dir.path().join("audio.mp4"), b"fake").unwrap();
+        let found = find_audio_file(dir.path()).unwrap();
+        assert_eq!(found.file_name().unwrap(), "audio.mp4");
+    }
+
+    #[test]
+    fn test_find_audio_file_non_mp4_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create audio.wav (imported as .wav, not .mp4)
+        std::fs::write(dir.path().join("audio.wav"), b"fake").unwrap();
+        let found = find_audio_file(dir.path()).unwrap();
+        assert_eq!(found.file_name().unwrap(), "audio.wav");
+    }
+
+    #[test]
+    fn test_find_audio_file_fallback_scan() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create a file with an audio extension but non-standard name
+        std::fs::write(dir.path().join("my_recording.flac"), b"fake").unwrap();
+        // Also add a non-audio file that should be ignored
+        std::fs::write(dir.path().join("notes.txt"), b"text").unwrap();
+
+        let found = find_audio_file(dir.path()).unwrap();
+        assert_eq!(found.file_name().unwrap(), "my_recording.flac");
+    }
+
+    #[test]
+    fn test_find_audio_file_priority_order() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create both audio.m4a and audio.mp4 — mp4 should win (listed first in candidates)
+        std::fs::write(dir.path().join("audio.m4a"), b"fake").unwrap();
+        std::fs::write(dir.path().join("audio.mp4"), b"fake").unwrap();
+        let found = find_audio_file(dir.path()).unwrap();
+        assert_eq!(found.file_name().unwrap(), "audio.mp4");
+    }
+
+    #[test]
+    fn test_find_audio_file_empty_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = find_audio_file(dir.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No audio file found"));
+    }
+
+    #[test]
+    fn test_find_audio_file_nonexistent_folder() {
+        let result = find_audio_file(Path::new("/nonexistent/path/12345"));
+        assert!(result.is_err());
     }
 }

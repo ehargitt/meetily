@@ -294,6 +294,7 @@ pub async fn start_import<R: Runtime>(
                     "duration_seconds": res.duration_seconds
                 }),
             );
+            crate::diarization::job::maybe_start_auto(&app, &res.meeting_id).await;
         }
         Err(e) => {
             let _ = app.emit(
