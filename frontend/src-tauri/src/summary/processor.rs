@@ -724,8 +724,9 @@ mod tests {
 
         assert_eq!(chunks.len(), 3, "{chunks:?}");
         assert!(chunks[1].starts_with("[00:02] B: "), "{chunks:?}");
-        // Here the overlap point lies inside the "[00:02]" line, so the chunk starts on it.
-        assert!(chunks[2].starts_with("[00:02] B: ") || chunks[2].starts_with("[00:03] C: "), "{chunks:?}");
+        // Chunk 1 cannot end on a line break past the overlap, so it is cut mid-line inside the
+        // "[00:03]" line; the overlap point lies in that line, so chunk 2 starts on it.
+        assert_eq!(chunks[2], format!("[00:03] C: {}", "y".repeat(40)), "{chunks:?}");
     }
 
     #[test]

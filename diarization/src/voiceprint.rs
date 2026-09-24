@@ -56,26 +56,6 @@ pub fn match_self(centroids: &[Vec<f32>], profile: &[f32]) -> SelfMatch {
     }
 }
 
-/// Fold a centroid into the profile as a speech-seconds-weighted running mean, L2-normalised.
-/// Returns the new profile and its accumulated speech seconds. A profile of another dimension
-/// (another model) is replaced by the centroid.
-pub fn update_profile(profile: Option<(&[f32], f64)>, centroid: &[f32], speech_secs: f64) -> (Vec<f32>, f64) {
-    let (mut merged, total) = match profile {
-        Some((p, weight)) if p.len() == centroid.len() && weight + speech_secs > 0.0 => {
-            let total = weight + speech_secs;
-            let merged = p
-                .iter()
-                .zip(centroid)
-                .map(|(a, b)| ((*a as f64 * weight + *b as f64 * speech_secs) / total) as f32)
-                .collect();
-            (merged, total)
-        }
-        _ => (centroid.to_vec(), speech_secs),
-    };
-    l2_normalize(&mut merged);
-    (merged, total)
-}
-
 /// Build the profile from every enrolled `(centroid, speech_secs)`: the speech-seconds-weighted
 /// mean, L2-normalised, with the total speech seconds. Sources whose dimension differs from the
 /// first, or without speech, are ignored; `None` when nothing remains.
@@ -149,19 +129,6 @@ mod tests {
         assert_eq!(match_self(&[at(0.34), at(0.0)], &PROFILE), SelfMatch::None);
         assert_eq!(match_self(&[], &PROFILE), SelfMatch::None);
         assert_eq!(match_self(&[vec![1.0, 0.0]], &PROFILE), SelfMatch::None, "dimension mismatch");
-    }
-
-    #[test]
-    fn update_profile_is_weighted_mean_normalised() {
-        let (p, secs) = update_profile(None, &[3.0, 4.0], 12.0);
-        assert_eq!(secs, 12.0);
-        assert!((p[0] - 0.6).abs() < 1e-6 && (p[1] - 0.8).abs() < 1e-6);
-
-        // 30 s of [1, 0] plus 10 s of [0, 1] points along (0.75, 0.25).
-        let (p, secs) = update_profile(Some((&[1.0, 0.0], 30.0)), &[0.0, 1.0], 10.0);
-        assert_eq!(secs, 40.0);
-        let norm = (0.75f32 * 0.75 + 0.25 * 0.25).sqrt();
-        assert!((p[0] - 0.75 / norm).abs() < 1e-6 && (p[1] - 0.25 / norm).abs() < 1e-6);
     }
 
     #[test]

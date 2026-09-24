@@ -22,7 +22,7 @@ use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 use crate::audio::common::find_audio_file;
 use crate::audio::decoder::decode_audio_file;
 use crate::audio::recording_preferences::load_recording_preferences;
-use crate::audio::retranscription::is_retranscribing;
+use crate::audio::retranscription::{is_retranscribing, is_retranscription_in_progress};
 use crate::database::repositories::meeting::MeetingsRepository;
 use crate::database::repositories::speaker::{
     JobStatus, SavedIdentification, SpeakerIdJobRow, SpeakerRepoError, SpeakerRepository,
@@ -297,10 +297,11 @@ async fn recording_folder(
     Ok(meeting.folder_path.map(PathBuf::from))
 }
 
-/// Parallelism for a job: [`LIVE_RECORDING_WORKERS`] while recording, otherwise a third of
-/// the cores (the prototype's sweet spot), capped at [`MAX_WORKERS`].
-fn worker_count(recording_live: bool, cores: usize) -> usize {
-    if recording_live {
+/// Parallelism for a job: [`LIVE_RECORDING_WORKERS`] while a recording or a retranscription
+/// (of any meeting) is transcribing on the same CPU, otherwise a third of the cores (the
+/// prototype's sweet spot), capped at [`MAX_WORKERS`].
+fn worker_count(recording_live: bool, retranscribing: bool, cores: usize) -> usize {
+    if recording_live || retranscribing {
         LIVE_RECORDING_WORKERS
     } else {
         (cores / 3).clamp(1, MAX_WORKERS)
@@ -480,6 +481,7 @@ async fn run_registered_job(
         config,
         workers: worker_count(
             crate::audio::recording_commands::is_recording().await,
+            is_retranscription_in_progress(),
             std::thread::available_parallelism().map_or(1, NonZeroUsize::get),
         ),
     };
@@ -713,6 +715,21 @@ fn live_state(running: bool, stage: JobStage, progress: u32) -> JobState {
     }
 }
 
+/// The state of `stored`, the row read after [`live_job_state`] found no job. A job registered
+/// between the two reads has already written a `queued` row, so an unfinished row is checked
+/// against the registry again before it is reported as interrupted.
+pub fn stored_or_live_job_state(meeting_id: &str, stored: Option<SpeakerIdJobRow>) -> JobState {
+    let unfinished = stored
+        .as_ref()
+        .is_some_and(|row| matches!(row.status.as_str(), "queued" | "running"));
+    if unfinished {
+        if let Some(live) = live_job_state(meeting_id) {
+            return live;
+        }
+    }
+    stored_job_state(stored)
+}
+
 /// The state recorded for a meeting with no live job. A `queued`/`running` row then means the
 /// app quit mid-run.
 pub fn stored_job_state(stored: Option<SpeakerIdJobRow>) -> JobState {
@@ -746,16 +763,22 @@ mod tests {
 
     #[test]
     fn workers_drop_to_two_while_recording() {
-        assert_eq!(worker_count(true, 24), 2);
+        assert_eq!(worker_count(true, false, 24), 2);
+    }
+
+    #[test]
+    fn workers_drop_to_two_while_another_meeting_is_retranscribed() {
+        assert_eq!(worker_count(false, true, 24), 2);
+        assert_eq!(worker_count(true, true, 24), 2);
     }
 
     #[test]
     fn workers_use_a_third_of_the_cores_capped_at_eight() {
-        assert_eq!(worker_count(false, 24), 8);
-        assert_eq!(worker_count(false, 32), 8);
-        assert_eq!(worker_count(false, 12), 4);
-        assert_eq!(worker_count(false, 2), 1);
-        assert_eq!(worker_count(false, 1), 1);
+        assert_eq!(worker_count(false, false, 24), 8);
+        assert_eq!(worker_count(false, false, 32), 8);
+        assert_eq!(worker_count(false, false, 12), 4);
+        assert_eq!(worker_count(false, false, 2), 1);
+        assert_eq!(worker_count(false, false, 1), 1);
     }
 
     #[test]
@@ -797,6 +820,41 @@ mod tests {
         assert_eq!(stored_job_state(Some(row("queued"))).status, "interrupted");
         assert_eq!(stored_job_state(Some(row("completed"))).status, "completed");
         assert_eq!(stored_job_state(None).status, "none");
+    }
+
+    #[test]
+    fn a_queued_row_of_a_job_registered_after_the_registry_miss_is_not_interrupted() {
+        let meeting_id = "meeting-registered-after-miss-test";
+        let row = |status: &str| {
+            Some(SpeakerIdJobRow {
+                status: status.to_string(),
+                speaker_count: None,
+                error: None,
+            })
+        };
+        assert_eq!(live_job_state(meeting_id), None);
+        let (registration, _) = register(meeting_id).unwrap();
+
+        assert_eq!(
+            stored_or_live_job_state(meeting_id, row("queued")).status,
+            "queued"
+        );
+        set_running(meeting_id);
+        assert_eq!(
+            stored_or_live_job_state(meeting_id, row("running")).status,
+            "running"
+        );
+
+        drop(registration);
+        assert_eq!(
+            stored_or_live_job_state(meeting_id, row("running")).status,
+            "interrupted"
+        );
+        assert_eq!(
+            stored_or_live_job_state(meeting_id, row("completed")).status,
+            "completed"
+        );
+        assert_eq!(stored_or_live_job_state(meeting_id, None).status, "none");
     }
 
     #[test]

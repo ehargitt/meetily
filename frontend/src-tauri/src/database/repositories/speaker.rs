@@ -368,6 +368,32 @@ impl SpeakerRepository {
         .await?)
     }
 
+    /// Whether the meeting's completed summary predates its speaker labels: the summary started
+    /// (`start_time`, else `created_at`) before the last completed identification or the last
+    /// speaker edit (rename, "Me", merge). `false` without a completed summary or speakers.
+    /// Timestamps are compared as `julianday` values rather than text, so rows written with a
+    /// different timestamp format or fractional precision still order correctly.
+    pub async fn speakers_changed_since_summary(
+        pool: &SqlitePool,
+        meeting_id: &str,
+    ) -> Result<bool, SpeakerRepoError> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM summary_processes sp
+                 WHERE sp.meeting_id = ?1
+                   AND LOWER(sp.status) = 'completed'
+                   AND EXISTS (SELECT 1 FROM meeting_speakers WHERE meeting_id = ?1)
+                   AND julianday(COALESCE(sp.start_time, sp.created_at)) < MAX(
+                       COALESCE((SELECT julianday(completed_at) FROM speaker_identification_jobs
+                                  WHERE meeting_id = ?1 AND status = 'completed'), 0),
+                       COALESCE((SELECT MAX(julianday(updated_at)) FROM meeting_speakers
+                                  WHERE meeting_id = ?1), 0)))",
+        )
+        .bind(meeting_id)
+        .fetch_one(pool)
+        .await?)
+    }
+
     /// Record a non-completed job state (`completed` is written by [`Self::save_result`]).
     pub async fn set_job_status(
         pool: &SqlitePool,

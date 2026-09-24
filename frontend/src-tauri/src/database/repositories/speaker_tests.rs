@@ -1,5 +1,6 @@
 use super::*;
 use crate::database::repositories::meeting::MeetingsRepository;
+use crate::database::repositories::summary::SummaryProcessesRepository;
 use meetily_diarization::{EMBEDDING_DIM, MODEL_ID};
 
 const MEETING: &str = "meeting-1";
@@ -763,4 +764,134 @@ async fn marking_me_with_enough_speech_enrolls_the_voiceprint() {
             .unwrap();
     assert_eq!(voiceprint::from_blob(&embedding).unwrap(), unit_vector(0));
     assert_eq!(secs, MIN_ENROLL_SECS + 5.0);
+}
+
+/// Minutes after a fixed point an hour ago, so a real edit made now comes after all of them.
+fn minutes_in(minutes: i64) -> chrono::DateTime<Utc> {
+    Utc::now() - chrono::Duration::hours(1) + chrono::Duration::minutes(minutes)
+}
+
+async fn seed_identified_speakers(pool: &SqlitePool, speakers_saved: i64, job_completed: i64) {
+    seed_speaker(pool, "S1", None, 12.0).await;
+    sqlx::query("UPDATE meeting_speakers SET updated_at = ? WHERE meeting_id = ?")
+        .bind(minutes_in(speakers_saved))
+        .bind(MEETING)
+        .execute(pool)
+        .await
+        .unwrap();
+    SpeakerRepository::set_job_status(pool, MEETING, JobStatus::Completed, None)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE speaker_identification_jobs SET completed_at = ? WHERE meeting_id = ?")
+        .bind(minutes_in(job_completed))
+        .bind(MEETING)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn complete_summary_started_at(pool: &SqlitePool, minutes: i64) {
+    let started_at = minutes_in(minutes);
+    SummaryProcessesRepository::create_or_reset_process(pool, MEETING, started_at)
+        .await
+        .unwrap();
+    let completed = SummaryProcessesRepository::update_process_completed(
+        pool,
+        MEETING,
+        started_at,
+        serde_json::json!({ "markdown": "summary" }),
+        1,
+        1.0,
+    )
+    .await
+    .unwrap();
+    assert!(completed);
+}
+
+async fn changed_since_summary(pool: &SqlitePool) -> bool {
+    SpeakerRepository::speakers_changed_since_summary(pool, MEETING)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn speakers_have_not_changed_since_a_summary_that_does_not_exist() {
+    let pool = test_pool().await;
+    seed_meeting(&pool, MEETING).await;
+    seed_identified_speakers(&pool, 0, 0).await;
+
+    assert!(!changed_since_summary(&pool).await);
+}
+
+#[tokio::test]
+async fn a_summary_started_before_identification_completed_is_stale() {
+    let pool = test_pool().await;
+    seed_meeting(&pool, MEETING).await;
+    // The speakers were last written before the summary; only the job completed after it.
+    seed_identified_speakers(&pool, 0, 10).await;
+    complete_summary_started_at(&pool, 5).await;
+
+    assert!(changed_since_summary(&pool).await);
+}
+
+#[tokio::test]
+async fn a_summary_started_after_identification_completed_is_current_until_a_rename() {
+    let pool = test_pool().await;
+    seed_meeting(&pool, MEETING).await;
+    seed_identified_speakers(&pool, 10, 10).await;
+    complete_summary_started_at(&pool, 20).await;
+    assert!(!changed_since_summary(&pool).await);
+
+    SpeakerRepository::set_job_status(&pool, MEETING, JobStatus::Failed, Some("boom"))
+        .await
+        .unwrap();
+    assert!(
+        !changed_since_summary(&pool).await,
+        "a failed re-run leaves the labels as they were"
+    );
+
+    SpeakerRepository::update_meeting_speaker(&pool, MEETING, "S1", Some("Alice"), None)
+        .await
+        .unwrap();
+
+    assert!(changed_since_summary(&pool).await);
+}
+
+#[tokio::test]
+async fn a_summary_without_start_time_is_dated_by_its_creation() {
+    let pool = test_pool().await;
+    seed_meeting(&pool, MEETING).await;
+    seed_identified_speakers(&pool, 10, 10).await;
+    sqlx::query(
+        "INSERT INTO summary_processes (meeting_id, status, created_at, updated_at, result)
+         VALUES (?, 'completed', ?, ?, '{}')",
+    )
+    .bind(MEETING)
+    .bind(minutes_in(5))
+    .bind(minutes_in(30))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert!(changed_since_summary(&pool).await);
+}
+
+#[tokio::test]
+async fn only_a_completed_summary_with_speakers_can_be_stale() {
+    let pool = test_pool().await;
+    seed_meeting(&pool, MEETING).await;
+    complete_summary_started_at(&pool, 5).await;
+    SpeakerRepository::set_job_status(&pool, MEETING, JobStatus::Completed, None)
+        .await
+        .unwrap();
+    assert!(!changed_since_summary(&pool).await, "no speakers");
+
+    seed_identified_speakers(&pool, 10, 10).await;
+    SummaryProcessesRepository::create_or_reset_process(&pool, MEETING, minutes_in(0))
+        .await
+        .unwrap();
+    assert!(
+        !changed_since_summary(&pool).await,
+        "a pending regeneration"
+    );
 }

@@ -39,6 +39,9 @@ pub struct SpeakerIdStatus {
     /// transcript segment. Above [`job::LONG_RECORDING_SECS`] the UI warns that identification
     /// is slow and memory-hungry.
     pub audio_duration_seconds: Option<f64>,
+    /// The completed summary was generated before the current speaker labels, so the UI
+    /// suggests regenerating it to include speaker names.
+    pub speakers_changed_since_summary: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,7 +113,8 @@ pub async fn get_speaker_identification_status<R: Runtime>(
     let pool = state.db_manager.pool();
     let job_state = match job::live_job_state(&meeting_id) {
         Some(live) => live,
-        None => job::stored_job_state(
+        None => job::stored_or_live_job_state(
+            &meeting_id,
             SpeakerRepository::get_job(pool, &meeting_id)
                 .await
                 .map_err(|e| e.to_string())?,
@@ -131,6 +135,10 @@ pub async fn get_speaker_identification_status<R: Runtime>(
             .map_err(|e| e.to_string())?,
     };
     let models_installed = models::missing(&super::models_dir(&app)?).is_empty();
+    let speakers_changed_since_summary =
+        SpeakerRepository::speakers_changed_since_summary(pool, &meeting_id)
+            .await
+            .map_err(|e| e.to_string())?;
 
     Ok(SpeakerIdStatus {
         state: job_state,
@@ -138,6 +146,7 @@ pub async fn get_speaker_identification_status<R: Runtime>(
         audio_available,
         models_installed,
         audio_duration_seconds,
+        speakers_changed_since_summary,
     })
 }
 

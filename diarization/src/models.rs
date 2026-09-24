@@ -1,5 +1,6 @@
 //! Model artifacts: commit-pinned URLs, sizes and sha256, plus verified download.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -120,8 +121,8 @@ fn part_path(models_dir: &Path, spec: &ModelSpec) -> PathBuf {
 }
 
 /// Stream `spec.url` into `part`, returning the lowercase hex sha256 of what was written.
-/// Fails with `Download` when no data arrives for `stall_timeout`, and observes `cancel`
-/// while waiting for data as well as between chunks.
+/// Fails with `Download` when the response headers or the next chunk take longer than
+/// `stall_timeout`, and observes `cancel` during both waits.
 async fn download_one(
     client: &reqwest::Client,
     spec: &'static ModelSpec,
@@ -130,10 +131,9 @@ async fn download_one(
     progress: &(dyn Fn(DownloadProgress) + Send + Sync),
     stall_timeout: Duration,
 ) -> Result<String> {
-    let response = client
-        .get(spec.url)
-        .send()
-        .await
+    let send = client.get(spec.url).send();
+    let response = wait_for_network(send, cancel, stall_timeout, spec, "no response")
+        .await?
         .and_then(|r| r.error_for_status())
         .map_err(|e| DiarizationError::Download(format!("{}: {e}", spec.file_name)))?;
     let mut file = tokio::fs::File::create(part).await?;
@@ -141,25 +141,9 @@ async fn download_one(
     let mut downloaded = 0u64;
     let mut stream = response.bytes_stream();
     progress(DownloadProgress { file_name: spec.file_name, downloaded_bytes: 0, total_bytes: spec.size_bytes });
-    let mut last_data = tokio::time::Instant::now();
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(DiarizationError::Cancelled);
-        }
-        // `Next` holds no data between polls, so dropping it on a poll timeout loses nothing.
-        let next = match tokio::time::timeout(CANCEL_POLL, stream.next()).await {
-            Ok(next) => next,
-            Err(_) if last_data.elapsed() >= stall_timeout => {
-                return Err(DiarizationError::Download(format!(
-                    "{}: no data received for {} seconds",
-                    spec.file_name,
-                    stall_timeout.as_secs()
-                )));
-            }
-            Err(_) => continue,
-        };
-        let Some(chunk) = next else { break };
-        last_data = tokio::time::Instant::now();
+    while let Some(chunk) =
+        wait_for_network(stream.next(), cancel, stall_timeout, spec, "no data received").await?
+    {
         let chunk = chunk.map_err(|e| DiarizationError::Download(format!("{}: {e}", spec.file_name)))?;
         downloaded += chunk.len() as u64;
         if downloaded > spec.size_bytes {
@@ -179,6 +163,37 @@ async fn download_one(
     file.flush().await?;
     file.sync_all().await?;
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Await one network step, checking `cancel` every [`CANCEL_POLL`] and failing with
+/// `Download("<file>: <stalled> for N seconds")` once `stall_timeout` passes without it
+/// finishing. reqwest's only read bound is the one-hour total timeout, and a connection that
+/// dropped without a reset otherwise waits that long.
+async fn wait_for_network<F: Future>(
+    step: F,
+    cancel: &AtomicBool,
+    stall_timeout: Duration,
+    spec: &ModelSpec,
+    stalled: &str,
+) -> Result<F::Output> {
+    let mut step = std::pin::pin!(step);
+    let started = tokio::time::Instant::now();
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(DiarizationError::Cancelled);
+        }
+        match tokio::time::timeout(CANCEL_POLL, &mut step).await {
+            Ok(output) => return Ok(output),
+            Err(_) if started.elapsed() >= stall_timeout => {
+                return Err(DiarizationError::Download(format!(
+                    "{}: {stalled} for {} seconds",
+                    spec.file_name,
+                    stall_timeout.as_secs()
+                )));
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 /// Move a finished `.part` file into place if its sha256 matches `spec`; otherwise delete it and
@@ -254,9 +269,18 @@ mod tests {
         assert_eq!(total_bytes(), 5_992_913 + 26_530_550);
     }
 
-    /// Serves one GET with the headers and the first 64 KiB of a 1 MiB body, then keeps the
-    /// connection open without sending more, like a connection that dropped mid-download.
-    async fn stalling_server() -> (&'static ModelSpec, tokio::task::JoinHandle<()>) {
+    /// Where [`stalling_server`] stops answering.
+    #[derive(Clone, Copy)]
+    enum Stall {
+        /// After reading the request, before any response header.
+        BeforeHeaders,
+        /// After the headers and the first 64 KiB of a 1 MiB body.
+        MidBody,
+    }
+
+    /// Serves one GET up to `stall`, then keeps the connection open without sending more, like
+    /// a connection that dropped without a reset.
+    async fn stalling_server(stall: Stall) -> (&'static ModelSpec, tokio::task::JoinHandle<()>) {
         use tokio::io::AsyncReadExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -273,10 +297,12 @@ mod tests {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0u8; 1024];
             let _ = socket.read(&mut request).await.unwrap();
-            let headers = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", 1 << 20);
-            socket.write_all(headers.as_bytes()).await.unwrap();
-            socket.write_all(&vec![0u8; 64 * 1024]).await.unwrap();
-            socket.flush().await.unwrap();
+            if let Stall::MidBody = stall {
+                let headers = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", 1 << 20);
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                socket.write_all(&vec![0u8; 64 * 1024]).await.unwrap();
+                socket.flush().await.unwrap();
+            }
             tokio::time::sleep(Duration::from_secs(3600)).await;
             drop(socket);
         });
@@ -286,7 +312,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_interrupts_a_stalled_download_and_removes_the_part_file() {
         let dir = tempfile::tempdir().unwrap();
-        let (spec, server) = stalling_server().await;
+        let (spec, server) = stalling_server(Stall::MidBody).await;
         let cancel = AtomicBool::new(false);
         let pending = [spec];
         let started = tokio::time::Instant::now();
@@ -307,7 +333,7 @@ mod tests {
     #[tokio::test]
     async fn a_stalled_download_times_out_and_removes_the_part_file() {
         let dir = tempfile::tempdir().unwrap();
-        let (spec, server) = stalling_server().await;
+        let (spec, server) = stalling_server(Stall::MidBody).await;
         let received = std::sync::Mutex::new(0u64);
         let on_progress = |p: DownloadProgress| *received.lock().unwrap() = p.downloaded_bytes;
 
@@ -320,6 +346,53 @@ mod tests {
         }
         assert!(*received.lock().unwrap() > 0, "the server's first bytes should arrive before the stall");
         assert!(!part_path(dir.path(), spec).exists());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_a_download_waiting_for_response_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, server) = stalling_server(Stall::BeforeHeaders).await;
+        let cancel = AtomicBool::new(false);
+        let pending = [spec];
+        let started = tokio::time::Instant::now();
+
+        let download = download_specs(dir.path(), &pending, &cancel, &|_| {}, Duration::from_secs(60));
+        let set_cancel = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            cancel.store(true, Ordering::SeqCst);
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(download, set_cancel) })
+            .await
+            .expect("cancel must end a download that is still waiting for headers");
+
+        assert!(matches!(result, Err(DiarizationError::Cancelled)), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(5), "cancel took {:?}", started.elapsed());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_download_waiting_for_response_headers_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, server) = stalling_server(Stall::BeforeHeaders).await;
+        let progressed = AtomicBool::new(false);
+        let on_progress = |_: DownloadProgress| progressed.store(true, Ordering::SeqCst);
+
+        let never_cancelled = AtomicBool::new(false);
+        let pending = [spec];
+
+        let download = download_specs(dir.path(), &pending, &never_cancelled, &on_progress, Duration::from_secs(1));
+        let result = tokio::time::timeout(Duration::from_secs(10), download)
+            .await
+            .expect("the stall timeout must end a download that is still waiting for headers");
+
+        match result {
+            Err(DiarizationError::Download(message)) => {
+                assert_eq!(message, "stalled.onnx: no response for 1 seconds")
+            }
+            other => panic!("expected a stall error, got {other:?}"),
+        }
+        assert!(!progressed.load(Ordering::SeqCst), "no response headers, so no progress");
         server.abort();
     }
 }
