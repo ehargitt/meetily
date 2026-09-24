@@ -181,6 +181,8 @@ export interface SpeakerIdStatus {
   models_installed: boolean;
   /** Length of the recording, when known. */
   audio_duration_seconds?: number | null;
+  /** The saved summary was started before the latest speaker identification or speaker edit. */
+  speakers_changed_since_summary?: boolean;
 }
 
 export interface SpeakerIdProgress {

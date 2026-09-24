@@ -24,13 +24,14 @@ let speakerCount: number | null;
 let labeled: boolean;
 let speakers: MeetingSpeaker[];
 let failSpeakerReads: boolean;
+let speakersChangedSinceSummary: boolean;
 const statusReads: string[] = [];
 const invoke = mock(async (command: string): Promise<unknown> => {
   if (command === 'get_speaker_identification_status') {
     statusReads.push(jobStatus);
     const status: SpeakerIdStatus = {
       meeting_id: 'meeting-a', status: jobStatus, speaker_count: speakerCount,
-      audio_available: true, models_installed: true,
+      audio_available: true, models_installed: true, speakers_changed_since_summary: speakersChangedSinceSummary,
     };
     return status;
   }
@@ -110,6 +111,7 @@ beforeEach(() => {
   labeled = false;
   speakers = [];
   failSpeakerReads = false;
+  speakersChangedSinceSummary = false;
   refetches = 0;
   summaryStatus = 'idle';
   aiSummary = null;
@@ -229,6 +231,70 @@ describe('meeting page wiring for speaker identification', () => {
     summaryStatus = 'completed';
     aiSummary = { markdown: 'Summary without names' } as MeetingSummary;
     await rerender();
+    expect(state.showSpeakerNamesHint).toBe(true);
+  });
+
+  test('shows the regenerate hint on load when the saved summary predates the speaker labels', async () => {
+    jobStatus = 'completed';
+    labeled = true;
+    speakersChangedSinceSummary = true;
+    summaryStatus = 'completed';
+    aiSummary = { markdown: 'Summary without names' } as MeetingSummary;
+    await show(false);
+    expect(state.showSpeakerNamesHint).toBe(true);
+  });
+
+  test('shows no hint on load when the saved summary is newer than the speaker labels', async () => {
+    jobStatus = 'completed';
+    labeled = true;
+    summaryStatus = 'completed';
+    aiSummary = { markdown: 'Summary with names' } as MeetingSummary;
+    await show(false);
+    expect(statusReads).toEqual(['completed']);
+    expect(state.showSpeakerNamesHint).toBe(false);
+  });
+
+  test('shows the regenerate hint when a status refresh reports the summary predates the speakers', async () => {
+    jobStatus = 'completed';
+    labeled = true;
+    summaryStatus = 'completed';
+    aiSummary = { markdown: 'Summary without names' } as MeetingSummary;
+    await show(false);
+    expect(state.showSpeakerNamesHint).toBe(false);
+
+    speakersChangedSinceSummary = true;
+    await act(async () => { await state.speakerIdentification.refreshStatus(); });
+    expect(state.showSpeakerNamesHint).toBe(true);
+  });
+
+  test('regenerating clears the persisted hint and a later status with the same flag does not raise it again', async () => {
+    jobStatus = 'completed';
+    labeled = true;
+    speakersChangedSinceSummary = true;
+    summaryStatus = 'completed';
+    aiSummary = { markdown: 'Summary without names' } as MeetingSummary;
+    await show(false);
+    expect(state.showSpeakerNamesHint).toBe(true);
+
+    summaryStatus = 'regenerating';
+    await rerender();
+    expect(state.showSpeakerNamesHint).toBe(false);
+    summaryStatus = 'completed';
+    await rerender();
+    await act(async () => { await state.speakerIdentification.refreshStatus(); });
+    expect(state.showSpeakerNamesHint).toBe(false);
+  });
+
+  test('a speaker rename still flags the summary when the saved status says it is current', async () => {
+    jobStatus = 'completed';
+    labeled = true;
+    speakers = [speaker('S1', 30)];
+    summaryStatus = 'completed';
+    aiSummary = { markdown: 'Summary with names' } as MeetingSummary;
+    await show(false);
+    expect(state.showSpeakerNamesHint).toBe(false);
+
+    await act(async () => { await state.meetingSpeakers.renameSpeaker('S1', 'Alice'); });
     expect(state.showSpeakerNamesHint).toBe(true);
   });
 

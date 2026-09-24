@@ -83,6 +83,14 @@ export function useSpeakerAwareSummary({
     },
   });
 
+  // Rust reports a saved summary older than the speaker labels, so the hint also covers a
+  // summary written while this page was closed. It is raised when the flag turns on, so a
+  // dismissal or a regeneration is not undone by the unchanged flag of a later status.
+  const summaryPredatesSpeakers = speakerIdentification.status?.speakers_changed_since_summary === true;
+  useEffect(() => {
+    if (summaryPredatesSpeakers) setShowSpeakerNamesHint(true);
+  }, [summaryPredatesSpeakers]);
+
   useEffect(() => {
     if (isSummaryGenerating) {
       setShowSpeakerNamesHint(false);
@@ -95,10 +103,12 @@ export function useSpeakerAwareSummary({
 
   const dismissSpeakerNamesHint = useCallback(() => setShowSpeakerNamesHint(false), []);
 
-  const startAutoSummary = useCallback((customPrompt: string, options?: GenerateSummaryOptions) => {
+  // Several reads precede the Rust call, and the summary is marked started before them, so a
+  // start dropped by leaving the page in that window would never be retried.
+  const startAutoSummary = useCallback((customPrompt: string) => {
     autoSummaryStartedForRef.current = meetingId;
     onAutoGenerateStarted?.();
-    void generateSummary(customPrompt, options);
+    void generateSummary(customPrompt, { survivesUnmount: true });
   }, [meetingId, onAutoGenerateStarted, generateSummary]);
 
   const isWaitingForSpeakers = shouldAutoGenerate
@@ -123,7 +133,7 @@ export function useSpeakerAwareSummary({
   leavePageRef.current = () => {
     if (canAutoGenerate && isWaitingForSpeakers && autoSummaryStartedForRef.current !== meetingId) {
       console.log('Leaving the meeting before speaker identification finished; generating the summary now');
-      startAutoSummary('', { survivesUnmount: true });
+      startAutoSummary('');
     }
   };
   useEffect(() => () => leavePageRef.current(), []);
