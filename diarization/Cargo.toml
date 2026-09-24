@@ -1,0 +1,28 @@
+[package]
+name = "meetily-diarization"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Offline speaker diarization for Meetily: pyannote segmentation-3.0 + WeSpeaker ResNet34-LM on ONNX Runtime (CPU)"
+
+[lib]
+name = "meetily_diarization"
+
+[dependencies]
+# Must stay on the same ort pin as frontend/src-tauri (one ONNX Runtime per process).
+ort = { version = "=2.0.0-rc.10" }
+ndarray = "0.16"
+realfft = "3.4.0"
+rayon = "1.10"
+thiserror = "2.0.16"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+reqwest = { version = "0.11", features = ["stream"] }
+futures-util = "0.3"
+tokio = { version = "1.32.0", features = ["fs", "io-util"] }
+log = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1.32.0", features = ["full"] }
+tempfile = "3.3.0"
