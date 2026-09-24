@@ -1,7 +1,7 @@
 //! Tauri commands for speaker identification, per-meeting speaker editing, the self
 //! voiceprint and the diarization model download.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
@@ -35,6 +35,10 @@ pub struct SpeakerIdStatus {
     pub state: JobState,
     pub audio_available: bool,
     pub models_installed: bool,
+    /// Length of the recording: `metadata.json` `duration_seconds`, else the end of the last
+    /// transcript segment. Above [`job::LONG_RECORDING_SECS`] the UI warns that identification
+    /// is slow and memory-hungry.
+    pub audio_duration_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -45,6 +49,8 @@ pub struct DiarizationModelsStatus {
     /// Download size of all models.
     pub total_bytes: u64,
     pub models_dir: String,
+    /// A download is running, e.g. one started before the user left the page.
+    pub download_in_progress: bool,
 }
 
 fn parse_trigger(trigger: &str) -> Result<Trigger, String> {
@@ -102,23 +108,46 @@ pub async fn get_speaker_identification_status<R: Runtime>(
     meeting_id: String,
 ) -> Result<SpeakerIdStatus, String> {
     let pool = state.db_manager.pool();
-    let stored = SpeakerRepository::get_job(pool, &meeting_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    let job_state = match job::live_job_state(&meeting_id) {
+        Some(live) => live,
+        None => job::stored_job_state(
+            SpeakerRepository::get_job(pool, &meeting_id)
+                .await
+                .map_err(|e| e.to_string())?,
+        ),
+    };
     let folder = MeetingsRepository::get_meeting_metadata(pool, &meeting_id)
         .await
         .map_err(|e| e.to_string())?
         .and_then(|meeting| meeting.folder_path)
         .map(PathBuf::from);
-    let audio_available = folder.is_some_and(|f| find_audio_file(&f).is_ok());
+    let audio_available = folder
+        .as_deref()
+        .is_some_and(|f| find_audio_file(f).is_ok());
+    let audio_duration_seconds = match folder.as_deref().and_then(metadata_duration_seconds) {
+        Some(duration) => Some(duration),
+        None => MeetingsRepository::get_last_audio_end_time(pool, &meeting_id)
+            .await
+            .map_err(|e| e.to_string())?,
+    };
     let models_installed = models::missing(&super::models_dir(&app)?).is_empty();
 
     Ok(SpeakerIdStatus {
-        state: job::job_state(&meeting_id, stored),
+        state: job_state,
         meeting_id,
         audio_available,
         models_installed,
+        audio_duration_seconds,
     })
+}
+
+/// `duration_seconds` from the recording folder's `metadata.json`, when present and positive.
+fn metadata_duration_seconds(folder: &Path) -> Option<f64> {
+    let text = std::fs::read_to_string(folder.join("metadata.json")).ok()?;
+    let metadata: serde_json::Value = serde_json::from_str(&text).ok()?;
+    metadata["duration_seconds"]
+        .as_f64()
+        .filter(|seconds| *seconds > 0.0)
 }
 
 #[tauri::command]
@@ -132,7 +161,7 @@ pub async fn api_get_meeting_speakers(
 }
 
 /// `display_name`: `None` leaves it unchanged, `""` resets to the default label.
-/// `is_self: true` marks the speaker as the local user (and enrolls the voiceprint).
+/// `is_self` marks or un-marks the speaker as the local user; either rebuilds the voiceprint.
 #[tauri::command]
 pub async fn api_update_meeting_speaker(
     state: tauri::State<'_, AppState>,
@@ -192,6 +221,7 @@ pub async fn get_diarization_models_status<R: Runtime>(
         missing,
         total_bytes: models::total_bytes(),
         models_dir: models_dir.display().to_string(),
+        download_in_progress: DOWNLOAD_IN_PROGRESS.load(Ordering::SeqCst),
     })
 }
 
@@ -317,6 +347,44 @@ mod tests {
             quality: None,
         };
         assert!(diarization_config(Some(zero)).is_err());
+    }
+
+    #[test]
+    fn download_latch_is_exclusive_and_released_when_the_download_ends() {
+        let guard = DownloadGuard::acquire().unwrap();
+        assert!(DOWNLOAD_IN_PROGRESS.load(Ordering::SeqCst));
+        assert!(
+            DownloadGuard::acquire().is_err(),
+            "a second download is refused"
+        );
+
+        // `download_diarization_models` holds the guard for the call, so it drops however
+        // `models::download_all` returns, including the stall timeout and cancellation.
+        drop(guard);
+        assert!(!DOWNLOAD_IN_PROGRESS.load(Ordering::SeqCst));
+        drop(DownloadGuard::acquire().expect("a retry is accepted"));
+    }
+
+    #[test]
+    fn duration_comes_from_metadata_when_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(metadata_duration_seconds(dir.path()), None);
+
+        std::fs::write(
+            dir.path().join("metadata.json"),
+            r#"{"duration_seconds": 33.19}"#,
+        )
+        .unwrap();
+        assert_eq!(metadata_duration_seconds(dir.path()), Some(33.19));
+
+        for missing in [
+            r#"{"duration_seconds": null}"#,
+            r#"{"duration_seconds": 0}"#,
+            "not json",
+        ] {
+            std::fs::write(dir.path().join("metadata.json"), missing).unwrap();
+            assert_eq!(metadata_duration_seconds(dir.path()), None, "{missing}");
+        }
     }
 
     #[test]

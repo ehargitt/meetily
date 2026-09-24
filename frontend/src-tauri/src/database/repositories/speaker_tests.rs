@@ -37,17 +37,29 @@ async fn seed_transcript(pool: &SqlitePool, id: &str, times: Option<(f64, f64)>)
 }
 
 async fn seed_speaker(pool: &SqlitePool, key: &str, name: Option<&str>, speech_seconds: f64) {
+    seed_voice(pool, MEETING, key, name, speech_seconds, 0).await;
+}
+
+/// A speaker whose embedding points along `axis`, so voices of different axes are unrelated.
+async fn seed_voice(
+    pool: &SqlitePool,
+    meeting_id: &str,
+    key: &str,
+    name: Option<&str>,
+    speech_seconds: f64,
+    axis: usize,
+) {
     sqlx::query(
         "INSERT INTO meeting_speakers
              (meeting_id, speaker_key, display_name, speech_seconds, embedding, embedding_model,
               created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(MEETING)
+    .bind(meeting_id)
     .bind(key)
     .bind(name)
     .bind(speech_seconds)
-    .bind(voiceprint::to_blob(&unit_vector(0)))
+    .bind(voiceprint::to_blob(&unit_vector(axis)))
     .bind(MODEL_ID)
     .bind(Utc::now())
     .bind(Utc::now())
@@ -439,6 +451,159 @@ async fn forgetting_the_voiceprint_removes_profile_and_suggestions() {
     assert!(!speaker(&pool, "S1").await.suggested_self);
 }
 
+/// The stored self voiceprint and its speech seconds, `None` when there is none.
+async fn self_profile(pool: &SqlitePool) -> Option<(Vec<f32>, f64)> {
+    sqlx::query_as::<_, (Vec<u8>, f64)>(
+        "SELECT embedding, speech_seconds FROM speaker_profiles WHERE is_self = 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+    .map(|(blob, secs)| (voiceprint::from_blob(&blob).unwrap(), secs))
+}
+
+async fn mark_me(pool: &SqlitePool, meeting_id: &str, key: &str, is_self: bool) {
+    SpeakerRepository::update_meeting_speaker(pool, meeting_id, key, None, Some(is_self))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn moving_me_after_a_misclick_leaves_only_my_voice_in_the_voiceprint() {
+    let pool = test_pool().await;
+    seed_meeting(&pool, MEETING).await;
+    seed_voice(&pool, MEETING, "S1", Some("Colleague"), 20.0, 0).await;
+    seed_voice(&pool, MEETING, "S2", None, 30.0, 1).await;
+
+    mark_me(&pool, MEETING, "S1", true).await;
+    assert_eq!(self_profile(&pool).await, Some((unit_vector(0), 20.0)));
+
+    mark_me(&pool, MEETING, "S2", true).await;
+    assert_eq!(self_profile(&pool).await, Some((unit_vector(1), 30.0)));
+}
+
+#[tokio::test]
+async fn toggling_me_off_and_on_does_not_count_the_voice_twice() {
+    let pool = test_pool().await;
+    seed_meeting(&pool, MEETING).await;
+    seed_voice(&pool, MEETING, "S1", None, 20.0, 0).await;
+
+    mark_me(&pool, MEETING, "S1", true).await;
+    mark_me(&pool, MEETING, "S1", false).await;
+    assert_eq!(
+        self_profile(&pool).await,
+        None,
+        "un-marking the only voice removes it"
+    );
+
+    mark_me(&pool, MEETING, "S1", true).await;
+    mark_me(&pool, MEETING, "S1", true).await;
+    assert_eq!(self_profile(&pool).await, Some((unit_vector(0), 20.0)));
+}
+
+#[tokio::test]
+async fn the_voiceprint_is_the_speech_weighted_mean_across_meetings() {
+    let pool = test_pool().await;
+    seed_meeting(&pool, MEETING).await;
+    seed_meeting(&pool, "meeting-2").await;
+    seed_voice(&pool, MEETING, "S1", None, 30.0, 0).await;
+    seed_voice(&pool, "meeting-2", "S1", None, 10.0, 1).await;
+    seed_voice(&pool, "meeting-2", "S2", None, MIN_ENROLL_SECS - 1.0, 2).await;
+
+    mark_me(&pool, MEETING, "S1", true).await;
+    mark_me(&pool, "meeting-2", "S1", true).await;
+    let (profile, secs) = self_profile(&pool).await.unwrap();
+    assert_eq!(secs, 40.0);
+    assert!(
+        profile[0] > profile[1] && profile[1] > 0.0,
+        "{:?}",
+        &profile[..2]
+    );
+
+    // A voice with too little speech is marked "Me" but not enrolled.
+    mark_me(&pool, "meeting-2", "S2", true).await;
+    let (profile, secs) = self_profile(&pool).await.unwrap();
+    assert_eq!(secs, 30.0);
+    assert_eq!(profile, unit_vector(0));
+}
+
+#[tokio::test]
+async fn merging_away_the_me_speaker_rebuilds_the_voiceprint() {
+    let pool = test_pool().await;
+    seed_meeting(&pool, MEETING).await;
+    seed_voice(&pool, MEETING, "S1", None, 20.0, 0).await;
+    seed_voice(&pool, MEETING, "S2", None, 20.0, 1).await;
+    seed_turn(&pool, "S1", 0.0, 10.0).await;
+    seed_turn(&pool, "S2", 10.0, 30.0).await;
+    mark_me(&pool, MEETING, "S1", true).await;
+
+    SpeakerRepository::merge_meeting_speakers(&pool, MEETING, "S1", "S2")
+        .await
+        .unwrap();
+
+    assert!(speaker(&pool, "S2").await.is_self);
+    assert_eq!(self_profile(&pool).await, Some((unit_vector(1), 30.0)));
+}
+
+#[tokio::test]
+async fn forgetting_the_voiceprint_drops_the_me_embeddings_so_it_is_not_rebuilt() {
+    let pool = test_pool().await;
+    seed_meeting(&pool, MEETING).await;
+    seed_voice(&pool, MEETING, "S1", None, 20.0, 0).await;
+    seed_voice(&pool, MEETING, "S2", None, 20.0, 1).await;
+    mark_me(&pool, MEETING, "S1", true).await;
+
+    SpeakerRepository::delete_self_voiceprint(&pool)
+        .await
+        .unwrap();
+
+    let embeddings: Vec<(String, Option<Vec<u8>>)> =
+        sqlx::query_as("SELECT speaker_key, embedding FROM meeting_speakers ORDER BY speaker_key")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(embeddings[0].1, None, "the Me speaker's voice is forgotten");
+    assert!(embeddings[1].1.is_some(), "other speakers keep theirs");
+    assert!(speaker(&pool, "S1").await.is_self);
+
+    mark_me(&pool, MEETING, "S1", false).await;
+    mark_me(&pool, MEETING, "S1", true).await;
+    assert_eq!(self_profile(&pool).await, None);
+}
+
+#[tokio::test]
+async fn write_transactions_take_the_write_lock_up_front() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+
+    let dir = tempfile::tempdir().unwrap();
+    let options = SqliteConnectOptions::new()
+        .filename(dir.path().join("lock.sqlite"))
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(std::time::Duration::ZERO);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(2)
+        .connect_with(options)
+        .await
+        .unwrap();
+
+    let deferred = pool.begin().await.unwrap();
+    let mut other = pool.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *other)
+        .await
+        .unwrap();
+    sqlx::query("ROLLBACK").execute(&mut *other).await.unwrap();
+    drop(deferred);
+
+    let _write = begin_write(&pool).await.unwrap();
+    let blocked = sqlx::query("BEGIN IMMEDIATE").execute(&mut *other).await;
+    assert!(
+        blocked.is_err(),
+        "another writer must wait for the write transaction"
+    );
+}
+
 #[tokio::test]
 async fn job_status_transitions_are_recorded() {
     let pool = test_pool().await;
@@ -483,10 +648,7 @@ fn union_length_counts_overlap_once() {
     assert_eq!(union_length(&[(0.0, 10.0), (2.0, 3.0)]), 10.0);
 }
 
-// The tests below call the engine's relabel/assign/timeline/voiceprint functions.
-
 #[tokio::test]
-#[ignore = "needs engine (track A)"]
 async fn save_writes_turns_speakers_and_labels() {
     let pool = test_pool().await;
     seed_meeting(&pool, MEETING).await;
@@ -520,7 +682,6 @@ async fn save_writes_turns_speakers_and_labels() {
 }
 
 #[tokio::test]
-#[ignore = "needs engine (track A)"]
 async fn rerun_keeps_names_through_stable_keys() {
     let pool = test_pool().await;
     seed_previous_result(&pool).await;
@@ -544,7 +705,6 @@ async fn rerun_keeps_names_through_stable_keys() {
 }
 
 #[tokio::test]
-#[ignore = "needs engine (track A)"]
 async fn realign_labels_the_rows_written_by_retranscription() {
     let pool = test_pool().await;
     seed_previous_result(&pool).await;
@@ -566,7 +726,6 @@ async fn realign_labels_the_rows_written_by_retranscription() {
 }
 
 #[tokio::test]
-#[ignore = "needs engine (track A)"]
 async fn save_labels_me_from_the_stored_voiceprint() {
     let pool = test_pool().await;
     seed_meeting(&pool, MEETING).await;
@@ -588,7 +747,6 @@ async fn save_labels_me_from_the_stored_voiceprint() {
 }
 
 #[tokio::test]
-#[ignore = "needs engine (track A)"]
 async fn marking_me_with_enough_speech_enrolls_the_voiceprint() {
     let pool = test_pool().await;
     seed_meeting(&pool, MEETING).await;

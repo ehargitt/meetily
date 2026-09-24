@@ -308,8 +308,9 @@ pub fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -
         let start_byte: usize = chars[..start_char].iter().map(|c| c.len_utf8()).sum();
         let mut end_byte: usize = chars[..end_char].iter().map(|c| c.len_utf8()).sum();
 
-        // Break at a line, sentence or word boundary, in that order of preference; a line
-        // break keeps each "[MM:SS] Name: text" line together with its speaker label.
+        // Break at a line, sentence or word boundary, in that order of preference. Ending on
+        // a line break, and starting the next chunk on a line start (below), keeps each
+        // "[MM:SS] Name: text" line together with its speaker label.
         if end_char < total_chars {
             let slice = &text[start_byte..end_byte];
             let line_boundary = slice.rfind('\n').map(|index| index + 1);
@@ -333,13 +334,28 @@ pub fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -
             break;
         }
 
-        start_char = emitted_end_char
+        let overlap_start = emitted_end_char
             .saturating_sub(overlap_chars)
             .max(start_char + 1);
+        start_char = line_start_near(&chars, overlap_start, start_char, emitted_end_char);
     }
 
     info!("Created {} chunks from text", chunks.len());
     chunks
+}
+
+/// Where the next chunk starts: the start of the line containing `position` when that is past
+/// `chunk_start` (so chunking progresses), else the next line start up to `chunk_end`, else
+/// `position` itself (text without line breaks).
+fn line_start_near(chars: &[char], position: usize, chunk_start: usize, chunk_end: usize) -> usize {
+    let is_break = |c: &char| *c == '\n';
+    if let Some(offset) = chars[chunk_start..position].iter().rposition(is_break) {
+        return chunk_start + offset + 1;
+    }
+    chars[position..chunk_end]
+        .iter()
+        .position(is_break)
+        .map_or(position, |offset| position + offset + 1)
 }
 
 /// Extracts meeting name from the first heading in markdown
@@ -681,6 +697,35 @@ mod tests {
 
         assert_eq!(chunks[0], "[00:01] A: hi\n");
         assert!(chunks[1].starts_with("[00:05] B: "), "{chunks:?}");
+    }
+
+    #[test]
+    fn chunk_text_starts_every_chunk_on_a_labelled_line() {
+        let text: String = (0..400)
+            .map(|i| format!("[{:02}:{:02}] Speaker {}: ship the release on friday and bob owns the notes\n", i / 60, i % 60, i % 3))
+            .collect();
+
+        let chunks = chunk_text(&text, 3700, 100);
+
+        assert!(chunks.len() > 1, "{}", chunks.len());
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert!(chunk.starts_with('['), "chunk {index} starts mid-line: {:?}", &chunk[..40]);
+        }
+        assert!(chunks.windows(2).all(|pair| pair[0].ends_with('\n')), "chunks end on a line break");
+    }
+
+    #[test]
+    fn chunk_text_start_moves_forward_to_a_line_start_when_the_line_began_in_the_previous_chunk() {
+        // The overlap point lies inside the chunk's first line, so the next chunk starts on the
+        // following line instead of before the previous chunk's start.
+        let text = format!("[00:01] A: {}\n[00:02] B: short\n[00:03] C: {}", "x".repeat(30), "y".repeat(40));
+
+        let chunks = chunk_text(&text, 20, 10);
+
+        assert_eq!(chunks.len(), 3, "{chunks:?}");
+        assert!(chunks[1].starts_with("[00:02] B: "), "{chunks:?}");
+        // Here the overlap point lies inside the "[00:02]" line, so the chunk starts on it.
+        assert!(chunks[2].starts_with("[00:02] B: ") || chunks[2].starts_with("[00:03] C: "), "{chunks:?}");
     }
 
     #[test]

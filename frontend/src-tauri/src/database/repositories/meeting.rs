@@ -135,6 +135,17 @@ impl MeetingsRepository {
         Ok(meeting)
     }
 
+    /// End of the meeting's last timed transcript segment, in seconds; `None` without one
+    pub async fn get_last_audio_end_time(
+        pool: &SqlitePool,
+        meeting_id: &str,
+    ) -> Result<Option<f64>, SqlxError> {
+        sqlx::query_scalar("SELECT MAX(audio_end_time) FROM transcripts WHERE meeting_id = ?")
+            .bind(meeting_id)
+            .fetch_one(pool)
+            .await
+    }
+
     /// Get meeting transcripts with pagination support
     pub async fn get_meeting_transcripts_paginated(
         pool: &SqlitePool,

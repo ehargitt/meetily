@@ -76,6 +76,25 @@ pub fn update_profile(profile: Option<(&[f32], f64)>, centroid: &[f32], speech_s
     (merged, total)
 }
 
+/// Build the profile from every enrolled `(centroid, speech_secs)`: the speech-seconds-weighted
+/// mean, L2-normalised, with the total speech seconds. Sources whose dimension differs from the
+/// first, or without speech, are ignored; `None` when nothing remains.
+pub fn build_profile(sources: &[(Vec<f32>, f64)]) -> Option<(Vec<f32>, f64)> {
+    let dim = sources.first()?.0.len();
+    let mut sum = vec![0f64; dim];
+    let mut total = 0.0;
+    for (centroid, secs) in sources.iter().filter(|(c, secs)| c.len() == dim && *secs > 0.0) {
+        sum.iter_mut().zip(centroid).for_each(|(acc, x)| *acc += *x as f64 * secs);
+        total += secs;
+    }
+    if total <= 0.0 || dim == 0 {
+        return None;
+    }
+    let mut profile: Vec<f32> = sum.iter().map(|x| (x / total) as f32).collect();
+    l2_normalize(&mut profile);
+    Some((profile, total))
+}
+
 /// Little-endian f32 bytes for SQLite BLOB storage.
 pub fn to_blob(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -143,6 +162,21 @@ mod tests {
         assert_eq!(secs, 40.0);
         let norm = (0.75f32 * 0.75 + 0.25 * 0.25).sqrt();
         assert!((p[0] - 0.75 / norm).abs() < 1e-6 && (p[1] - 0.25 / norm).abs() < 1e-6);
+    }
+
+    #[test]
+    fn build_profile_is_the_weighted_mean_of_all_sources() {
+        assert_eq!(build_profile(&[]), None);
+        assert_eq!(build_profile(&[(vec![1.0, 0.0], 0.0)]), None);
+
+        let (p, secs) = build_profile(&[(vec![1.0, 0.0], 30.0), (vec![0.0, 1.0], 10.0)]).unwrap();
+        assert_eq!(secs, 40.0);
+        let norm = (0.75f32 * 0.75 + 0.25 * 0.25).sqrt();
+        assert!((p[0] - 0.75 / norm).abs() < 1e-6 && (p[1] - 0.25 / norm).abs() < 1e-6);
+
+        let (p, secs) = build_profile(&[(vec![3.0, 4.0], 12.0), (vec![1.0, 0.0, 0.0], 50.0)]).unwrap();
+        assert_eq!(secs, 12.0, "a source of another dimension is ignored");
+        assert!((p[0] - 0.6).abs() < 1e-6 && (p[1] - 0.8).abs() < 1e-6);
     }
 
     #[test]

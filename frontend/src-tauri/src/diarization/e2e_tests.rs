@@ -120,7 +120,7 @@ async fn attach_meeting(pool: &SqlitePool, recording: &Path) {
 }
 
 #[tokio::test]
-#[ignore = "needs engine (track A), MEETILY_DIARIZATION_MODELS_DIR and the local Teams echo-test meeting"]
+#[ignore = "needs MEETILY_DIARIZATION_MODELS_DIR and the local Teams echo-test meeting"]
 async fn identifies_two_speakers_in_the_teams_echo_meeting() {
     let models_dir = PathBuf::from(
         std::env::var("MEETILY_DIARIZATION_MODELS_DIR").expect("MEETILY_DIARIZATION_MODELS_DIR"),
@@ -155,7 +155,7 @@ async fn identifies_two_speakers_in_the_teams_echo_meeting() {
     .expect("identification");
     println!("{saved:?}");
 
-    assert!(saved.speaker_count >= 2, "{saved:?}");
+    assert_eq!(saved.speaker_count, 2, "{saved:?}");
     let unlabeled: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM transcripts t
          WHERE t.meeting_id = ? AND t.audio_start_time IS NOT NULL AND t.audio_end_time IS NOT NULL
