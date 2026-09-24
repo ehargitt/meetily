@@ -8,7 +8,9 @@ import { ConfidenceIndicator } from "./ConfidenceIndicator";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { RecordingStatusBar } from "./RecordingStatusBar";
 import { motion, AnimatePresence } from "framer-motion";
-import { TranscriptSegmentData } from "@/types";
+import { MeetingSpeaker, TranscriptSegmentData } from "@/types";
+import { speakerColorIndex, speakerLabel } from "@/lib/speaker-label";
+import { SpeakerChip } from "./Speakers/SpeakerChip";
 
 export interface VirtualizedTranscriptViewProps {
     /** Transcript segments to display */
@@ -27,6 +29,8 @@ export interface VirtualizedTranscriptViewProps {
     showConfidence?: boolean;
     /** Completely disable auto-scroll behavior (for meeting details page) */
     disableAutoScroll?: boolean;
+    /** Identified speakers by key, used to label segments that carry a speaker key */
+    speakers?: ReadonlyMap<string, MeetingSpeaker>;
 
     // Pagination props (infinite scroll)
     hasMore?: boolean;
@@ -38,6 +42,33 @@ export interface VirtualizedTranscriptViewProps {
 
 // Threshold for enabling virtualization (below this, use simple rendering)
 const VIRTUALIZATION_THRESHOLD = 10;
+
+// Below this share of a segment covered by its speaker, the segment likely contains several voices.
+const MIXED_SPEAKER_OVERLAP = 0.6;
+
+const NO_SPEAKERS: ReadonlyMap<string, MeetingSpeaker> = new Map();
+
+interface SpeakerHeader {
+    label: string;
+    colorIndex: number;
+}
+
+// A speaker chip starts each run of consecutive segments from the same speaker; rows are never merged
+// because auto-scroll and playback sync address individual segment elements.
+function speakerHeaderFor(
+    segments: TranscriptSegmentData[],
+    index: number,
+    speakers: ReadonlyMap<string, MeetingSpeaker>
+): SpeakerHeader | null {
+    const key = segments[index].speakerKey;
+    if (!key || (index > 0 && segments[index - 1].speakerKey === key)) return null;
+    const speaker = speakers.get(key);
+    return { label: speakerLabel(key, speaker), colorIndex: speakerColorIndex(key, speaker) };
+}
+
+function isMixedSpeech(segment: TranscriptSegmentData): boolean {
+    return segment.speakerOverlap != null && segment.speakerOverlap < MIXED_SPEAKER_OVERLAP;
+}
 
 // Helper function to format seconds as recording-relative time [MM:SS]
 function formatRecordingTime(seconds: number | undefined): string {
@@ -71,6 +102,9 @@ const TranscriptSegment = memo(function TranscriptSegment({
     confidence,
     isStreaming,
     showConfidence,
+    speakerName,
+    speakerColor,
+    isMixed = false,
 }: {
     id: string;
     timestamp: number;
@@ -78,11 +112,19 @@ const TranscriptSegment = memo(function TranscriptSegment({
     confidence?: number;
     isStreaming: boolean;
     showConfidence: boolean;
+    speakerName?: string;
+    speakerColor?: number;
+    isMixed?: boolean;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
 
     return (
         <div id={`segment-${id}`} className="mb-3">
+            {speakerName !== undefined && (
+                <div className="mt-2 mb-1">
+                    <SpeakerChip label={speakerName} colorIndex={speakerColor ?? 0} />
+                </div>
+            )}
             <div className="flex items-start gap-2">
                 <Tooltip>
                     <TooltipTrigger>
@@ -104,6 +146,14 @@ const TranscriptSegment = memo(function TranscriptSegment({
                     ) : (
                         <p className="text-base text-gray-800 leading-relaxed">{displayText}</p>
                     )}
+                    {isMixed && (
+                        <span
+                            className="text-[10px] uppercase tracking-wide text-gray-400"
+                            title="Several people may be speaking in this segment"
+                        >
+                            mixed speakers
+                        </span>
+                    )}
                 </div>
             </div>
         </div>
@@ -119,6 +169,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     enableStreaming = false,
     showConfidence = true,
     disableAutoScroll = false,
+    speakers = NO_SPEAKERS,
     hasMore = false,
     isLoadingMore = false,
     totalCount = 0,
@@ -275,6 +326,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                         {virtualizer.getVirtualItems().map((virtualRow) => {
                             const segment = segments[virtualRow.index];
                             const isStreaming = streamingSegmentId === segment.id;
+                            const header = speakerHeaderFor(segments, virtualRow.index, speakers);
 
                             return (
                                 <div
@@ -296,6 +348,9 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        speakerName={header?.label}
+                                        speakerColor={header?.colorIndex}
+                                        isMixed={isMixedSpeech(segment)}
                                     />
                                 </div>
                             );
@@ -335,8 +390,9 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                 // Simple rendering for small lists (better animations)
                 <>
                     <div className="space-y-1">
-                        {segments.map((segment) => {
+                        {segments.map((segment, index) => {
                             const isStreaming = streamingSegmentId === segment.id;
+                            const header = speakerHeaderFor(segments, index, speakers);
 
                             return (
                                 <motion.div
@@ -352,6 +408,9 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        speakerName={header?.label}
+                                        speakerColor={header?.colorIndex}
+                                        isMixed={isMixedSpeech(segment)}
                                     />
                                 </motion.div>
                             );

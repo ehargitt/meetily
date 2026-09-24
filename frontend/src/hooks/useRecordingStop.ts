@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
+import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { useTranscripts } from '@/contexts/TranscriptContext';
@@ -8,6 +9,7 @@ import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateCon
 import { storageService } from '@/services/storageService';
 import { transcriptService } from '@/services/transcriptService';
 import Analytics from '@/lib/analytics';
+import { StartSpeakerIdResult } from '@/types';
 import {
   applyPinnedSummaryLanguageToMeeting,
   detectAndCacheSummaryLanguage,
@@ -263,6 +265,17 @@ export function useRecordingStop(
           if (!meetingId) {
             console.error('No meeting_id in response:', responseData);
             throw new Error('No meeting ID received from save operation');
+          }
+
+          // Returns at once; Rust skips it when the setting is off, models are missing or there is no audio.
+          try {
+            const identification = await invoke<StartSpeakerIdResult>('start_speaker_identification', {
+              meetingId,
+              trigger: 'auto',
+            });
+            console.log('Automatic speaker identification:', identification);
+          } catch (error) {
+            console.warn('Failed to start automatic speaker identification:', error);
           }
 
           let shouldDetectSummaryLanguage = false;

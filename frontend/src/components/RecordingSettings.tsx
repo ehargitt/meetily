@@ -7,6 +7,7 @@ import Analytics from '@/lib/analytics';
 import { toast } from 'sonner';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { useConfig } from '@/contexts/ConfigContext';
+import { SpeakerIdentificationSettings } from '@/components/Speakers/SpeakerIdentificationSettings';
 
 export interface RecordingPreferences {
   save_folder: string;
@@ -14,6 +15,7 @@ export interface RecordingPreferences {
   file_format: string;
   preferred_mic_device: string | null;
   preferred_system_device: string | null;
+  auto_identify_speakers: boolean;
 }
 
 interface RecordingSettingsProps {
@@ -26,7 +28,8 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     auto_save: true,
     file_format: 'mp4',
     preferred_mic_device: null,
-    preferred_system_device: null
+    preferred_system_device: null,
+    auto_identify_speakers: true,
   });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -39,7 +42,8 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     const loadPreferences = async () => {
       try {
         const prefs = await invoke<RecordingPreferences>('get_recording_preferences');
-        setPreferences(prefs);
+        // Older backends omit the flag; Rust defaults it to on.
+        setPreferences({ ...prefs, auto_identify_speakers: prefs.auto_identify_speakers ?? true });
       } catch (error) {
         console.error('Failed to load recording preferences:', error);
         // If loading fails, get default folder path
@@ -79,6 +83,16 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
 
     // Track auto-save setting change
     await Analytics.track('auto_save_recording_toggled', {
+      enabled: enabled.toString()
+    });
+  };
+
+  const handleAutoIdentifyToggle = async (enabled: boolean) => {
+    const newPreferences = { ...preferences, auto_identify_speakers: enabled };
+    setPreferences(newPreferences);
+    await savePreferences(newPreferences);
+
+    await Analytics.track('auto_identify_speakers_toggled', {
       enabled: enabled.toString()
     });
   };
@@ -235,6 +249,12 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
           onCheckedChange={handleNotificationToggle}
         />
       </div>
+
+      <SpeakerIdentificationSettings
+        autoIdentify={preferences.auto_identify_speakers}
+        onAutoIdentifyChange={handleAutoIdentifyToggle}
+        disabled={saving}
+      />
 
       {/* Device Preferences */}
       <div className="space-y-4">

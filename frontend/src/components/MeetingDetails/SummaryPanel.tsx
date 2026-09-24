@@ -9,7 +9,7 @@ import { SummaryUpdaterButtonGroup } from './SummaryUpdaterButtonGroup';
 import Analytics from '@/lib/analytics';
 import { useEffect, useRef, useState, RefObject } from 'react';
 import { toast } from 'sonner';
-import { Languages, ChevronDown } from 'lucide-react';
+import { Languages, ChevronDown, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
 import { LanguagePickerPopover } from '@/components/LanguagePickerPopover';
@@ -54,6 +54,9 @@ interface SummaryPanelProps {
   onTemplateSelect: (templateId: string, templateName: string) => void;
   isModelConfigLoading?: boolean;
   onOpenModelSettings?: (openFn: () => void) => void;
+  /** Speakers were identified or renamed after this summary was generated. */
+  showSpeakerNamesHint?: boolean;
+  onDismissSpeakerNamesHint?: () => void;
 }
 
 export function SummaryPanel({
@@ -84,6 +87,8 @@ export function SummaryPanel({
   onTemplateSelect,
   isModelConfigLoading = false,
   onOpenModelSettings,
+  showSpeakerNamesHint = false,
+  onDismissSpeakerNamesHint,
 }: SummaryPanelProps) {
   const [summaryLang, setSummaryLang] = useState<string | null>(null);
   const [summaryLangStorage, setSummaryLangStorage] = useState<SummaryLanguageStorage>('metadata');
@@ -278,6 +283,20 @@ export function SummaryPanel({
           )}
         </div>
       </div>
+
+      {showSpeakerNamesHint && hasSummary && !isSummaryLoading && (
+        <div className="flex items-center justify-between gap-2 border-b border-blue-200 bg-blue-50 px-4 py-2 text-sm text-blue-800">
+          <span>Speakers changed since this summary was generated. Regenerate to include speaker names.</span>
+          <div className="flex flex-shrink-0 gap-1">
+            <Button size="sm" variant="outline" onClick={() => void onRegenerateSummary()}>
+              Regenerate
+            </Button>
+            <Button size="sm" variant="ghost" onClick={onDismissSpeakerNamesHint} aria-label="Dismiss">
+              <X size={14} />
+            </Button>
+          </div>
+        </div>
+      )}
 
       {isSummaryLoading ? (
         <div className="flex items-center justify-center flex-1">

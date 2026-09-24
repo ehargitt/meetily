@@ -16,6 +16,9 @@ export interface Transcript {
   audio_start_time?: number; // Seconds from recording start (e.g., 125.3)
   audio_end_time?: number;   // Seconds from recording start (e.g., 128.6)
   duration?: number;          // Segment duration in seconds (e.g., 3.3)
+  // Speaker identification (absent until a meeting has been diarized)
+  speaker_key?: string | null;     // "S1", "S2", ...
+  speaker_overlap?: number | null; // Fraction of the segment covered by that speaker (0-1)
 }
 
 export interface TranscriptUpdate {
@@ -141,4 +144,95 @@ export interface TranscriptSegmentData {
   endTime?: number; // audio_end_time in seconds
   text: string;
   confidence?: number;
+  speakerKey?: string | null;
+  speakerOverlap?: number | null;
+}
+
+// Speaker identification (diarization) contracts shared with the Rust commands and events
+export interface MeetingSpeaker {
+  speaker_key: string;
+  display_name: string | null;
+  is_self: boolean;
+  color_index: number;
+  segment_count: number;
+  talk_time_seconds: number;
+  /** Voice resembles the saved "Me" voiceprint, but not closely enough to label automatically. */
+  suggested_self?: boolean;
+}
+
+export type SpeakerIdJobStatus =
+  | 'none'
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'skipped'
+  | 'interrupted';
+
+export interface SpeakerIdStatus {
+  meeting_id: string;
+  status: SpeakerIdJobStatus;
+  stage?: string | null;
+  progress_percentage?: number | null;
+  speaker_count?: number | null;
+  error?: string | null;
+  audio_available: boolean;
+  models_installed: boolean;
+}
+
+export interface SpeakerIdProgress {
+  meeting_id: string;
+  stage: string;
+  progress_percentage: number;
+  message: string;
+}
+
+export interface SpeakerIdComplete {
+  meeting_id: string;
+  speaker_count: number;
+  labeled_segments: number;
+}
+
+export type SpeakerIdErrorCode =
+  | 'no_audio'
+  | 'models_missing'
+  | 'decode_failed'
+  | 'cancelled'
+  | 'meeting_deleted'
+  | 'busy'
+  | 'internal';
+
+export interface SpeakerIdError {
+  meeting_id: string;
+  code: SpeakerIdErrorCode;
+  error: string;
+}
+
+export interface SpeakerIdOptions {
+  num_speakers?: number | null;
+  quality?: 'fast' | 'accurate' | null;
+}
+
+export interface StartSpeakerIdResult {
+  status: 'started' | 'queued' | 'skipped';
+  reason?: string | null;
+}
+
+export interface DiarizationModelsStatus {
+  installed: boolean;
+  missing: string[];
+  total_bytes: number;
+  models_dir: string;
+}
+
+export interface DiarizationModelsDownloadProgress {
+  file: string;
+  downloaded_bytes: number;
+  total_bytes: number;
+}
+
+export interface DiarizationModelsDownloadError {
+  error: string;
+  cancelled?: boolean;
 }

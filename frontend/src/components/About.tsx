@@ -8,6 +8,7 @@ import { updateService, UpdateInfo } from '@/services/updateService';
 import { Button } from './ui/button';
 import { Loader2, CheckCircle2 } from 'lucide-react';
 import { toast } from 'sonner';
+import { ModelAttribution } from './Speakers/ModelAttribution';
 
 
 export function About() {
@@ -135,6 +136,12 @@ export function About() {
                 >
                     Chat with the Zackriya team
                 </button>
+            </div>
+
+            {/* Third-party model credits (CC BY 4.0 requires attribution) */}
+            <div className="space-y-1">
+                <h3 className="text-sm font-semibold text-gray-800">Acknowledgements</h3>
+                <ModelAttribution />
             </div>
 
             {/* Footer - Compact */}

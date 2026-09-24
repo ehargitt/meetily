@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import {
   CancelSummaryResponse,
+  MeetingSpeaker,
   MeetingSummary,
   ProcessTranscriptResponse,
   SummaryProcessResponse,
@@ -18,6 +19,8 @@ import {
   readCachedDetectedSummaryLanguage,
 } from '@/lib/summary-language-preferences';
 import { parseSummaryContent, readSummaryMetadata } from '@/lib/summary-content';
+import { formatTranscriptForSummary } from '@/lib/transcript-format';
+import { fetchMeetingSpeakers } from './useMeetingSpeakers';
 
 async function resolveSummaryLanguage(
   meetingId: string,
@@ -433,22 +436,11 @@ export function useSummaryGeneration({
     }
   }, []);
 
-  const buildSummaryTranscriptPayload = useCallback((allTranscripts: Transcript[]) => {
-    const formatTime = (seconds: number | undefined, fallbackTimestamp: string): string => {
-      if (seconds === undefined) {
-        return fallbackTimestamp;
-      }
-      const totalSecs = Math.floor(seconds);
-      return `[${Math.floor(totalSecs / 60).toString().padStart(2, '0')}:${(totalSecs % 60).toString().padStart(2, '0')}]`;
-    };
-
-    return {
-      transcriptText: allTranscripts
-        .map((transcript) => `${formatTime(transcript.audio_start_time, transcript.timestamp)} ${transcript.text}`)
-        .join('\n'),
-      transcriptTexts: allTranscripts.map((transcript) => transcript.text),
-    };
-  }, []);
+  // Speaker names go only into the summary text; language detection sees the spoken words alone.
+  const buildSummaryTranscriptPayload = useCallback((allTranscripts: Transcript[], speakers: MeetingSpeaker[]) => ({
+    transcriptText: formatTranscriptForSummary(allTranscripts, speakers),
+    transcriptTexts: allTranscripts.map((transcript) => transcript.text),
+  }), []);
 
   const showPreflightError = useCallback((message: string) => {
     setSummaryError(message);
@@ -499,8 +491,9 @@ export function useSummaryGeneration({
       return;
     }
 
+    const speakers = await fetchMeetingSpeakers(meeting.id);
     await processSummary({
-      ...buildSummaryTranscriptPayload(allTranscripts),
+      ...buildSummaryTranscriptPayload(allTranscripts, speakers),
       customPrompt,
     });
   }, [
@@ -524,8 +517,9 @@ export function useSummaryGeneration({
       return;
     }
 
+    const speakers = await fetchMeetingSpeakers(meeting.id);
     await processSummary({
-      ...buildSummaryTranscriptPayload(allTranscripts),
+      ...buildSummaryTranscriptPayload(allTranscripts, speakers),
       isRegeneration: true
     });
   }, [meeting.id, fetchAllTranscripts, buildSummaryTranscriptPayload, processSummary]);

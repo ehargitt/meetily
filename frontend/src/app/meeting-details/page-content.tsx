@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { motion } from 'framer-motion';
 import { MeetingSummary, SummaryProcessResponse } from '@/types';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
@@ -18,6 +18,9 @@ import { useTemplates } from '@/hooks/meeting-details/useTemplates';
 import { useCopyOperations } from '@/hooks/meeting-details/useCopyOperations';
 import { useMeetingOperations } from '@/hooks/meeting-details/useMeetingOperations';
 import { useConfig } from '@/contexts/ConfigContext';
+import { useMeetingSpeakers, SpeakerEdit } from '@/hooks/meeting-details/useMeetingSpeakers';
+import { useSpeakerIdentification } from '@/hooks/meeting-details/useSpeakerIdentification';
+import { hasVisibleSummaryContent } from '@/lib/summary-content';
 
 export default function PageContent({
   meeting,
@@ -60,6 +63,7 @@ export default function PageContent({
   const [customPrompt, setCustomPrompt] = useState<string>('');
   const isRecording = false;
   const [activeTab, setActiveTab] = useState<MeetingDetailsTab>('transcript');
+  const [showSpeakerNamesHint, setShowSpeakerNamesHint] = useState(false);
 
   // Ref to store the modal open function from SummaryGeneratorButtonGroup
   const openModelSettingsRef = useRef<(() => void) | null>(null);
@@ -141,6 +145,36 @@ export default function PageContent({
     meeting,
   });
 
+  // An existing summary was written without the latest speaker names; there is no automatic regeneration.
+  const flagSummaryWithoutSpeakerNames = () => {
+    if (hasVisibleSummaryContent(meetingData.aiSummary)) setShowSpeakerNamesHint(true);
+  };
+
+  const meetingSpeakers = useMeetingSpeakers({
+    meetingId: meeting.id,
+    onSpeakersEdited: (edit: SpeakerEdit) => {
+      if (edit === 'merge') void onRefetchTranscripts?.();
+      flagSummaryWithoutSpeakerNames();
+    },
+  });
+
+  // Holds the auto-summary after a recording until identification finishes, so it can use speaker names.
+  const speakerIdentification = useSpeakerIdentification({
+    meetingId: meeting.id,
+    holdSummary: shouldAutoGenerate,
+    onComplete: async () => {
+      await Promise.all([meetingSpeakers.refresh(), onRefetchTranscripts?.()]);
+      flagSummaryWithoutSpeakerNames();
+    },
+  });
+
+  const isSummaryGenerating = ['processing', 'summarizing', 'regenerating'].includes(summaryGeneration.summaryStatus);
+  useEffect(() => {
+    if (isSummaryGenerating) setShowSpeakerNamesHint(false);
+  }, [isSummaryGenerating]);
+
+  const dismissSpeakerNamesHint = useCallback(() => setShowSpeakerNamesHint(false), []);
+
   // Track page view
   useEffect(() => {
     Analytics.trackPageView('meeting_details');
@@ -161,6 +195,7 @@ export default function PageContent({
   useEffect(() => {
     if (
       !shouldAutoGenerate
+      || speakerIdentification.isSummaryHeld
       || summaryGeneration.summaryStatus !== 'idle'
       || isModelConfigLoading
       || meetingData.transcripts.length === 0
@@ -182,6 +217,7 @@ export default function PageContent({
     modelConfig.model,
     summaryGeneration.handleGenerateSummary,
     summaryGeneration.summaryStatus,
+    speakerIdentification.isSummaryHeld,
     onAutoGenerateComplete,
   ]);
 
@@ -218,6 +254,8 @@ export default function PageContent({
               meetingId={meeting.id}
               meetingFolderPath={meeting.folder_path}
               onRefetchTranscripts={onRefetchTranscripts}
+              meetingSpeakers={meetingSpeakers}
+              speakerIdentification={speakerIdentification}
             />
           }
           summary={
@@ -249,6 +287,8 @@ export default function PageContent({
               onTemplateSelect={templates.handleTemplateSelection}
               isModelConfigLoading={isModelConfigLoading}
               onOpenModelSettings={handleRegisterModalOpen}
+              showSpeakerNamesHint={showSpeakerNamesHint}
+              onDismissSpeakerNamesHint={dismissSpeakerNamesHint}
             />
           }
         />

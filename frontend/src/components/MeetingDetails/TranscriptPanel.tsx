@@ -5,6 +5,8 @@ import { TranscriptView } from '@/components/TranscriptView';
 import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptView';
 import { TranscriptButtonGroup } from './TranscriptButtonGroup';
 import { useMemo } from 'react';
+import type { UseMeetingSpeakersReturn } from '@/hooks/meeting-details/useMeetingSpeakers';
+import type { UseSpeakerIdentificationReturn } from '@/hooks/meeting-details/useSpeakerIdentification';
 
 interface TranscriptPanelProps {
   transcripts: Transcript[];
@@ -28,6 +30,10 @@ interface TranscriptPanelProps {
   meetingId?: string;
   meetingFolderPath?: string | null;
   onRefetchTranscripts?: () => Promise<void>;
+
+  // Speaker identification props
+  meetingSpeakers?: UseMeetingSpeakersReturn;
+  speakerIdentification?: UseSpeakerIdentificationReturn;
 }
 
 export function TranscriptPanel({
@@ -48,6 +54,8 @@ export function TranscriptPanel({
   meetingId,
   meetingFolderPath,
   onRefetchTranscripts,
+  meetingSpeakers,
+  speakerIdentification,
 }: TranscriptPanelProps) {
   // Convert transcripts to segments if pagination is not used but we want virtualization
   const convertedSegments = useMemo(() => {
@@ -61,6 +69,8 @@ export function TranscriptPanel({
       endTime: t.audio_end_time,
       text: t.text,
       confidence: t.confidence,
+      speakerKey: t.speaker_key,
+      speakerOverlap: t.speaker_overlap,
     }));
   }, [transcripts, usePagination, segments]);
 
@@ -75,6 +85,8 @@ export function TranscriptPanel({
           meetingId={meetingId}
           meetingFolderPath={meetingFolderPath}
           onRefetchTranscripts={onRefetchTranscripts}
+          meetingSpeakers={meetingSpeakers}
+          speakerIdentification={speakerIdentification}
         />
       </div>
 
@@ -89,6 +101,7 @@ export function TranscriptPanel({
           enableStreaming={false}
           showConfidence={true}
           disableAutoScroll={disableAutoScroll}
+          speakers={meetingSpeakers?.speakerMap}
           hasMore={hasMore}
           isLoadingMore={isLoadingMore}
           totalCount={totalCount}
