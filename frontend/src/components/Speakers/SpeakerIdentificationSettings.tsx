@@ -72,9 +72,15 @@ export function SpeakerIdentificationSettings({
                 />
                 <div className="flex items-center justify-between text-xs text-gray-600">
                   <span>{progress ? `Downloading ${progress.file}` : 'Starting download...'}</span>
-                  <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => void models.cancelDownload()}>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 px-2"
+                    onClick={() => void models.cancelDownload()}
+                    disabled={models.isCancelling}
+                  >
                     <X className="w-3 h-3" />
-                    Cancel
+                    {models.isCancelling ? 'Cancelling...' : 'Cancel'}
                   </Button>
                 </div>
               </div>

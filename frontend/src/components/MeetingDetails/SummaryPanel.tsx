@@ -6,6 +6,7 @@ import { EmptyStateSummary } from '@/components/EmptyStateSummary';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 import { SummaryGeneratorButtonGroup } from './SummaryGeneratorButtonGroup';
 import { SummaryUpdaterButtonGroup } from './SummaryUpdaterButtonGroup';
+import { WaitingForSpeakersSummary } from './WaitingForSpeakersSummary';
 import Analytics from '@/lib/analytics';
 import { useEffect, useRef, useState, RefObject } from 'react';
 import { toast } from 'sonner';
@@ -57,6 +58,9 @@ interface SummaryPanelProps {
   /** Speakers were identified or renamed after this summary was generated. */
   showSpeakerNamesHint?: boolean;
   onDismissSpeakerNamesHint?: () => void;
+  /** The auto-summary is held until speaker identification finishes. */
+  isWaitingForSpeakers?: boolean;
+  onGenerateNow?: () => void;
 }
 
 export function SummaryPanel({
@@ -89,6 +93,8 @@ export function SummaryPanel({
   onOpenModelSettings,
   showSpeakerNamesHint = false,
   onDismissSpeakerNamesHint,
+  isWaitingForSpeakers = false,
+  onGenerateNow,
 }: SummaryPanelProps) {
   const [summaryLang, setSummaryLang] = useState<string | null>(null);
   const [summaryLangStorage, setSummaryLangStorage] = useState<SummaryLanguageStorage>('metadata');
@@ -305,6 +311,8 @@ export function SummaryPanel({
             <p className="text-gray-600">Generating AI Summary...</p>
           </div>
         </div>
+      ) : !hasSummary && isWaitingForSpeakers && onGenerateNow ? (
+        <WaitingForSpeakersSummary onGenerateNow={onGenerateNow} />
       ) : !hasSummary ? (
         <EmptyStateSummary
           onGenerate={() => onGenerateSummary(customPrompt)}

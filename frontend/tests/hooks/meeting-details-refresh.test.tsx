@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from 'b
 import { useEffect } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import type { SummaryProcessResponse } from '../../src/types';
+import { recordingStateModule } from '../support/recording-state-mock';
 
 const originalCore = { ...await import('@tauri-apps/api/core') };
 const originalAnalytics = { ...await import('../../src/lib/analytics') };
@@ -23,7 +24,7 @@ mock.module('next/navigation', () => ({
   usePathname: () => '/meeting-details', useRouter: () => ({}),
   useSearchParams: () => new URLSearchParams({ id: selectedMeeting }),
 }));
-mock.module('../../src/contexts/RecordingStateContext', () => ({ useRecordingState: () => ({ isRecording: false }) }));
+mock.module('../../src/contexts/RecordingStateContext', () => recordingStateModule());
 mock.module('../../src/contexts/ConfigContext', () => ({ useConfig: () => ({ isAutoSummary: false }) }));
 const notify = mock(() => {});
 mock.module('sonner', () => ({ toast: { info: notify, error: notify, success: notify, warning: notify } }));

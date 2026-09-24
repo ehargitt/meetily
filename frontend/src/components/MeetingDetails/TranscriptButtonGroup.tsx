@@ -44,12 +44,11 @@ export function TranscriptButtonGroup({
   const identifyProgress = speakerIdentification?.progress?.progress_percentage
     ?? speakerIdentification?.status?.progress_percentage;
 
+  // New rows are relabeled in Rust, which changes each speaker's segment count and talk time.
+  const refreshSpeakers = meetingSpeakers?.refresh;
   const handleRetranscribeComplete = useCallback(async () => {
-    // Refetch transcripts to show the updated data
-    if (onRefetchTranscripts) {
-      await onRefetchTranscripts();
-    }
-  }, [onRefetchTranscripts]);
+    await Promise.all([onRefetchTranscripts?.(), refreshSpeakers?.()]);
+  }, [onRefetchTranscripts, refreshSpeakers]);
 
   return (
     <div className="flex items-center justify-center w-full gap-2">

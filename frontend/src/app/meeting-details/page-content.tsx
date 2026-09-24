@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
 import { MeetingSummary, SummaryProcessResponse } from '@/types';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
@@ -18,9 +18,7 @@ import { useTemplates } from '@/hooks/meeting-details/useTemplates';
 import { useCopyOperations } from '@/hooks/meeting-details/useCopyOperations';
 import { useMeetingOperations } from '@/hooks/meeting-details/useMeetingOperations';
 import { useConfig } from '@/contexts/ConfigContext';
-import { useMeetingSpeakers, SpeakerEdit } from '@/hooks/meeting-details/useMeetingSpeakers';
-import { useSpeakerIdentification } from '@/hooks/meeting-details/useSpeakerIdentification';
-import { hasVisibleSummaryContent } from '@/lib/summary-content';
+import { useSpeakerAwareSummary } from '@/hooks/meeting-details/useSpeakerAwareSummary';
 
 export default function PageContent({
   meeting,
@@ -63,13 +61,11 @@ export default function PageContent({
   const [customPrompt, setCustomPrompt] = useState<string>('');
   const isRecording = false;
   const [activeTab, setActiveTab] = useState<MeetingDetailsTab>('transcript');
-  const [showSpeakerNamesHint, setShowSpeakerNamesHint] = useState(false);
 
   // Ref to store the modal open function from SummaryGeneratorButtonGroup
   const openModelSettingsRef = useRef<(() => void) | null>(null);
   const autoSwitchedSummaryMeetingIdsRef = useRef(new Set<string>());
   const manuallySelectedTabMeetingIdsRef = useRef(new Set<string>());
-  const autoGenerationStartedMeetingIdRef = useRef<string | null>(null);
 
   // Sidebar context
   const { serverAddress } = useSidebar();
@@ -145,35 +141,18 @@ export default function PageContent({
     meeting,
   });
 
-  // An existing summary was written without the latest speaker names; there is no automatic regeneration.
-  const flagSummaryWithoutSpeakerNames = () => {
-    if (hasVisibleSummaryContent(meetingData.aiSummary)) setShowSpeakerNamesHint(true);
-  };
-
-  const meetingSpeakers = useMeetingSpeakers({
-    meetingId: meeting.id,
-    onSpeakersEdited: (edit: SpeakerEdit) => {
-      if (edit === 'merge') void onRefetchTranscripts?.();
-      flagSummaryWithoutSpeakerNames();
-    },
-  });
-
   // Holds the auto-summary after a recording until identification finishes, so it can use speaker names.
-  const speakerIdentification = useSpeakerIdentification({
+  const speakerSummary = useSpeakerAwareSummary({
     meetingId: meeting.id,
-    holdSummary: shouldAutoGenerate,
-    onComplete: async () => {
-      await Promise.all([meetingSpeakers.refresh(), onRefetchTranscripts?.()]);
-      flagSummaryWithoutSpeakerNames();
-    },
+    shouldAutoGenerate,
+    isModelConfigLoading,
+    transcripts: meetingData.transcripts,
+    aiSummary: meetingData.aiSummary,
+    summaryStatus: summaryGeneration.summaryStatus,
+    generateSummary: summaryGeneration.handleGenerateSummary,
+    onAutoGenerateStarted: onAutoGenerateComplete,
+    onRefetchTranscripts,
   });
-
-  const isSummaryGenerating = ['processing', 'summarizing', 'regenerating'].includes(summaryGeneration.summaryStatus);
-  useEffect(() => {
-    if (isSummaryGenerating) setShowSpeakerNamesHint(false);
-  }, [isSummaryGenerating]);
-
-  const dismissSpeakerNamesHint = useCallback(() => setShowSpeakerNamesHint(false), []);
 
   // Track page view
   useEffect(() => {
@@ -190,36 +169,6 @@ export default function PageContent({
       setActiveTab('summary');
     }
   }, [meeting.id, meetingData.aiSummary, summaryGeneration.summaryStatus]);
-
-  // Auto-generate only after the model configuration has settled.
-  useEffect(() => {
-    if (
-      !shouldAutoGenerate
-      || speakerIdentification.isSummaryHeld
-      || summaryGeneration.summaryStatus !== 'idle'
-      || isModelConfigLoading
-      || meetingData.transcripts.length === 0
-      || autoGenerationStartedMeetingIdRef.current === meeting.id
-    ) {
-      return;
-    }
-
-    autoGenerationStartedMeetingIdRef.current = meeting.id;
-    console.log(`🤖 Auto-generating summary with ${modelConfig.provider}/${modelConfig.model}...`);
-    onAutoGenerateComplete?.();
-    void summaryGeneration.handleGenerateSummary('');
-  }, [
-    shouldAutoGenerate,
-    meeting.id,
-    meetingData.transcripts.length,
-    isModelConfigLoading,
-    modelConfig.provider,
-    modelConfig.model,
-    summaryGeneration.handleGenerateSummary,
-    summaryGeneration.summaryStatus,
-    speakerIdentification.isSummaryHeld,
-    onAutoGenerateComplete,
-  ]);
 
   return (
     <motion.div
@@ -254,8 +203,8 @@ export default function PageContent({
               meetingId={meeting.id}
               meetingFolderPath={meeting.folder_path}
               onRefetchTranscripts={onRefetchTranscripts}
-              meetingSpeakers={meetingSpeakers}
-              speakerIdentification={speakerIdentification}
+              meetingSpeakers={speakerSummary.meetingSpeakers}
+              speakerIdentification={speakerSummary.speakerIdentification}
             />
           }
           summary={
@@ -287,8 +236,10 @@ export default function PageContent({
               onTemplateSelect={templates.handleTemplateSelection}
               isModelConfigLoading={isModelConfigLoading}
               onOpenModelSettings={handleRegisterModalOpen}
-              showSpeakerNamesHint={showSpeakerNamesHint}
-              onDismissSpeakerNamesHint={dismissSpeakerNamesHint}
+              showSpeakerNamesHint={speakerSummary.showSpeakerNamesHint}
+              onDismissSpeakerNamesHint={speakerSummary.dismissSpeakerNamesHint}
+              isWaitingForSpeakers={speakerSummary.isWaitingForSpeakers}
+              onGenerateNow={() => speakerSummary.generateNow(customPrompt)}
             />
           }
         />

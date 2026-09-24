@@ -179,6 +179,8 @@ export interface SpeakerIdStatus {
   error?: string | null;
   audio_available: boolean;
   models_installed: boolean;
+  /** Length of the recording, when known. */
+  audio_duration_seconds?: number | null;
 }
 
 export interface SpeakerIdProgress {
@@ -224,6 +226,8 @@ export interface DiarizationModelsStatus {
   missing: string[];
   total_bytes: number;
   models_dir: string;
+  /** A download is running, possibly started from another screen. */
+  download_in_progress: boolean;
 }
 
 export interface DiarizationModelsDownloadProgress {

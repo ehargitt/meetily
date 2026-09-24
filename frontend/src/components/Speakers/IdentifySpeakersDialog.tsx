@@ -31,11 +31,16 @@ type Quality = 'fast' | 'accurate';
 
 const SPEAKER_COUNT_OPTIONS = ['auto', '2', '3', '4', '5', '6', '7', '8', '9', '10'];
 
+/** Decoding needs about 0.9 GB per hour of audio, so warn before long runs. */
+export const LONG_RECORDING_SECONDS = 3 * 60 * 60;
+export const LONG_RECORDING_WARNING =
+  'This recording is over 3 hours long. Identifying speakers will take a few minutes and use 1 GB or more of memory.';
+
 const STAGE_LABELS: Record<string, string> = {
   loading_models: 'Loading models',
   decoding: 'Reading audio',
   segmenting: 'Finding speech',
-  embedding: 'Analysing voices',
+  embedding: 'Analyzing voices',
   clustering: 'Grouping speakers',
   saving: 'Saving',
 };
@@ -155,6 +160,11 @@ export function IdentifySpeakersDialog({ open, onOpenChange, identification }: I
                   The last run was interrupted before it finished. Run it again to label this meeting.
                 </p>
               )}
+              {(status?.audio_duration_seconds ?? 0) > LONG_RECORDING_SECONDS && (
+                <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-md p-2">
+                  {LONG_RECORDING_WARNING}
+                </p>
+              )}
               <div className="space-y-2">
                 <span className="text-sm font-medium">Number of speakers</span>
                 <Select value={speakerCount} onValueChange={setSpeakerCount}>
@@ -205,9 +215,9 @@ export function IdentifySpeakersDialog({ open, onOpenChange, identification }: I
 
           {!isActive && !modelsInstalled && (
             models.isDownloading ? (
-              <Button variant="outline" onClick={() => void models.cancelDownload()}>
+              <Button variant="outline" onClick={() => void models.cancelDownload()} disabled={models.isCancelling}>
                 <X className="h-4 w-4 mr-2" />
-                Cancel download
+                {models.isCancelling ? 'Cancelling...' : 'Cancel download'}
               </Button>
             ) : (
               <>
@@ -258,7 +268,7 @@ function downloadPercentage(progress: { downloaded_bytes: number; total_bytes: n
 function skipReasonMessage(reason: string | null | undefined): string {
   switch (reason) {
     case 'no_audio':
-      return 'This meeting has no saved recording to analyse.';
+      return 'This meeting has no saved recording to analyze.';
     case 'models_missing':
       return 'The speaker identification models are not installed.';
     case 'already_running':

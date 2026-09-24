@@ -25,6 +25,11 @@ interface UseSpeakerIdentificationProps {
   /** Hold the auto-summary while this meeting's identification is queued or running. */
   holdSummary: boolean;
   onComplete?: (result: SpeakerIdComplete) => void | Promise<void>;
+  /**
+   * The first status read found a run that had already completed. Its completion event may
+   * have fired before this page was listening, so data loaded earlier can lack the labels.
+   */
+  onAlreadyCompleted?: (status: SpeakerIdStatus) => void | Promise<void>;
 }
 
 export interface UseSpeakerIdentificationReturn {
@@ -47,6 +52,7 @@ export function useSpeakerIdentification({
   meetingId,
   holdSummary,
   onComplete,
+  onAlreadyCompleted,
 }: UseSpeakerIdentificationProps): UseSpeakerIdentificationReturn {
   const [status, setStatus] = useState<SpeakerIdStatus | null>(null);
   const [progress, setProgress] = useState<SpeakerIdProgress | null>(null);
@@ -55,23 +61,26 @@ export function useSpeakerIdentification({
   const statusRequestRef = useRef(0);
   const onCompleteRef = useRef(onComplete);
   onCompleteRef.current = onComplete;
+  const onAlreadyCompletedRef = useRef(onAlreadyCompleted);
+  onAlreadyCompletedRef.current = onAlreadyCompleted;
 
-  const refreshStatus = useCallback(async () => {
+  /** Resolves to the status it stored, or null when the read failed or a newer read superseded it. */
+  const readStatus = useCallback(async (): Promise<SpeakerIdStatus | null> => {
     const requestId = ++statusRequestRef.current;
     try {
       const next = await invoke<SpeakerIdStatus>('get_speaker_identification_status', { meetingId });
-      if (requestId === statusRequestRef.current) setStatus(next);
+      if (requestId !== statusRequestRef.current) return null;
+      setStatus(next);
+      return next;
     } catch (err) {
       console.warn('Failed to read speaker identification status:', err);
       // Without a status the summary cannot know what it is waiting for.
       if (requestId === statusRequestRef.current) setSummaryReleased(true);
+      return null;
     }
   }, [meetingId]);
 
-  useEffect(() => {
-    void refreshStatus();
-    return () => { statusRequestRef.current += 1; };
-  }, [refreshStatus]);
+  const refreshStatus = useCallback(async () => { await readStatus(); }, [readStatus]);
 
   useEffect(() => {
     const unlisteners: UnlistenFn[] = [];
@@ -85,41 +94,59 @@ export function useSpeakerIdentification({
       else unlisteners.push(unlisten);
     };
 
-    void register<SpeakerIdProgress>('speaker-identification-progress', payload => {
-      setProgress(payload);
-      setError(null);
-      setStatus(prev => prev && {
-        ...prev, status: 'running', stage: payload.stage, progress_percentage: payload.progress_percentage,
+    const registrations = [
+      register<SpeakerIdProgress>('speaker-identification-progress', payload => {
+        setProgress(payload);
+        setError(null);
+        setStatus(prev => prev && {
+          ...prev, status: 'running', stage: payload.stage, progress_percentage: payload.progress_percentage,
+        });
+      }),
+
+      register<SpeakerIdComplete>('speaker-identification-complete', payload => {
+        setProgress(null);
+        setError(null);
+        setSummaryReleased(true);
+        void readStatus();
+        if (payload.speaker_count === 0) {
+          toast.info('No speech detected', { description: 'Speaker identification found nobody talking.' });
+        } else {
+          toast.success(`Identified ${payload.speaker_count} speaker${payload.speaker_count === 1 ? '' : 's'}`);
+        }
+        void onCompleteRef.current?.(payload);
+      }),
+
+      register<SpeakerIdError>('speaker-identification-error', payload => {
+        setProgress(null);
+        setSummaryReleased(true);
+        void readStatus();
+        const silent = SILENT_ERROR_CODES.includes(payload.code);
+        setError(silent ? null : payload);
+        if (!silent) toast.error('Speaker identification failed', { description: payload.error });
+      }),
+    ];
+
+    // Read the status only once every listener is in place: an event emitted in between
+    // would otherwise be lost, leaving a stale "running" status or unlabelled rows.
+    void (async () => {
+      const results = await Promise.allSettled(registrations);
+      results.forEach(result => {
+        if (result.status === 'rejected') {
+          console.warn('Failed to listen for speaker identification events:', result.reason);
+        }
       });
-    });
-
-    void register<SpeakerIdComplete>('speaker-identification-complete', payload => {
-      setProgress(null);
-      setError(null);
-      setSummaryReleased(true);
-      void refreshStatus();
-      if (payload.speaker_count === 0) {
-        toast.info('No speech detected', { description: 'Speaker identification found nobody talking.' });
-      } else {
-        toast.success(`Identified ${payload.speaker_count} speaker${payload.speaker_count === 1 ? '' : 's'}`);
-      }
-      void onCompleteRef.current?.(payload);
-    });
-
-    void register<SpeakerIdError>('speaker-identification-error', payload => {
-      setProgress(null);
-      setSummaryReleased(true);
-      void refreshStatus();
-      const silent = SILENT_ERROR_CODES.includes(payload.code);
-      setError(silent ? null : payload);
-      if (!silent) toast.error('Speaker identification failed', { description: payload.error });
-    });
+      if (cleanedUp) return;
+      // A completion event handled meanwhile makes this read stale; readStatus then yields null.
+      const initial = await readStatus();
+      if (!cleanedUp && initial?.status === 'completed') void onAlreadyCompletedRef.current?.(initial);
+    })();
 
     return () => {
       cleanedUp = true;
+      statusRequestRef.current += 1;
       unlisteners.forEach(unlisten => unlisten());
     };
-  }, [meetingId, refreshStatus]);
+  }, [meetingId, readStatus]);
 
   const isActive = status !== null && ACTIVE_STATUSES.includes(status.status);
 

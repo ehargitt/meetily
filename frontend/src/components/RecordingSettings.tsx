@@ -90,7 +90,7 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
   const handleAutoIdentifyToggle = async (enabled: boolean) => {
     const newPreferences = { ...preferences, auto_identify_speakers: enabled };
     setPreferences(newPreferences);
-    await savePreferences(newPreferences);
+    await savePreferences(newPreferences, 'setting');
 
     await Analytics.track('auto_identify_speakers_toggled', {
       enabled: enabled.toString()
@@ -144,21 +144,26 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     }
   };
 
-  const savePreferences = async (prefs: RecordingPreferences) => {
+  // `setting` saves a single toggle; its toast must not claim that devices were saved.
+  const savePreferences = async (prefs: RecordingPreferences, saved: 'devices' | 'setting' = 'devices') => {
     setSaving(true);
     try {
       await invoke('set_recording_preferences', { preferences: prefs });
       onSave?.(prefs);
 
-      // Show success toast with device details
-      const micDevice = prefs.preferred_mic_device || 'Default';
-      const systemDevice = prefs.preferred_system_device || 'Default';
-      toast.success("Device preferences saved", {
-        description: `Microphone: ${micDevice}, System Audio: ${systemDevice}`
-      });
+      if (saved === 'setting') {
+        toast.success('Preference saved');
+      } else {
+        // Show success toast with device details
+        const micDevice = prefs.preferred_mic_device || 'Default';
+        const systemDevice = prefs.preferred_system_device || 'Default';
+        toast.success("Device preferences saved", {
+          description: `Microphone: ${micDevice}, System Audio: ${systemDevice}`
+        });
+      }
     } catch (error) {
       console.error('Failed to save recording preferences:', error);
-      toast.error("Failed to save device preferences", {
+      toast.error(saved === 'setting' ? 'Failed to save preference' : "Failed to save device preferences", {
         description: error instanceof Error ? error.message : String(error)
       });
     } finally {

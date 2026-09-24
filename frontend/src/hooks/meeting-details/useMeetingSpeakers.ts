@@ -17,6 +17,10 @@ export async function fetchMeetingSpeakers(meetingId: string): Promise<MeetingSp
   }
 }
 
+/** Rust saves no voiceprint for a speaker with less speech than this (MIN_ENROLL_SECS). */
+export const MIN_VOICEPRINT_SPEECH_SECONDS = 10;
+export const SHORT_VOICEPRINT_MESSAGE = 'Needs at least 10 s of speech to save a voiceprint';
+
 export type SpeakerEdit = 'rename' | 'self' | 'merge';
 
 interface UseMeetingSpeakersProps {
@@ -41,10 +45,17 @@ export function useMeetingSpeakers({ meetingId, onSpeakersEdited }: UseMeetingSp
   const onSpeakersEditedRef = useRef(onSpeakersEdited);
   onSpeakersEditedRef.current = onSpeakersEdited;
 
+  // A failed read keeps the speakers on screen: clearing them would hide every name.
   const refresh = useCallback(async () => {
     const requestId = ++requestIdRef.current;
-    const result = await fetchMeetingSpeakers(meetingId);
-    if (requestId === requestIdRef.current) setSpeakers(result);
+    try {
+      const result = await invoke<MeetingSpeaker[]>('api_get_meeting_speakers', { meetingId });
+      if (requestId === requestIdRef.current) setSpeakers(result);
+    } catch (error) {
+      if (requestId !== requestIdRef.current) return;
+      console.error('Failed to load meeting speakers:', error);
+      toast.error('Failed to load speakers', { description: String(error) });
+    }
   }, [meetingId]);
 
   useEffect(() => {
@@ -53,34 +64,40 @@ export function useMeetingSpeakers({ meetingId, onSpeakersEdited }: UseMeetingSp
     return () => { requestIdRef.current += 1; };
   }, [refresh]);
 
+  /** Resolves to whether the edit was saved. */
   const saveEdit = useCallback(async (edit: SpeakerEdit, action: () => Promise<unknown>, failureMessage: string) => {
     try {
       await action();
     } catch (error) {
       console.error(`${failureMessage}:`, error);
       toast.error(failureMessage, { description: String(error) });
-      return;
+      return false;
     }
     await refresh();
     onSpeakersEditedRef.current?.(edit);
+    return true;
   }, [refresh]);
 
-  const renameSpeaker = useCallback((speakerKey: string, displayName: string) =>
-    saveEdit('rename', () => invoke<MeetingSpeaker>('api_update_meeting_speaker', {
+  const renameSpeaker = useCallback(async (speakerKey: string, displayName: string) => {
+    await saveEdit('rename', () => invoke<MeetingSpeaker>('api_update_meeting_speaker', {
       meetingId, speakerKey, displayName: displayName.trim(), isSelf: null,
-    }), 'Failed to rename speaker'),
-  [meetingId, saveEdit]);
+    }), 'Failed to rename speaker');
+  }, [meetingId, saveEdit]);
 
-  const setSelf = useCallback((speakerKey: string, isSelf: boolean) =>
-    saveEdit('self', () => invoke<MeetingSpeaker>('api_update_meeting_speaker', {
+  const setSelf = useCallback(async (speakerKey: string, isSelf: boolean) => {
+    const speaker = speakers.find(candidate => candidate.speaker_key === speakerKey);
+    const saved = await saveEdit('self', () => invoke<MeetingSpeaker>('api_update_meeting_speaker', {
       meetingId, speakerKey, displayName: null, isSelf,
-    }), 'Failed to update speaker'),
-  [meetingId, saveEdit]);
+    }), 'Failed to update speaker');
+    if (saved && isSelf && speaker && speaker.talk_time_seconds < MIN_VOICEPRINT_SPEECH_SECONDS) {
+      toast.info('Marked as you, but no voiceprint was saved', { description: SHORT_VOICEPRINT_MESSAGE });
+    }
+  }, [meetingId, saveEdit, speakers]);
 
-  const mergeSpeakers = useCallback((fromKey: string, intoKey: string) =>
-    saveEdit('merge', () => invoke('api_merge_meeting_speakers', { meetingId, fromKey, intoKey }),
-      'Failed to merge speakers'),
-  [meetingId, saveEdit]);
+  const mergeSpeakers = useCallback(async (fromKey: string, intoKey: string) => {
+    await saveEdit('merge', () => invoke('api_merge_meeting_speakers', { meetingId, fromKey, intoKey }),
+      'Failed to merge speakers');
+  }, [meetingId, saveEdit]);
 
   const speakerMap = useMemo(() => speakersByKey(speakers), [speakers]);
 

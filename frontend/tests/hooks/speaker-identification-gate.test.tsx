@@ -101,7 +101,7 @@ describe('auto-summary gate for speaker identification', () => {
     await act(async () => { resolveStatus(status('running')); });
     expect(state.isSummaryHeld).toBe(true);
     await emit('speaker-identification-progress', {
-      meeting_id: 'meeting-a', stage: 'embedding', progress_percentage: 50, message: 'Analysing voices',
+      meeting_id: 'meeting-a', stage: 'embedding', progress_percentage: 50, message: 'Analyzing voices',
     });
     expect(state.isSummaryHeld).toBe(true);
     expect(generate).not.toHaveBeenCalled();

@@ -14,6 +14,10 @@ import { Switch } from '@/components/ui/switch';
 import { MeetingSpeaker } from '@/types';
 import { speakerColorIndex, speakerLabel } from '@/lib/speaker-label';
 import { speakerColorClasses } from './speakerColors';
+import {
+  MIN_VOICEPRINT_SPEECH_SECONDS,
+  SHORT_VOICEPRINT_MESSAGE,
+} from '@/hooks/meeting-details/useMeetingSpeakers';
 import { cn } from '@/lib/utils';
 
 interface SpeakersPopoverProps {
@@ -157,6 +161,9 @@ function SpeakerRow({ speaker, others, showSelfSuggestion, onRename, onSetSelf, 
           onCheckedChange={checked => void run(() => onSetSelf(key, checked))}
         />
       </label>
+      {speaker.talk_time_seconds < MIN_VOICEPRINT_SPEECH_SECONDS && (
+        <p className="text-xs text-muted-foreground">{SHORT_VOICEPRINT_MESSAGE}</p>
+      )}
       {showSelfSuggestion && (
         <div className="flex items-center justify-between rounded-md border border-blue-200 bg-blue-50 px-2 py-1.5 text-xs text-blue-800">
           <span>This sounds like you. Is this you?</span>

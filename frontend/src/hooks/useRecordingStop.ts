@@ -17,6 +17,25 @@ import {
 
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
 
+export const SPEAKER_MODELS_HINT_SHOWN_KEY = 'speaker_models_hint_shown';
+
+/**
+ * Automatic identification is on by default but skips quietly until the models are downloaded,
+ * so say once where to get them. Storage can be unavailable; the hint then shows each time.
+ */
+function showSpeakerModelsHintOnce() {
+  try {
+    if (localStorage.getItem(SPEAKER_MODELS_HINT_SHOWN_KEY)) return;
+    localStorage.setItem(SPEAKER_MODELS_HINT_SHOWN_KEY, 'true');
+  } catch (error) {
+    console.warn('Could not remember the speaker models hint:', error);
+  }
+  toast.info('Download speaker models in Settings to identify speakers automatically', {
+    description: 'Settings → Recordings → Speaker Identification',
+    duration: 10000,
+  });
+}
+
 interface UseRecordingStopReturn {
   handleRecordingStop: (callApi: boolean) => Promise<void>;
   isStopping: boolean;
@@ -274,6 +293,9 @@ export function useRecordingStop(
               trigger: 'auto',
             });
             console.log('Automatic speaker identification:', identification);
+            if (identification.status === 'skipped' && identification.reason === 'models_missing') {
+              showSpeakerModelsHintOnce();
+            }
           } catch (error) {
             console.warn('Failed to start automatic speaker identification:', error);
           }

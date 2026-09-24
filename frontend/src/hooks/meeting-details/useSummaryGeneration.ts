@@ -59,6 +59,14 @@ async function resolveSummaryLanguage(
 
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
 
+export interface GenerateSummaryOptions {
+  /**
+   * Start the summary even if the page unmounts first. It then runs in Rust unobserved, and the
+   * page picks it up again from the saved summary status when the meeting is reopened.
+   */
+  survivesUnmount?: boolean;
+}
+
 function restoredSummaryStatus(response?: SummaryProcessResponse | null): SummaryStatus {
   if (!response) return 'idle';
   if (response.status === 'pending' || response.status === 'processing') return 'processing';
@@ -312,11 +320,13 @@ export function useSummaryGeneration({
     transcriptTexts,
     customPrompt = '',
     isRegeneration = false,
+    survivesUnmount = false,
   }: {
     transcriptText: string;
     transcriptTexts?: string[];
     customPrompt?: string;
     isRegeneration?: boolean;
+    survivesUnmount?: boolean;
   }) => {
     const previousAttempt = trackedAttemptRef.current;
     if (previousAttempt && !previousAttempt.finished) {
@@ -360,7 +370,8 @@ export function useSummaryGeneration({
         meeting.id,
         transcriptTexts?.length ? transcriptTexts : [transcriptText],
       );
-      if (!mountedRef.current || visibleMeetingIdRef.current !== meeting.id || generationId !== generationIdRef.current) {
+      const leftPage = !mountedRef.current || visibleMeetingIdRef.current !== meeting.id;
+      if (generationId !== generationIdRef.current || (leftPage && !survivesUnmount)) {
         return;
       }
 
@@ -448,7 +459,10 @@ export function useSummaryGeneration({
     toast.error(message);
   }, []);
 
-  const handleGenerateSummary = useCallback(async (customPrompt: string = '') => {
+  const handleGenerateSummary = useCallback(async (
+    customPrompt: string = '',
+    { survivesUnmount = false }: GenerateSummaryOptions = {},
+  ) => {
     if (isModelConfigLoading) {
       toast.info('Loading model configuration, please wait...');
       return;
@@ -495,6 +509,7 @@ export function useSummaryGeneration({
     await processSummary({
       ...buildSummaryTranscriptPayload(allTranscripts, speakers),
       customPrompt,
+      survivesUnmount,
     });
   }, [
     buildSummaryTranscriptPayload,

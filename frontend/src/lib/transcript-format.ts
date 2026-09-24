@@ -3,8 +3,9 @@ import { speakerLabel, speakersByKey } from './speaker-label';
 
 export type FormattableTranscript = Pick<Transcript, 'text' | 'timestamp' | 'audio_start_time' | 'speaker_key'>;
 
-// Summary chunking splits long input at newlines, so a merged speaker run is capped to keep
-// every chunk starting on a line that carries its speaker label.
+// Summary chunking ends each chunk at a line break and starts the next at a line start. A merged
+// speaker run is capped so that no line outgrows a chunk, which keeps every chunk starting on a
+// line that carries its speaker label.
 const MAX_SUMMARY_LINE_CHARS = 1000;
 
 /** `[MM:SS]` from recording-relative seconds; legacy rows without audio time keep their wall-clock timestamp. */
