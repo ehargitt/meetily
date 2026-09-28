@@ -4,7 +4,7 @@ import type { MeetingSpeaker } from '../../src/types';
 
 const speaker = (overrides: Partial<MeetingSpeaker> = {}): MeetingSpeaker => ({
   speaker_key: 'S2', display_name: null, is_self: false, color_index: 1,
-  segment_count: 3, talk_time_seconds: 12, ...overrides,
+  segment_count: 3, talk_time_seconds: 12, voiceprint: 'ready', ...overrides,
 });
 
 describe('speaker labels', () => {

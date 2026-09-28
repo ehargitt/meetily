@@ -57,6 +57,25 @@ pub struct MeetingSpeaker {
     pub color_index: i64,
     pub segment_count: i64,
     pub talk_time_seconds: f64,
+    pub voiceprint: VoiceprintState,
+}
+
+/// Whether marking a speaker "Me" puts its voice in the self voiceprint (the same conditions
+/// `rebuild_self_voiceprint` enrolls by), so the UI can say when it does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(rename_all = "snake_case")]
+pub enum VoiceprintState {
+    /// Enrollable; for a "Me" speaker the self voiceprint exists.
+    Ready,
+    /// Less than [`MIN_ENROLL_SECS`] of speech.
+    TooShort,
+    /// No embedding from the current model ("Forget my voice" drops the "Me" ones); running
+    /// identification again restores it.
+    VoiceMissing,
+    /// Marked "Me" and enrollable, but no self voiceprint exists: it was forgotten and the
+    /// voice came back from a later identification run.
+    NotSaved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,9 +121,24 @@ const SELECT_MEETING_SPEAKERS: &str = "
     SELECT ms.speaker_key, ms.display_name, ms.is_self, ms.suggested_self, ms.color_index,
            (SELECT COUNT(*) FROM transcript_speakers ts
              WHERE ts.meeting_id = ms.meeting_id AND ts.speaker_key = ms.speaker_key) AS segment_count,
-           ms.speech_seconds AS talk_time_seconds
+           ms.speech_seconds AS talk_time_seconds,
+           CASE
+               WHEN ms.speech_seconds < ? THEN 'too_short'
+               WHEN ms.embedding IS NULL OR ms.embedding_model IS NOT ? THEN 'voice_missing'
+               WHEN ms.is_self = 1
+                    AND NOT EXISTS (SELECT 1 FROM speaker_profiles WHERE is_self = 1)
+                   THEN 'not_saved'
+               ELSE 'ready'
+           END AS voiceprint
     FROM meeting_speakers ms
     WHERE ms.meeting_id = ?";
+
+/// Bind the parameters of [`SELECT_MEETING_SPEAKERS`] that come before `meeting_id`.
+fn bind_voiceprint_params<'q>(
+    query: sqlx::query::QueryAs<'q, Sqlite, MeetingSpeaker, sqlx::sqlite::SqliteArguments<'q>>,
+) -> sqlx::query::QueryAs<'q, Sqlite, MeetingSpeaker, sqlx::sqlite::SqliteArguments<'q>> {
+    query.bind(MIN_ENROLL_SECS).bind(MODEL_ID)
+}
 
 pub struct SpeakerRepository;
 
@@ -117,7 +151,7 @@ impl SpeakerRepository {
         let query = format!(
             "{SELECT_MEETING_SPEAKERS} ORDER BY CAST(SUBSTR(ms.speaker_key, 2) AS INTEGER)"
         );
-        Ok(sqlx::query_as::<_, MeetingSpeaker>(&query)
+        Ok(bind_voiceprint_params(sqlx::query_as(&query))
             .bind(meeting_id)
             .fetch_all(pool)
             .await?)
@@ -209,6 +243,8 @@ impl SpeakerRepository {
     /// Rename a speaker (`Some("")` resets to the default label) and/or mark it as the local
     /// user. Marking "Me" clears it from the meeting's other speakers. Any change of "Me"
     /// rebuilds the self voiceprint, so un-marking or moving "Me" also takes that voice out.
+    /// Marking a speaker that is already "Me" rebuilds it too, which saves a voiceprint again
+    /// after "Forget my voice" once identification has restored the voice.
     pub async fn update_meeting_speaker(
         pool: &SqlitePool,
         meeting_id: &str,
@@ -248,6 +284,7 @@ impl SpeakerRepository {
                 .await?;
                 rebuild_self_voiceprint(&mut tx).await?;
             }
+            Some(true) => rebuild_self_voiceprint(&mut tx).await?,
             Some(false) if current.is_self => {
                 sqlx::query(
                     "UPDATE meeting_speakers SET is_self = 0, updated_at = ?
@@ -456,7 +493,7 @@ async fn fetch_speaker(
     speaker_key: &str,
 ) -> Result<MeetingSpeaker, SpeakerRepoError> {
     let query = format!("{SELECT_MEETING_SPEAKERS} AND ms.speaker_key = ?");
-    sqlx::query_as::<_, MeetingSpeaker>(&query)
+    bind_voiceprint_params(sqlx::query_as(&query))
         .bind(meeting_id)
         .bind(speaker_key)
         .fetch_optional(conn)

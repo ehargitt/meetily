@@ -22,7 +22,7 @@ const row = (start: number | undefined, text: string, speaker_key?: string | nul
 });
 const speaker = (key: string, overrides: Partial<MeetingSpeaker> = {}): MeetingSpeaker => ({
   speaker_key: key, display_name: null, is_self: false, color_index: Number(key.slice(1)) - 1,
-  segment_count: 1, talk_time_seconds: 1, ...overrides,
+  segment_count: 1, talk_time_seconds: 1, voiceprint: 'too_short', ...overrides,
 });
 
 const unlabelled = [row(0.5, ' Hello there.'), row(65.9, 'Second line'), row(undefined, 'Legacy row')];

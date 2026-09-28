@@ -112,7 +112,7 @@ const invoke = mock(async (command: string, args: CommandArgs = {}): Promise<unk
       };
     case 'api_get_meeting_speakers':
       return meeting.labelled
-        ? [{ speaker_key: 'S1', display_name: 'Alice', is_self: false, color_index: 0, segment_count: 1, talk_time_seconds: 2 }]
+        ? [{ speaker_key: 'S1', display_name: 'Alice', is_self: false, color_index: 0, segment_count: 1, talk_time_seconds: 2, voiceprint: 'too_short' }]
         : [];
     case 'api_process_transcript':
       processes.push({ meetingId, text: args.text ?? '' });

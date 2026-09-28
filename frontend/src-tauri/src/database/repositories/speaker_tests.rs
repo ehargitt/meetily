@@ -573,6 +573,50 @@ async fn forgetting_the_voiceprint_drops_the_me_embeddings_so_it_is_not_rebuilt(
 }
 
 #[tokio::test]
+async fn speakers_report_whether_marking_me_saves_a_voiceprint() {
+    let pool = test_pool().await;
+    seed_meeting(&pool, MEETING).await;
+    seed_voice(&pool, MEETING, "S1", None, 20.0, 0).await;
+    seed_voice(&pool, MEETING, "S2", None, 20.0, 1).await;
+    seed_voice(&pool, MEETING, "S3", None, MIN_ENROLL_SECS - 1.0, 2).await;
+    mark_me(&pool, MEETING, "S1", true).await;
+    assert_eq!(speaker(&pool, "S1").await.voiceprint, VoiceprintState::Ready);
+    assert_eq!(speaker(&pool, "S2").await.voiceprint, VoiceprintState::Ready);
+    assert_eq!(speaker(&pool, "S3").await.voiceprint, VoiceprintState::TooShort);
+
+    SpeakerRepository::delete_self_voiceprint(&pool)
+        .await
+        .unwrap();
+    assert_eq!(speaker(&pool, "S1").await.voiceprint, VoiceprintState::VoiceMissing);
+    assert_eq!(speaker(&pool, "S2").await.voiceprint, VoiceprintState::Ready);
+
+    // Marking "Me" again reports that nothing was saved.
+    mark_me(&pool, MEETING, "S1", false).await;
+    let remarked =
+        SpeakerRepository::update_meeting_speaker(&pool, MEETING, "S1", None, Some(true))
+            .await
+            .unwrap();
+    assert_eq!(remarked.voiceprint, VoiceprintState::VoiceMissing);
+    assert_eq!(self_profile(&pool).await, None);
+
+    // Identification restores the voice without re-enrolling it...
+    sqlx::query("UPDATE meeting_speakers SET embedding = ? WHERE speaker_key = 'S1'")
+        .bind(voiceprint::to_blob(&unit_vector(0)))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(speaker(&pool, "S1").await.voiceprint, VoiceprintState::NotSaved);
+    assert_eq!(self_profile(&pool).await, None);
+
+    // ...until the user marks the speaker that is already "Me" again.
+    let saved = SpeakerRepository::update_meeting_speaker(&pool, MEETING, "S1", None, Some(true))
+        .await
+        .unwrap();
+    assert_eq!(saved.voiceprint, VoiceprintState::Ready);
+    assert_eq!(self_profile(&pool).await, Some((unit_vector(0), 20.0)));
+}
+
+#[tokio::test]
 async fn write_transactions_take_the_write_lock_up_front() {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 

@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
-import { MeetingSpeaker } from '@/types';
+import { MeetingSpeaker, VoiceprintState } from '@/types';
 import { speakersByKey } from '@/lib/speaker-label';
 
 /**
@@ -17,9 +17,15 @@ export async function fetchMeetingSpeakers(meetingId: string): Promise<MeetingSp
   }
 }
 
-/** Rust saves no voiceprint for a speaker with less speech than this (MIN_ENROLL_SECS). */
-export const MIN_VOICEPRINT_SPEECH_SECONDS = 10;
 export const SHORT_VOICEPRINT_MESSAGE = 'Needs at least 10 s of speech to save a voiceprint';
+export const MISSING_VOICE_MESSAGE = 'Run Identify again to save a voiceprint for this speaker';
+
+/** Why marking this speaker "This is me" saves no voiceprint, or null when it does. */
+export function voiceprintProblem(state: VoiceprintState): string | null {
+  if (state === 'too_short') return SHORT_VOICEPRINT_MESSAGE;
+  if (state === 'voice_missing') return MISSING_VOICE_MESSAGE;
+  return null;
+}
 
 export type SpeakerEdit = 'rename' | 'self' | 'merge';
 
@@ -64,8 +70,8 @@ export function useMeetingSpeakers({ meetingId, onSpeakersEdited }: UseMeetingSp
     return () => { requestIdRef.current += 1; };
   }, [refresh]);
 
-  /** Resolves to whether the edit was saved. */
-  const saveEdit = useCallback(async (edit: SpeakerEdit, action: () => Promise<unknown>, failureMessage: string) => {
+  /** Resolves to whether the edit was saved. A null edit changed no speaker label, so it is not reported. */
+  const saveEdit = useCallback(async (edit: SpeakerEdit | null, action: () => Promise<unknown>, failureMessage: string) => {
     try {
       await action();
     } catch (error) {
@@ -74,7 +80,7 @@ export function useMeetingSpeakers({ meetingId, onSpeakersEdited }: UseMeetingSp
       return false;
     }
     await refresh();
-    onSpeakersEditedRef.current?.(edit);
+    if (edit) onSpeakersEditedRef.current?.(edit);
     return true;
   }, [refresh]);
 
@@ -85,13 +91,16 @@ export function useMeetingSpeakers({ meetingId, onSpeakersEdited }: UseMeetingSp
   }, [meetingId, saveEdit]);
 
   const setSelf = useCallback(async (speakerKey: string, isSelf: boolean) => {
-    const speaker = speakers.find(candidate => candidate.speaker_key === speakerKey);
-    const saved = await saveEdit('self', () => invoke<MeetingSpeaker>('api_update_meeting_speaker', {
-      meetingId, speakerKey, displayName: null, isSelf,
-    }), 'Failed to update speaker');
-    if (saved && isSelf && speaker && speaker.talk_time_seconds < MIN_VOICEPRINT_SPEECH_SECONDS) {
-      toast.info('Marked as you, but no voiceprint was saved', { description: SHORT_VOICEPRINT_MESSAGE });
-    }
+    // Marking the speaker that is already "Me" only saves its voiceprint again; no label changes.
+    const labelChanges = speakers.find(candidate => candidate.speaker_key === speakerKey)?.is_self !== isSelf;
+    let updated: MeetingSpeaker | undefined;
+    const saved = await saveEdit(labelChanges ? 'self' : null, async () => {
+      updated = await invoke<MeetingSpeaker>('api_update_meeting_speaker', {
+        meetingId, speakerKey, displayName: null, isSelf,
+      });
+    }, 'Failed to update speaker');
+    const problem = saved && isSelf && updated ? voiceprintProblem(updated.voiceprint) : null;
+    if (problem) toast.info('Marked as you, but no voiceprint was saved', { description: problem });
   }, [meetingId, saveEdit, speakers]);
 
   const mergeSpeakers = useCallback(async (fromKey: string, intoKey: string) => {

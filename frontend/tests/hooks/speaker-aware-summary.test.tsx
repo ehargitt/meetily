@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { useState } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
-import type { MeetingSpeaker, MeetingSummary, SpeakerIdJobStatus, SpeakerIdStatus, Transcript } from '../../src/types';
+import type { MeetingSpeaker, MeetingSummary, SpeakerIdJobStatus, SpeakerIdStatus, Transcript, VoiceprintState } from '../../src/types';
 
 // Bun shares module mocks between test files; restore the real modules after this suite.
 // The real event module is never loaded (see speaker-identification-gate.test.tsx); its mock stays registered.
@@ -26,7 +26,7 @@ let speakers: MeetingSpeaker[];
 let failSpeakerReads: boolean;
 let speakersChangedSinceSummary: boolean;
 const statusReads: string[] = [];
-const invoke = mock(async (command: string): Promise<unknown> => {
+const invoke = mock(async (command: string, args?: Record<string, unknown>): Promise<unknown> => {
   if (command === 'get_speaker_identification_status') {
     statusReads.push(jobStatus);
     const status: SpeakerIdStatus = {
@@ -39,7 +39,7 @@ const invoke = mock(async (command: string): Promise<unknown> => {
     if (failSpeakerReads) throw new Error('database is locked');
     return speakers;
   }
-  if (command === 'api_update_meeting_speaker') return speakers[0];
+  if (command === 'api_update_meeting_speaker') return speakers.find(s => s.speaker_key === args?.speakerKey);
   throw new Error(`Unexpected command: ${command}`);
 });
 mock.module('@tauri-apps/api/core', () => ({ ...originalCore, invoke }));
@@ -61,7 +61,7 @@ const listen = mock((event: string, handler: Handler) => {
 mock.module('@tauri-apps/api/event', () => ({ listen }));
 
 const { useSpeakerAwareSummary } = await import('../../src/hooks/meeting-details/useSpeakerAwareSummary');
-const { SHORT_VOICEPRINT_MESSAGE } = await import('../../src/hooks/meeting-details/useMeetingSpeakers');
+const { MISSING_VOICE_MESSAGE, SHORT_VOICEPRINT_MESSAGE } = await import('../../src/hooks/meeting-details/useMeetingSpeakers');
 
 type SummaryStatus = Parameters<typeof useSpeakerAwareSummary>[0]['summaryStatus'];
 
@@ -69,8 +69,8 @@ const row = (id: string, speakerKey: string | null): Transcript => ({
   id, text: `line ${id}`, timestamp: '00:00', audio_start_time: 0, speaker_key: speakerKey,
 });
 const readRows = () => [row('1', labeled ? 'S1' : null), row('2', labeled ? 'S2' : null)];
-const speaker = (key: string, talkTime: number): MeetingSpeaker => ({
-  speaker_key: key, display_name: null, is_self: false, color_index: 0, segment_count: 3, talk_time_seconds: talkTime,
+const speaker = (key: string, talkTime: number, voiceprint: VoiceprintState = talkTime < 10 ? 'too_short' : 'ready'): MeetingSpeaker => ({
+  speaker_key: key, display_name: null, is_self: false, color_index: 0, segment_count: 3, talk_time_seconds: talkTime, voiceprint,
 });
 
 const generate = mock(async (..._args: unknown[]) => {});
@@ -318,5 +318,30 @@ describe('meeting page wiring for speaker identification', () => {
     await act(async () => { await state.meetingSpeakers.setSelf('S1', true); });
     expect(toastInfo).toHaveBeenCalledTimes(1);
     expect(toastInfo.mock.calls[0][1]).toEqual({ description: SHORT_VOICEPRINT_MESSAGE });
+  });
+
+  test('"This is me" after "Forget my voice" says to run Identify again', async () => {
+    speakers = [speaker('S1', 121, 'voice_missing')];
+    await show(false);
+    await act(async () => { await state.meetingSpeakers.setSelf('S1', true); });
+    expect(toastInfo).toHaveBeenCalledTimes(1);
+    expect(toastInfo.mock.calls[0][1]).toEqual({ description: MISSING_VOICE_MESSAGE });
+  });
+
+  test('saving the voiceprint of the speaker that is already "Me" does not flag the summary', async () => {
+    jobStatus = 'completed';
+    labeled = true;
+    speakers = [{ ...speaker('S1', 121, 'not_saved'), is_self: true }];
+    summaryStatus = 'completed';
+    aiSummary = { markdown: 'Summary with names' } as MeetingSummary;
+    await show(false);
+    expect(state.showSpeakerNamesHint).toBe(false);
+
+    await act(async () => { await state.meetingSpeakers.setSelf('S1', true); });
+    expect(invoke.mock.calls.some(([command]) => command === 'api_update_meeting_speaker')).toBe(true);
+    expect(state.showSpeakerNamesHint).toBe(false);
+
+    await act(async () => { await state.meetingSpeakers.setSelf('S1', false); });
+    expect(state.showSpeakerNamesHint).toBe(true);
   });
 });

@@ -158,7 +158,15 @@ export interface MeetingSpeaker {
   talk_time_seconds: number;
   /** Voice resembles the saved "Me" voiceprint, but not closely enough to label automatically. */
   suggested_self?: boolean;
+  voiceprint: VoiceprintState;
 }
+
+/**
+ * Whether marking a speaker "This is me" saves its voice as the voiceprint: `too_short` under
+ * 10 s of speech, `voice_missing` after "Forget my voice" until identification runs again,
+ * `not_saved` for a "Me" speaker whose voice is back but whose voiceprint was forgotten.
+ */
+export type VoiceprintState = 'ready' | 'too_short' | 'voice_missing' | 'not_saved';
 
 export type SpeakerIdJobStatus =
   | 'none'

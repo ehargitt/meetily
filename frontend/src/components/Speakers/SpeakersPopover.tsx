@@ -15,7 +15,7 @@ import { MeetingSpeaker } from '@/types';
 import { speakerColorIndex, speakerLabel } from '@/lib/speaker-label';
 import { speakerColorClasses } from './speakerColors';
 import {
-  MIN_VOICEPRINT_SPEECH_SECONDS,
+  MISSING_VOICE_MESSAGE,
   SHORT_VOICEPRINT_MESSAGE,
 } from '@/hooks/meeting-details/useMeetingSpeakers';
 import { cn } from '@/lib/utils';
@@ -161,8 +161,25 @@ function SpeakerRow({ speaker, others, showSelfSuggestion, onRename, onSetSelf, 
           onCheckedChange={checked => void run(() => onSetSelf(key, checked))}
         />
       </label>
-      {speaker.talk_time_seconds < MIN_VOICEPRINT_SPEECH_SECONDS && (
+      {speaker.voiceprint === 'too_short' && (
         <p className="text-xs text-muted-foreground">{SHORT_VOICEPRINT_MESSAGE}</p>
+      )}
+      {speaker.is_self && speaker.voiceprint === 'voice_missing' && (
+        <p className="text-xs text-muted-foreground">This voice is not in your voiceprint. {MISSING_VOICE_MESSAGE}.</p>
+      )}
+      {speaker.is_self && speaker.voiceprint === 'not_saved' && (
+        <div className="flex items-center justify-between text-xs text-muted-foreground">
+          <span>No voiceprint saved.</span>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-6 px-2 text-xs"
+            disabled={isSaving}
+            onClick={() => void run(() => onSetSelf(key, true))}
+          >
+            Save voiceprint
+          </Button>
+        </div>
       )}
       {showSelfSuggestion && (
         <div className="flex items-center justify-between rounded-md border border-blue-200 bg-blue-50 px-2 py-1.5 text-xs text-blue-800">
