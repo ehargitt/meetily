@@ -22,9 +22,7 @@ use super::{
     RecordingManager,
 };
 use super::device_monitor::{DeviceEvent, DeviceMonitorType};
-use super::recording_state::{
-    DeviceType as RecordingDeviceType, StreamFault, StreamHealthEvent, StreamStatus,
-};
+use super::recording_state::{DeviceType as RecordingDeviceType, StreamFault, StreamHealthEvent};
 
 // Import transcription modules
 use super::transcription::{
@@ -515,7 +513,14 @@ fn resolve_mic_or_default<R: Runtime>(
 /// ponytail: no cpal enumeration check (unlike the mic helper) — Linux system
 /// devices are Pulse/ALSA monitor *inputs* tagged Output, so output_devices()
 /// would false-negative them. stream.rs still hard-fails on a missing device.
-fn resolve_system_or_default(requested_name: Option<&str>) -> Option<Arc<super::AudioDevice>> {
+///
+/// When nothing resolves (e.g. Linux with no monitor source configured) the
+/// user is told with `system-audio-unavailable` that participants' audio will
+/// not be recorded.
+fn resolve_system_or_default<R: Runtime>(
+    app: &AppHandle<R>,
+    requested_name: Option<&str>,
+) -> Option<Arc<super::AudioDevice>> {
     if let Some(name) = requested_name {
         match parse_audio_device(name) {
             Ok(device) => {
@@ -536,6 +541,13 @@ fn resolve_system_or_default(requested_name: Option<&str>) -> Option<Arc<super::
         }
         Err(e) => {
             warn!("⚠️ No system audio available: {} — recording will continue with microphone only", e);
+            emit_stream_health_event(
+                app,
+                StreamHealthEvent::SystemAudioUnavailable {
+                    device_name: None,
+                    reason: format!("No system audio device found: {}", e),
+                },
+            );
             None
         }
     }
@@ -645,7 +657,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     #[cfg(not(target_os = "macos"))]
     let microphone_device = resolve_mic_or_default(&app, preferred_mic_name.as_deref());
 
-    let system_device = resolve_system_or_default(preferred_system_name.as_deref());
+    let system_device = resolve_system_or_default(&app, preferred_system_name.as_deref());
 
     #[cfg(target_os = "macos")]
     prepare_audio_for_recording(system_device.as_deref()).await?;
@@ -762,7 +774,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     #[cfg(not(target_os = "macos"))]
     let mic_device = resolve_mic_or_default(&app, mic_device_name.as_deref());
 
-    let system_device = resolve_system_or_default(system_device_name.as_deref());
+    let system_device = resolve_system_or_default(&app, system_device_name.as_deref());
 
     #[cfg(target_os = "macos")]
     prepare_audio_for_recording(system_device.as_deref()).await?;
@@ -1695,226 +1707,81 @@ async fn do_stream_swap(
 // STREAM SUPERVISION (dead/stalled stream rebuild)
 // ============================================================================
 
-/// How often the supervisor checks for stalled streams and recoveries.
-const STREAM_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// Delays before each attempt to rebuild a dead stream on its own device.
-const STREAM_REBUILD_BACKOFF_MS: [u64; 4] = [250, 1_000, 2_000, 4_000];
+mod stream_supervisor;
+use stream_supervisor::{RebuildRequest, SupervisorHost};
 
 /// Guards against overlapping system-stream rebuilds. Mic rebuilds share
 /// MIC_SWAP_IN_PROGRESS with the disconnect fallback so they never overlap.
 static SYSTEM_REBUILD_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
-fn rebuild_guard_flag(device_type: RecordingDeviceType) -> &'static AtomicBool {
-    match device_type {
-        RecordingDeviceType::Microphone => &MIC_SWAP_IN_PROGRESS,
-        RecordingDeviceType::System => &SYSTEM_REBUILD_IN_PROGRESS,
-    }
-}
-
-/// Clears a rebuild/swap flag on every exit path, including panics.
-struct FlagReset(&'static AtomicBool);
-impl Drop for FlagReset {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
-}
-
-fn device_type_label(device_type: RecordingDeviceType) -> &'static str {
-    match device_type {
-        RecordingDeviceType::Microphone => "microphone",
-        RecordingDeviceType::System => "system",
-    }
-}
-
-fn session_device(
-    session: &super::RecordingState,
-    device_type: RecordingDeviceType,
-) -> Option<Arc<super::AudioDevice>> {
-    match device_type {
-        RecordingDeviceType::Microphone => session.get_microphone_device(),
-        RecordingDeviceType::System => session.get_system_device(),
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct StreamDegradedPayload {
-    device_type: &'static str,
-    device_name: String,
-    reason: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct StreamRecoveredPayload {
-    device_type: &'static str,
-    device_name: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct SystemAudioUnavailablePayload {
-    device_name: Option<String>,
-    reason: String,
-}
-
 /// Map a stream health change onto its frontend event.
 fn emit_stream_health_event<R: Runtime>(app: &AppHandle<R>, event: StreamHealthEvent) {
-    let result = match event {
-        StreamHealthEvent::Degraded { device_type, device_name, reason } => app.emit(
-            "audio-stream-degraded",
-            StreamDegradedPayload { device_type: device_type_label(device_type), device_name, reason },
-        ),
-        StreamHealthEvent::Recovered { device_type, device_name } => app.emit(
-            "audio-stream-recovered",
-            StreamRecoveredPayload { device_type: device_type_label(device_type), device_name },
-        ),
-        StreamHealthEvent::SystemAudioUnavailable { device_name, reason } => app.emit(
-            "system-audio-unavailable",
-            SystemAudioUnavailablePayload { device_name, reason },
-        ),
-        StreamHealthEvent::CaptureFailed { message } => app.emit("recording-error", message),
-    };
-    if let Err(e) = result {
-        warn!("Failed to emit stream health event: {}", e);
+    let (name, payload) = stream_supervisor::frontend_event(event);
+    if let Err(e) = app.emit(name, payload) {
+        warn!("Failed to emit {}: {}", name, e);
     }
 }
 
-/// Start rebuilding `device_type` if it is dead and no rebuild or mic swap is
-/// already running for it. Called on a fault and on every watchdog tick, so a
-/// fault that arrives while a swap is in flight is picked up once it ends.
-fn ensure_stream_rebuild<R: Runtime>(
-    app: &AppHandle<R>,
-    session: &Arc<super::RecordingState>,
-    device_type: RecordingDeviceType,
-    reason: String,
-) {
-    let health = session.stream_health(device_type);
-    if health.status() != StreamStatus::Dead {
-        return;
-    }
-    let flag = rebuild_guard_flag(device_type);
-    if flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-        return;
-    }
-    let guard = FlagReset(flag);
+/// The running app as seen by the stream supervisor of one session.
+struct AppSupervisorHost<R: Runtime> {
+    app: AppHandle<R>,
+    session: Arc<super::RecordingState>,
+}
 
-    let device_name = session_device(session, device_type).map(|d| d.name.clone()).unwrap_or_default();
-    if health.should_emit_degraded(std::time::Instant::now()) {
-        session.emit_health_event(StreamHealthEvent::Degraded {
-            device_type,
-            device_name,
-            reason: reason.clone(),
-        });
+impl<R: Runtime> Clone for AppSupervisorHost<R> {
+    fn clone(&self) -> Self {
+        Self { app: self.app.clone(), session: self.session.clone() }
+    }
+}
+
+impl<R: Runtime> SupervisorHost for AppSupervisorHost<R> {
+    fn session_live(&self) -> bool {
+        session_live(&self.session)
     }
 
-    let app = app.clone();
-    let session = session.clone();
+    fn swap_stream(
+        &self,
+        device_type: RecordingDeviceType,
+        device: Arc<super::AudioDevice>,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let session = self.session.clone();
+        async move { do_stream_swap(device_type, device, &session).await }
+    }
+
+    fn default_input_name(&self) -> Option<String> {
+        default_input_device().ok().map(|d| d.name)
+    }
+
+    fn emit_mic_switched(&self, device_name: &str) {
+        let _ = self.app.emit("mic-device-switched", serde_json::json!({ "device_name": device_name }));
+    }
+
+    fn emit_mic_recovery_exhausted(&self, device_name: &str) {
+        let _ = self.app.emit("mic-recovery-exhausted", serde_json::json!({ "device_name": device_name }));
+    }
+
+    fn rebuild_flag(&self, device_type: RecordingDeviceType) -> &'static AtomicBool {
+        match device_type {
+            RecordingDeviceType::Microphone => &MIC_SWAP_IN_PROGRESS,
+            RecordingDeviceType::System => &SYSTEM_REBUILD_IN_PROGRESS,
+        }
+    }
+
+    fn sleep(&self, duration: std::time::Duration) -> impl std::future::Future<Output = ()> + Send {
+        tokio::time::sleep(duration)
+    }
+}
+
+/// Start a rebuild for `request` if the supervisor's policy says one is due.
+fn start_rebuild_if_due<R: Runtime>(host: &AppSupervisorHost<R>, request: RebuildRequest) {
+    let Some(ticket) = stream_supervisor::claim_rebuild(host, &host.session, &request, std::time::Instant::now())
+    else {
+        return;
+    };
+    let host = host.clone();
     tokio::spawn(async move {
-        let _guard = guard;
-        rebuild_stream(&app, &session, device_type, reason).await;
+        stream_supervisor::rebuild_stream(&host, &host.session, request, ticket).await;
     });
-}
-
-/// Rebuild a dead stream on its own device with backoff; a microphone falls
-/// back to the default input. If nothing works the stream is given up on,
-/// and when no stream is left the session reports a capture failure.
-async fn rebuild_stream<R: Runtime>(
-    app: &AppHandle<R>,
-    session: &Arc<super::RecordingState>,
-    device_type: RecordingDeviceType,
-    reason: String,
-) {
-    let health = session.stream_health(device_type);
-    let Some(device) = session_device(session, device_type) else {
-        fail_stream(app, session, device_type, None, "no device recorded for the session".to_string());
-        return;
-    };
-    if !health.begin_rebuild(std::time::Instant::now()) {
-        fail_stream(app, session, device_type, Some(device.name.clone()),
-            format!("stream keeps failing ({})", reason));
-        return;
-    }
-
-    info!("[STREAM_REBUILD] Rebuilding {:?} stream on '{}': {}", device_type, device.name, reason);
-    let mut last_error = reason;
-    for delay_ms in STREAM_REBUILD_BACKOFF_MS {
-        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-        if !session_live(session) {
-            return;
-        }
-        match do_stream_swap(device_type, device.clone(), session).await {
-            Ok(()) => {
-                info!("[STREAM_REBUILD] {:?} stream on '{}' rebuilt", device_type, device.name);
-                return;
-            }
-            Err(e) => {
-                warn!("[STREAM_REBUILD] Rebuilding {:?} on '{}' failed: {}", device_type, device.name, e);
-                last_error = e;
-            }
-        }
-    }
-
-    if device_type == RecordingDeviceType::Microphone && session_live(session) {
-        if let Ok(fallback) = default_input_device() {
-            if fallback.name != device.name
-                && do_mic_swap(&fallback.name, session).await.is_ok()
-            {
-                info!("[STREAM_REBUILD] Microphone moved from '{}' to default '{}'", device.name, fallback.name);
-                let _ = app.emit("mic-device-switched", serde_json::json!({ "device_name": fallback.name }));
-                return;
-            }
-        }
-    }
-
-    if session_live(session) {
-        fail_stream(app, session, device_type, Some(device.name.clone()), last_error);
-    }
-}
-
-/// Give up on a stream: tell the user, and report a capture failure if no
-/// stream is left. The session itself keeps running so the normal stop/save runs.
-fn fail_stream<R: Runtime>(
-    app: &AppHandle<R>,
-    session: &Arc<super::RecordingState>,
-    device_type: RecordingDeviceType,
-    device_name: Option<String>,
-    reason: String,
-) {
-    error!("[STREAM_REBUILD] Giving up on {:?} stream {:?}: {}", device_type, device_name, reason);
-    session.stream_health(device_type).mark_failed();
-    match device_type {
-        RecordingDeviceType::System => {
-            session.emit_health_event(StreamHealthEvent::SystemAudioUnavailable { device_name, reason });
-        }
-        RecordingDeviceType::Microphone => {
-            let _ = app.emit(
-                "mic-recovery-exhausted",
-                serde_json::json!({ "device_name": device_name.unwrap_or_default() }),
-            );
-        }
-    }
-    if session.all_streams_down() {
-        session.report_capture_failed(
-            "Audio capture stopped: no microphone or system audio stream could be restarted. \
-             The recording up to this point is being saved."
-                .to_string(),
-        );
-    }
-}
-
-/// Watchdog tick: rebuild stalled or still-dead streams and report recoveries.
-fn supervise_streams<R: Runtime>(app: &AppHandle<R>, session: &Arc<super::RecordingState>) {
-    for device_type in session.detect_stalls(std::time::Instant::now()) {
-        warn!("[STREAM_WATCHDOG] {:?} stream delivered no audio for 3 s", device_type);
-    }
-    for device_type in [RecordingDeviceType::Microphone, RecordingDeviceType::System] {
-        let health = session.stream_health(device_type);
-        if health.take_recovered() {
-            let device_name = session_device(session, device_type).map(|d| d.name.clone()).unwrap_or_default();
-            info!("[STREAM_WATCHDOG] {:?} stream on '{}' is delivering audio again", device_type, device_name);
-            session.emit_health_event(StreamHealthEvent::Recovered { device_type, device_name });
-        }
-        ensure_stream_rebuild(app, session, device_type, "no audio received for 3 seconds".to_string());
-    }
 }
 
 /// Background supervisor for one recording session.
@@ -1942,10 +1809,11 @@ fn spawn_device_event_processor<R: Runtime>(
 ) {
     let (fault_sender, mut fault_receiver) = tokio::sync::mpsc::unbounded_channel::<StreamFault>();
     session.set_fault_sender(fault_sender);
+    let host = AppSupervisorHost { app: app.clone(), session: session.clone() };
 
     tokio::spawn(async move {
         info!("[DEVICE_EVENTS] Background event processor started");
-        let mut watchdog = tokio::time::interval(STREAM_WATCHDOG_INTERVAL);
+        let mut watchdog = tokio::time::interval(stream_supervisor::WATCHDOG_INTERVAL);
         watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
@@ -1956,12 +1824,14 @@ fn spawn_device_event_processor<R: Runtime>(
                 }
                 Some(fault) = fault_receiver.recv() => {
                     if session_live(&session) {
-                        ensure_stream_rebuild(&app, &session, fault.device_type, fault.reason);
+                        start_rebuild_if_due(&host, fault.into());
                     }
                 }
                 _ = watchdog.tick() => {
                     if session_live(&session) {
-                        supervise_streams(&app, &session);
+                        for request in stream_supervisor::watchdog_tick(&session, std::time::Instant::now()) {
+                            start_rebuild_if_due(&host, request);
+                        }
                     }
                 }
             }

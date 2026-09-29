@@ -17,6 +17,17 @@ const PIPELINE_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 type HealthCallback = Box<dyn Fn(StreamHealthEvent) + Send + Sync>;
 
+/// Why a captured chunk could not be handed to the pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ChunkSendError {
+    /// Capture started before the pipeline, or stop already detached it.
+    #[error("audio pipeline not ready")]
+    NotReady,
+    /// The pipeline task has exited while capture is running.
+    #[error("audio pipeline has stopped")]
+    PipelineClosed,
+}
+
 /// Device type for audio chunks
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceType {
@@ -258,14 +269,14 @@ impl RecordingState {
         *self.audio_sender.lock().unwrap() = Some(sender);
     }
 
-    pub fn send_audio_chunk(&self, chunk: AudioChunk) -> Result<()> {
+    pub fn send_audio_chunk(&self, chunk: AudioChunk) -> std::result::Result<(), ChunkSendError> {
         // Don't send audio chunks when paused
         if self.is_paused() {
             return Ok(()); // Silently discard chunks while paused
         }
 
         if let Some(sender) = self.audio_sender.lock().unwrap().as_ref() {
-            sender.send(chunk).map_err(|_| anyhow::anyhow!("Failed to send audio chunk"))?;
+            sender.send(chunk).map_err(|_| ChunkSendError::PipelineClosed)?;
 
             // Update statistics
             let mut stats = self.stats.lock().unwrap();
@@ -273,9 +284,18 @@ impl RecordingState {
             stats.last_activity = Some(Instant::now());
             Ok(())
         } else {
-            // Return an error when no sender is available (pipeline not ready)
-            Err(anyhow::anyhow!("Audio pipeline not ready - no sender available"))
+            Err(ChunkSendError::NotReady)
         }
+    }
+
+    /// The pipeline task is gone while capture is still running: nothing more
+    /// can be saved or transcribed, so report the session as failed (once).
+    pub fn report_pipeline_closed(&self) {
+        self.report_error(AudioError::ChannelClosed);
+        self.report_capture_failed(
+            "Audio processing stopped unexpectedly. The recording up to this point is being saved."
+                .to_string(),
+        );
     }
 
     // Error handling
@@ -321,6 +341,7 @@ impl RecordingState {
         error: AudioError,
         detail: &str,
     ) -> ErrorOutcome {
+        let disconnected = matches!(error, AudioError::DeviceDisconnected);
         let outcome = self.stream_health(device_type).record_error(&error, Instant::now());
         if outcome.already_dead {
             return outcome;
@@ -344,6 +365,7 @@ impl RecordingState {
             self.send_fault(StreamFault {
                 device_type,
                 reason: format!("{} ({})", error.user_message(), detail),
+                disconnected,
             });
         }
         outcome
@@ -542,6 +564,152 @@ impl Clone for RecordingStats {
             chunks_processed: self.chunks_processed,
             total_duration: self.total_duration,
             last_activity: self.last_activity,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A recording session with both streams running, a fault channel and a
+    /// health callback that records every event.
+    fn live_session() -> (
+        Arc<RecordingState>,
+        mpsc::UnboundedReceiver<StreamFault>,
+        Arc<Mutex<Vec<StreamHealthEvent>>>,
+    ) {
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        let (faults, fault_rx) = mpsc::unbounded_channel();
+        state.set_fault_sender(faults);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        state.set_health_callback(move |event| sink.lock().unwrap().push(event));
+        for device_type in [DeviceType::Microphone, DeviceType::System] {
+            state.stream_health(device_type).mark_running(Instant::now(), false);
+        }
+        (state, fault_rx, events)
+    }
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<StreamFault>) -> Vec<StreamFault> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    #[test]
+    fn a_disconnect_keeps_the_session_recording_and_requests_one_rebuild() {
+        let (state, mut faults, events) = live_session();
+        for _ in 0..50 {
+            state.report_stream_error(DeviceType::Microphone, "USB mic", AudioError::DeviceDisconnected, "gone");
+        }
+        assert!(state.is_recording(), "stream errors must never stop the session");
+        let faults = drain(&mut faults);
+        assert_eq!(faults.len(), 1, "one rebuild request per dead stream");
+        assert_eq!(faults[0].device_type, DeviceType::Microphone);
+        assert!(faults[0].disconnected);
+        assert!(events.lock().unwrap().is_empty(), "the supervisor, not the capture thread, notifies the UI");
+    }
+
+    #[test]
+    fn an_error_burst_keeps_the_session_recording() {
+        let (state, mut faults, _) = live_session();
+        for _ in 0..1_000 {
+            state.report_stream_error(DeviceType::System, "monitor", AudioError::StreamFailed, "POLLERR");
+        }
+        assert!(state.is_recording());
+        assert_eq!(state.stream_health(DeviceType::System).status(), StreamStatus::Dead);
+        assert_eq!(state.stream_health(DeviceType::Microphone).status(), StreamStatus::Running);
+        let faults = drain(&mut faults);
+        assert_eq!(faults.len(), 1);
+        assert!(!faults[0].disconnected);
+    }
+
+    #[test]
+    fn non_stream_errors_never_stop_the_session() {
+        let (state, _, _) = live_session();
+        for _ in 0..100 {
+            state.report_error(AudioError::ChannelClosed);
+        }
+        assert!(state.is_recording());
+    }
+
+    #[test]
+    fn all_streams_down_only_when_each_is_absent_or_failed() {
+        use StreamStatus::*;
+        let now = Instant::now();
+        let cases = [
+            (Running, Running, false),
+            (Running, Absent, false),
+            (Dead, Absent, false),
+            (Failed, Running, false),
+            (Failed, Absent, true),
+            (Absent, Failed, true),
+            (Failed, Failed, true),
+            (Absent, Absent, true),
+        ];
+        for (mic, system, expected) in cases {
+            let state = RecordingState::new();
+            for (device_type, status) in [(DeviceType::Microphone, mic), (DeviceType::System, system)] {
+                let health = state.stream_health(device_type);
+                health.mark_running(now, false);
+                match status {
+                    Running => {}
+                    Dead => {
+                        health.record_error(&AudioError::DeviceDisconnected, now);
+                    }
+                    Failed => health.mark_failed(now),
+                    Absent => health.mark_absent(),
+                }
+            }
+            assert_eq!(state.all_streams_down(), expected, "mic {mic:?}, system {system:?}");
+        }
+    }
+
+    #[test]
+    fn capture_failure_is_reported_once_and_keeps_recording_state() {
+        let (state, _, events) = live_session();
+        for _ in 0..5 {
+            state.report_capture_failed("no audio".to_string());
+        }
+        assert!(state.is_recording(), "the frontend runs the normal stop/save");
+        assert!(state.has_fatal_error());
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], StreamHealthEvent::CaptureFailed { .. }));
+    }
+
+    #[test]
+    fn a_closed_pipeline_is_reported_once_as_a_capture_failure() {
+        let (state, _, events) = live_session();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        state.set_audio_sender(sender);
+        drop(receiver);
+        let chunk = AudioChunk {
+            data: vec![0.0; 480],
+            sample_rate: 48_000,
+            timestamp: 0.0,
+            chunk_id: 0,
+            device_type: DeviceType::Microphone,
+        };
+        assert_eq!(state.send_audio_chunk(chunk), Err(ChunkSendError::PipelineClosed));
+        for _ in 0..10 {
+            state.report_pipeline_closed();
+        }
+        assert_eq!(events.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stalls_are_not_detected_while_paused() {
+        let (state, _, _) = live_session();
+        let later = Instant::now() + Duration::from_secs(10);
+        state.pause_recording().unwrap();
+        assert!(state.detect_stalls(later).is_empty());
+        state.resume_recording().unwrap();
+        let stalled = state.detect_stalls(later);
+        if cfg!(target_os = "linux") {
+            assert_eq!(stalled, vec![DeviceType::Microphone, DeviceType::System]);
+        } else {
+            assert!(stalled.is_empty(), "the stall watchdog is Linux-only");
         }
     }
 }

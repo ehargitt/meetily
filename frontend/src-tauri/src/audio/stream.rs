@@ -361,30 +361,61 @@ impl AudioStream {
     /// teardown thread is abandoned.
     pub async fn stop_off_runtime(self) {
         let name = self.device.name.clone();
-        let teardown = tokio::task::spawn_blocking(move || self.stop());
-        match tokio::time::timeout(STREAM_STOP_TIMEOUT, teardown).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(e))) => warn!("Failed to stop audio stream '{}': {}", name, e),
-            Ok(Err(join_error)) => warn!(
-                "Audio stream '{}' teardown {} (stream was already dead); continuing",
-                name,
-                if join_error.is_panic() { "panicked" } else { "was cancelled" }
-            ),
-            Err(_) => warn!(
-                "Audio stream '{}' teardown still blocked after {:?}; abandoning it",
-                name, STREAM_STOP_TIMEOUT
-            ),
-        }
+        run_teardown_off_runtime(&name, STREAM_STOP_TIMEOUT, move || self.stop()).await;
     }
 
     /// Synchronous counterpart of `stop_off_runtime` for `Drop`, which cannot
     /// await: contains a teardown panic instead of letting it escape `drop`.
     fn stop_contained(self) {
         let name = self.device.name.clone();
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.stop())) {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => error!("Failed to stop audio stream '{}': {}", name, e),
-            Err(_) => warn!("Audio stream '{}' teardown panicked (stream was already dead)", name),
+        run_teardown_contained(&name, move || self.stop());
+    }
+}
+
+/// How a contained teardown ended.
+#[derive(Debug, PartialEq, Eq)]
+enum TeardownOutcome {
+    Stopped,
+    Failed,
+    Panicked,
+    TimedOut,
+}
+
+async fn run_teardown_off_runtime<F>(name: &str, timeout: Duration, teardown: F) -> TeardownOutcome
+where
+    F: FnOnce() -> Result<()> + Send + 'static,
+{
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(teardown)).await {
+        Ok(Ok(Ok(()))) => TeardownOutcome::Stopped,
+        Ok(Ok(Err(e))) => {
+            warn!("Failed to stop audio stream '{}': {}", name, e);
+            TeardownOutcome::Failed
+        }
+        Ok(Err(join_error)) => {
+            warn!(
+                "Audio stream '{}' teardown {} (stream was already dead); continuing",
+                name,
+                if join_error.is_panic() { "panicked" } else { "was cancelled" }
+            );
+            TeardownOutcome::Panicked
+        }
+        Err(_) => {
+            warn!("Audio stream '{}' teardown still blocked after {:?}; abandoning it", name, timeout);
+            TeardownOutcome::TimedOut
+        }
+    }
+}
+
+fn run_teardown_contained<F: FnOnce() -> Result<()>>(name: &str, teardown: F) -> TeardownOutcome {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(teardown)) {
+        Ok(Ok(())) => TeardownOutcome::Stopped,
+        Ok(Err(e)) => {
+            error!("Failed to stop audio stream '{}': {}", name, e);
+            TeardownOutcome::Failed
+        }
+        Err(_) => {
+            warn!("Audio stream '{}' teardown panicked (stream was already dead)", name);
+            TeardownOutcome::Panicked
         }
     }
 }
@@ -524,5 +555,41 @@ impl Drop for AudioStreamManager {
         for stream in [self.microphone_stream.take(), self.system_stream.take()].into_iter().flatten() {
             stream.stop_contained();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_panicking_teardown_does_not_abort_the_caller() {
+        let outcome = run_teardown_off_runtime("mic", Duration::from_secs(5), || panic!("worker join failed")).await;
+        assert_eq!(outcome, TeardownOutcome::Panicked);
+    }
+
+    #[tokio::test]
+    async fn a_hung_teardown_is_abandoned_after_the_timeout() {
+        let started = std::time::Instant::now();
+        let outcome = run_teardown_off_runtime("mic", Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(500));
+            Ok(())
+        })
+        .await;
+        assert_eq!(outcome, TeardownOutcome::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(400));
+    }
+
+    #[tokio::test]
+    async fn teardown_errors_and_success_are_reported() {
+        let failed = run_teardown_off_runtime("mic", Duration::from_secs(5), || Err(anyhow::anyhow!("pause failed"))).await;
+        assert_eq!(failed, TeardownOutcome::Failed);
+        assert_eq!(run_teardown_off_runtime("mic", Duration::from_secs(5), || Ok(())).await, TeardownOutcome::Stopped);
+    }
+
+    #[test]
+    fn a_panicking_teardown_in_drop_is_contained() {
+        assert_eq!(run_teardown_contained("mic", || panic!("worker join failed")), TeardownOutcome::Panicked);
+        assert_eq!(run_teardown_contained("mic", || Ok(())), TeardownOutcome::Stopped);
     }
 }

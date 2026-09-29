@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use anyhow::Result;
@@ -9,7 +8,7 @@ use super::batch_processor::AudioMetricsBatcher;
 use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
 use super::devices::AudioDevice;
-use super::recording_state::{AudioChunk, AudioError, RecordingState, DeviceType};
+use super::recording_state::{AudioChunk, AudioError, ChunkSendError, RecordingState, DeviceType};
 use super::audio_processing::{audio_to_mono, LoudnessNormalizer, NoiseSuppressionProcessor, HighPassFilter};
 use super::vad::{ContinuousVadProcessor};
 
@@ -26,140 +25,8 @@ use super::vad::{ContinuousVadProcessor};
 /// pauses is cut by the VAD itself at 30 s (#756).
 const VAD_REDEMPTION_TIME_MS: u32 = 500;
 
-/// Mixing window length. Windows are only mixed once both streams have one.
-const MIX_WINDOW_MS: u32 = 600;
-
-/// A stream counts as starved (and is padded with silence) once the other
-/// stream has captured this much more audio than it has. Normal callback
-/// jitter is a few tens of milliseconds; a stalled, dead or absent stream
-/// crosses this quickly.
-const STARVATION_SECS: f64 = 0.2;
-
-/// Each stream buffers at most this many windows. Only reached when two live
-/// streams drift apart (slightly different device clocks); the oldest samples
-/// of the fuller stream are then dropped.
-const MAX_BUFFERED_WINDOWS: usize = 8;
-
-/// One stream's pending samples plus the capture time of its latest chunk.
-#[derive(Default)]
-struct StreamBuffer {
-    samples: VecDeque<f32>,
-    last_capture_secs: Option<f64>,
-}
-
-impl StreamBuffer {
-    /// Take up to `len` samples, zero-padded to exactly `len`.
-    fn take_padded(&mut self, len: usize) -> Vec<f32> {
-        let available = self.samples.len().min(len);
-        let mut window: Vec<f32> = self.samples.drain(..available).collect();
-        window.resize(len, 0.0);
-        window
-    }
-}
-
-/// Ring buffer for synchronized audio mixing.
-///
-/// Mic and system audio arrive asynchronously with different callback sizes.
-/// A window is mixed only when both streams hold a full window, so normal
-/// operation never inserts silence. A stream is padded with silence only when
-/// it is starved: it has delivered nothing while the other stream captured
-/// `STARVATION_SECS` of audio (it stalled, died, or the session has no such
-/// stream). Starvation is judged on capture timestamps, not on when chunks
-/// reach the pipeline, so a delayed pipeline draining a backlog does not pad.
-struct AudioMixerRingBuffer {
-    mic: StreamBuffer,
-    system: StreamBuffer,
-    window_size_samples: usize,
-    max_buffer_size: usize,
-    overflow_events: u64,
-}
-
-impl AudioMixerRingBuffer {
-    fn new(sample_rate: u32) -> Self {
-        let window_size_samples = (sample_rate as u64 * MIX_WINDOW_MS as u64 / 1000) as usize;
-        let max_buffer_size = window_size_samples * MAX_BUFFERED_WINDOWS;
-
-        info!("🔊 Ring buffer initialized: window={}ms ({} samples), max={}ms ({} samples)",
-              MIX_WINDOW_MS, window_size_samples,
-              MIX_WINDOW_MS as usize * MAX_BUFFERED_WINDOWS, max_buffer_size);
-
-        Self {
-            mic: StreamBuffer::default(),
-            system: StreamBuffer::default(),
-            window_size_samples,
-            max_buffer_size,
-            overflow_events: 0,
-        }
-    }
-
-    fn buffer_mut(&mut self, device_type: DeviceType) -> &mut StreamBuffer {
-        match device_type {
-            DeviceType::Microphone => &mut self.mic,
-            DeviceType::System => &mut self.system,
-        }
-    }
-
-    /// Queue samples captured at `capture_secs` (seconds since recording start).
-    fn add_samples(&mut self, device_type: DeviceType, samples: &[f32], capture_secs: f64) {
-        let max_buffer_size = self.max_buffer_size;
-        let buffer = self.buffer_mut(device_type);
-        buffer.samples.extend(samples.iter().copied());
-        buffer.last_capture_secs = Some(
-            buffer.last_capture_secs.map_or(capture_secs, |last| last.max(capture_secs)),
-        );
-
-        let excess = buffer.samples.len().saturating_sub(max_buffer_size);
-        if excess > 0 {
-            buffer.samples.drain(..excess);
-            self.overflow_events += 1;
-            // Drift overflows repeat slowly; the first and every 100th are enough.
-            if self.overflow_events % 100 == 1 {
-                warn!("⚠️ {:?} mix buffer full, dropped {} oldest samples ({} overflows this session)",
-                      device_type, excess, self.overflow_events);
-            }
-        }
-    }
-
-    /// Latest capture time seen from either stream.
-    fn latest_capture_secs(&self) -> Option<f64> {
-        match (self.mic.last_capture_secs, self.system.last_capture_secs) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (a, b) => a.or(b),
-        }
-    }
-
-    fn is_starved(&self, buffer: &StreamBuffer) -> bool {
-        match (buffer.last_capture_secs, self.latest_capture_secs()) {
-            (_, None) => false,
-            (None, Some(_)) => true,
-            (Some(last), Some(latest)) => latest - last > STARVATION_SECS,
-        }
-    }
-
-    /// The next mixable (mic, system) window, if any.
-    fn extract_window(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
-        let window = self.window_size_samples;
-        let mic_full = self.mic.samples.len() >= window;
-        let system_full = self.system.samples.len() >= window;
-        let ready = (mic_full && system_full)
-            || (mic_full && self.is_starved(&self.system))
-            || (system_full && self.is_starved(&self.mic));
-        if !ready {
-            return None;
-        }
-        Some((self.mic.take_padded(window), self.system.take_padded(window)))
-    }
-
-    /// Everything still buffered (less than a window per stream), with the
-    /// shorter stream padded to the longer. Used when recording stops.
-    fn drain_remaining(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
-        let len = self.mic.samples.len().max(self.system.samples.len());
-        if len == 0 {
-            return None;
-        }
-        Some((self.mic.take_padded(len), self.system.take_padded(len)))
-    }
-}
+mod mixer_ring_buffer;
+use mixer_ring_buffer::AudioMixerRingBuffer;
 
 /// Simple audio mixer without aggressive ducking
 /// Combines mic + system audio with basic clipping prevention
@@ -623,8 +490,9 @@ impl AudioCapture {
         //     }
         // }
 
-        // Use global recording timestamp for proper synchronization
-        let timestamp = self.state.get_recording_duration().unwrap_or(0.0);
+        // Capture time on the session's active (pause-excluded) clock, shared by
+        // both streams; the mixer aligns them on it.
+        let timestamp = self.state.get_active_recording_duration().unwrap_or(0.0);
 
         // RAW AUDIO CHUNK: No gain applied - will be mixed and gained downstream
         // Use 48kHz if we resampled, otherwise use original rate
@@ -642,26 +510,12 @@ impl AudioCapture {
         // Individual raw streams go only to the transcription pipeline below
 
         // Send to processing pipeline for transcription
-        if let Err(e) = self.state.send_audio_chunk(audio_chunk) {
-            // Check if this is the "pipeline not ready" error
-            if e.to_string().contains("Audio pipeline not ready") {
-                // This is expected during initialization, just log it as debug
-                debug!("Audio pipeline not ready yet, skipping chunk {}", chunk_id);
-                return;
-            }
-
-            warn!("Failed to send audio chunk: {}", e);
-            // More specific error handling based on failure reason
-            let error = if e.to_string().contains("channel closed") {
-                AudioError::ChannelClosed
-            } else if e.to_string().contains("full") {
-                AudioError::BufferOverflow
-            } else {
-                AudioError::ProcessingFailed
-            };
-            self.state.report_error(error);
-        } else {
-            debug!("Sent audio chunk {} ({} samples)", chunk_id, data.len());
+        match self.state.send_audio_chunk(audio_chunk) {
+            Ok(()) => debug!("Sent audio chunk {} ({} samples)", chunk_id, data.len()),
+            // Expected while the pipeline starts or after stop detached it
+            Err(ChunkSendError::NotReady) => debug!("Audio pipeline not ready yet, skipping chunk {}", chunk_id),
+            // Logged with a rate limit and reported to the UI once
+            Err(ChunkSendError::PipelineClosed) => self.state.report_pipeline_closed(),
         }
     }
 
@@ -1127,178 +981,27 @@ impl Default for AudioPipelineManager {
 mod tests {
     use super::*;
 
-    const RATE: u32 = 48_000;
-    const MIC_LEVEL: f32 = 0.25;
-    const SYS_LEVEL: f32 = 0.5;
-
-    /// Deterministic callback-size jitter (no RNG dependency needed).
-    struct Lcg(u64);
-    impl Lcg {
-        fn next_in(&mut self, lo: usize, hi: usize) -> usize {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            lo + (self.0 >> 33) as usize % (hi - lo + 1)
-        }
-    }
-
-    /// A simulated capture stream: delivers a callback whenever it has captured
-    /// a (jittered) buffer's worth of audio, stamped with the capture time.
-    struct SimStream {
-        device_type: DeviceType,
-        level: f32,
-        captured: usize,
-        next_len: usize,
-        jitter: Lcg,
-        min_len: usize,
-        max_len: usize,
-    }
-
-    impl SimStream {
-        fn new(device_type: DeviceType, level: f32, seed: u64, min_len: usize, max_len: usize) -> Self {
-            let mut jitter = Lcg(seed);
-            let next_len = jitter.next_in(min_len, max_len);
-            Self { device_type, level, captured: 0, next_len, jitter, min_len, max_len }
-        }
-
-        /// Deliver every buffer completed by sample time `now_samples`.
-        fn pump(&mut self, now_samples: usize, ring: &mut AudioMixerRingBuffer) {
-            while self.captured + self.next_len <= now_samples {
-                self.captured += self.next_len;
-                let data = vec![self.level; self.next_len];
-                ring.add_samples(self.device_type, &data, self.captured as f64 / RATE as f64);
-                self.next_len = self.jitter.next_in(self.min_len, self.max_len);
-            }
-        }
-    }
-
-    fn drain_windows(ring: &mut AudioMixerRingBuffer, out: &mut Vec<(Vec<f32>, Vec<f32>)>) {
-        while let Some(window) = ring.extract_window() {
-            out.push(window);
-        }
-    }
-
     #[test]
-    fn mixer_inserts_no_silence_when_both_streams_deliver_with_jitter() {
-        let mut ring = AudioMixerRingBuffer::new(RATE);
-        // Mic: 10-30 ms buffers. System: 5-85 ms buffers (bursty PipeWire monitor).
-        let mut mic = SimStream::new(DeviceType::Microphone, MIC_LEVEL, 7, 480, 1_440);
-        let mut sys = SimStream::new(DeviceType::System, SYS_LEVEL, 11, 256, 4_096);
-        let mut windows = Vec::new();
+    fn a_dead_pipeline_is_reported_once_without_stopping_capture() {
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        state.set_health_callback(move |event| sink.lock().unwrap().push(event));
+        let (sender, receiver) = mpsc::unbounded_channel();
+        state.set_audio_sender(sender);
+        drop(receiver); // the pipeline task died
 
-        let seconds = 120;
-        for ms in 0..seconds * 1_000 {
-            let now = ms * RATE as usize / 1_000;
-            // Alternate which stream's callback lands first.
-            if ms % 2 == 0 {
-                mic.pump(now, &mut ring);
-                sys.pump(now, &mut ring);
-            } else {
-                sys.pump(now, &mut ring);
-                mic.pump(now, &mut ring);
-            }
-            drain_windows(&mut ring, &mut windows);
+        let device = Arc::new(AudioDevice::new("mic".into(), super::super::devices::DeviceType::Input));
+        let capture = AudioCapture::new(device, state.clone(), 48_000, 1, DeviceType::System, None);
+        for _ in 0..100 {
+            capture.process_audio_data(&[0.0; 480]);
         }
 
-        assert!(windows.len() >= seconds * 1_000 / 600 - 2, "only {} windows mixed", windows.len());
-        for (i, (mic_window, sys_window)) in windows.iter().enumerate() {
-            assert!(mic_window.iter().all(|&s| s == MIC_LEVEL), "window {i}: mic padded with silence");
-            assert!(sys_window.iter().all(|&s| s == SYS_LEVEL), "window {i}: system padded with silence");
-        }
-    }
-
-    #[test]
-    fn mixer_pads_only_after_the_other_stream_starves_for_200ms() {
-        let mut ring = AudioMixerRingBuffer::new(RATE);
-        let window = ring.window_size_samples;
-        let ten_ms = RATE as usize / 100;
-
-        // Both streams deliver for the first 100 ms.
-        for i in 1..=10 {
-            let t = (i * ten_ms) as f64 / RATE as f64;
-            ring.add_samples(DeviceType::Microphone, &vec![MIC_LEVEL; ten_ms], t);
-            ring.add_samples(DeviceType::System, &vec![SYS_LEVEL; ten_ms], t);
-        }
-        // System goes quiet; mic keeps delivering. Mic reaches a full window at
-        // 600 ms, by which point system has been silent for 500 ms (> 200 ms).
-        let mut windows = Vec::new();
-        let mut first_window_at_ms = None;
-        for i in 11..=120 {
-            let t = (i * ten_ms) as f64 / RATE as f64;
-            ring.add_samples(DeviceType::Microphone, &vec![MIC_LEVEL; ten_ms], t);
-            let before = windows.len();
-            drain_windows(&mut ring, &mut windows);
-            if windows.len() > before && first_window_at_ms.is_none() {
-                first_window_at_ms = Some(i * 10);
-            }
-        }
-
-        assert_eq!(first_window_at_ms, Some(600), "mic's first full window mixes once system is starved");
-        let (mic_window, sys_window) = &windows[0];
-        assert!(mic_window.iter().all(|&s| s == MIC_LEVEL));
-        let real_system = sys_window.iter().filter(|&&s| s == SYS_LEVEL).count();
-        assert_eq!(real_system, 10 * ten_ms, "the system audio it did capture is kept");
-        assert!(sys_window[real_system..].iter().all(|&s| s == 0.0), "the rest is silence");
-        assert!(windows[1..].iter().all(|(_, sys)| sys.iter().all(|&s| s == 0.0)));
-        assert!(ring.mic.samples.len() < window, "mic does not accumulate while system is stalled");
-    }
-
-    #[test]
-    fn mixer_waits_through_short_gaps() {
-        let mut ring = AudioMixerRingBuffer::new(RATE);
-        let window = ring.window_size_samples;
-        // System delivered up to 500 ms; mic has a full window captured to 650 ms.
-        ring.add_samples(DeviceType::System, &vec![SYS_LEVEL; window - RATE as usize / 10], 0.5);
-        ring.add_samples(DeviceType::Microphone, &vec![MIC_LEVEL; window], 0.65);
-        assert!(ring.extract_window().is_none(), "a 150 ms gap is jitter, not starvation");
-    }
-
-    #[test]
-    fn mixer_handles_a_single_stream_session() {
-        let mut ring = AudioMixerRingBuffer::new(RATE);
-        let ten_ms = RATE as usize / 100;
-        let mut windows = Vec::new();
-        for i in 1..=600 {
-            let t = (i * ten_ms) as f64 / RATE as f64;
-            ring.add_samples(DeviceType::Microphone, &vec![MIC_LEVEL; ten_ms], t);
-            drain_windows(&mut ring, &mut windows);
-        }
-        assert_eq!(windows.len(), 10, "6 s of mic-only audio mixes as 10 windows");
-        assert!(windows.iter().all(|(mic, sys)| mic.iter().all(|&s| s == MIC_LEVEL)
-            && sys.iter().all(|&s| s == 0.0)));
-    }
-
-    #[test]
-    fn mixer_buffers_stay_bounded_when_streams_drift() {
-        let mut ring = AudioMixerRingBuffer::new(RATE);
-        let max = ring.max_buffer_size;
-        let ten_ms = RATE as usize / 100;
-        // System delivers 1% fewer samples than mic but on time, so it is never
-        // starved and mic's surplus accumulates until the cap trims it.
-        let mut windows = Vec::new();
-        for i in 1..=100_000 {
-            let t = (i * ten_ms) as f64 / RATE as f64;
-            ring.add_samples(DeviceType::Microphone, &vec![MIC_LEVEL; ten_ms], t);
-            ring.add_samples(DeviceType::System, &vec![SYS_LEVEL; ten_ms * 99 / 100], t);
-            drain_windows(&mut ring, &mut windows);
-            assert!(ring.mic.samples.len() <= max && ring.system.samples.len() <= max);
-        }
-        assert!(ring.overflow_events > 0, "drift reached the cap");
-        assert!(windows.iter().all(|(mic, sys)| mic.iter().all(|&s| s == MIC_LEVEL)
-            && sys.iter().all(|&s| s == SYS_LEVEL)), "drift is trimmed, never padded");
-    }
-
-    #[test]
-    fn drain_remaining_returns_the_partial_tail_padded_to_the_longer_stream() {
-        let mut ring = AudioMixerRingBuffer::new(RATE);
-        ring.add_samples(DeviceType::Microphone, &vec![MIC_LEVEL; 1_000], 0.02);
-        ring.add_samples(DeviceType::System, &vec![SYS_LEVEL; 400], 0.02);
-        assert!(ring.extract_window().is_none());
-
-        let (mic, sys) = ring.drain_remaining().expect("tail");
-        assert_eq!(mic, vec![MIC_LEVEL; 1_000]);
-        assert_eq!(&sys[..400], &vec![SYS_LEVEL; 400][..]);
-        assert!(sys[400..].iter().all(|&s| s == 0.0));
-        assert_eq!(sys.len(), 1_000);
-        assert!(ring.drain_remaining().is_none(), "drained once");
+        assert!(state.is_recording());
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "one recording-error, not one per buffer");
+        assert!(matches!(events[0], super::super::recording_state::StreamHealthEvent::CaptureFailed { .. }));
     }
 
     #[test]

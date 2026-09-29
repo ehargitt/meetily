@@ -26,10 +26,9 @@ pub const STALL_TIMEOUT: Duration = Duration::from_secs(3);
 pub const DEGRADED_EVENT_INTERVAL: Duration = Duration::from_secs(10);
 /// Stream-error log lines are summarised at most once per interval.
 const ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
-/// A stream rebuilt this many times inside `REBUILD_WINDOW` is given up on,
-/// so a device that dies straight after every rebuild cannot loop forever.
-pub const MAX_REBUILDS_PER_WINDOW: usize = 5;
-pub const REBUILD_WINDOW: Duration = Duration::from_secs(300);
+/// A stream whose rebuild failed is retried this often for the rest of the
+/// session, so a device that comes back later is picked up again.
+pub const FAILED_STREAM_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Lifecycle of one capture stream within a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +48,8 @@ pub enum StreamStatus {
 pub struct StreamFault {
     pub device_type: DeviceType,
     pub reason: String,
+    /// The device itself went away, so rebuilding on it is pointless.
+    pub disconnected: bool,
 }
 
 /// Health changes the frontend is told about. The command layer maps each
@@ -81,11 +82,15 @@ struct HealthInner {
     status: StreamStatus,
     running_since_ms: u64,
     awaiting_first_callback: bool,
+    /// `audio-stream-degraded` was emitted for the current outage, so its
+    /// recovery is announced too.
+    degraded_announced: bool,
     errors: VecDeque<Instant>,
     last_degraded_event: Option<Instant>,
     last_error_log: Option<Instant>,
     suppressed_error_logs: u64,
-    rebuilds: VecDeque<Instant>,
+    /// When the stream was last marked `Failed` (or last retried).
+    failed_at: Option<Instant>,
 }
 
 /// Health of one capture stream. The data callback only touches an atomic.
@@ -109,11 +114,12 @@ impl StreamHealth {
                 status: StreamStatus::Absent,
                 running_since_ms: 0,
                 awaiting_first_callback: false,
+                degraded_announced: false,
                 errors: VecDeque::new(),
                 last_degraded_event: None,
                 last_error_log: None,
                 suppressed_error_logs: 0,
-                rebuilds: VecDeque::new(),
+                failed_at: None,
             }),
         }
     }
@@ -137,31 +143,51 @@ impl StreamHealth {
         self.last_callback_ms.store(self.millis(now), Ordering::Relaxed);
     }
 
-    /// A stream was installed: at session start, or by a rebuild (`is_rebuild`),
-    /// in which case the first callback afterwards is reported as a recovery.
+    /// A stream was installed: at session start, or by a rebuild or hot-swap
+    /// (`is_rebuild`), in which case its first callback ends the outage and is
+    /// reported as a recovery if the outage was announced.
     pub fn mark_running(&self, now: Instant, is_rebuild: bool) {
         let mut inner = self.lock();
         inner.status = StreamStatus::Running;
         inner.running_since_ms = self.millis(now);
         inner.awaiting_first_callback = is_rebuild;
+        if !is_rebuild {
+            inner.degraded_announced = false;
+        }
         inner.errors.clear();
+        inner.failed_at = None;
         self.dead.store(false, Ordering::SeqCst);
     }
 
     pub fn mark_absent(&self) {
-        self.set_terminal(StreamStatus::Absent);
-    }
-
-    pub fn mark_failed(&self) {
-        self.set_terminal(StreamStatus::Failed);
-    }
-
-    fn set_terminal(&self, status: StreamStatus) {
         let mut inner = self.lock();
-        inner.status = status;
+        inner.status = StreamStatus::Absent;
         inner.awaiting_first_callback = false;
+        self.dead.store(true, Ordering::SeqCst);
+    }
+
+    /// Rebuilding failed. The stream stays `Failed` until a later retry
+    /// (see `retry_due`) or a hot-swap installs a new stream.
+    pub fn mark_failed(&self, now: Instant) {
+        let mut inner = self.lock();
+        inner.status = StreamStatus::Failed;
+        inner.awaiting_first_callback = false;
+        inner.failed_at = Some(now);
         // Any stream still attached keeps its callbacks cheap.
         self.dead.store(true, Ordering::SeqCst);
+    }
+
+    /// True (once per interval) when a `Failed` stream should be retried.
+    pub fn retry_due(&self, now: Instant) -> bool {
+        let mut inner = self.lock();
+        let due = inner.status == StreamStatus::Failed
+            && inner
+                .failed_at
+                .map_or(true, |t| now.saturating_duration_since(t) >= FAILED_STREAM_RETRY_INTERVAL);
+        if due {
+            inner.failed_at = Some(now);
+        }
+        due
     }
 
     /// Transition `Running -> Dead`. Returns false if the stream was not running.
@@ -229,18 +255,21 @@ impl StreamHealth {
         silent_for > STALL_TIMEOUT.as_millis() as u64 && self.mark_dead(&mut inner)
     }
 
-    /// True once, for a rebuilt stream that has delivered its first callback.
+    /// True once, for a rebuilt stream that has delivered its first callback
+    /// after an outage that was announced with `audio-stream-degraded`. A
+    /// hot-swap nobody was warned about ends silently.
     pub fn take_recovered(&self) -> bool {
         let mut inner = self.lock();
         let delivered = self.last_callback_ms.load(Ordering::Relaxed) >= inner.running_since_ms;
         if inner.status == StreamStatus::Running && inner.awaiting_first_callback && delivered {
             inner.awaiting_first_callback = false;
-            return true;
+            return std::mem::take(&mut inner.degraded_announced);
         }
         false
     }
 
-    /// Rate limit for `audio-stream-degraded`.
+    /// Rate limit for `audio-stream-degraded`. A true result means the caller
+    /// announces this outage, and its recovery will be announced too.
     pub fn should_emit_degraded(&self, now: Instant) -> bool {
         let mut inner = self.lock();
         let due = inner
@@ -248,26 +277,9 @@ impl StreamHealth {
             .map_or(true, |t| now.saturating_duration_since(t) >= DEGRADED_EVENT_INTERVAL);
         if due {
             inner.last_degraded_event = Some(now);
+            inner.degraded_announced = true;
         }
         due
-    }
-
-    /// Account for one rebuild. False when the stream has used its rebuild
-    /// budget, in which case the caller gives up on it.
-    pub fn begin_rebuild(&self, now: Instant) -> bool {
-        let mut inner = self.lock();
-        while inner
-            .rebuilds
-            .front()
-            .is_some_and(|t| now.saturating_duration_since(*t) > REBUILD_WINDOW)
-        {
-            inner.rebuilds.pop_front();
-        }
-        if inner.rebuilds.len() >= MAX_REBUILDS_PER_WINDOW {
-            return false;
-        }
-        inner.rebuilds.push_back(now);
-        true
     }
 }
 
@@ -376,6 +388,7 @@ mod tests {
         let epoch = Instant::now();
         let health = running(epoch);
         health.record_error(&AudioError::DeviceDisconnected, epoch);
+        assert!(health.should_emit_degraded(epoch));
         health.mark_running(at(epoch, 1_000), true);
         assert!(!health.take_recovered(), "no audio since the rebuild yet");
         assert!(!health.record_error(&AudioError::StreamFailed, at(epoch, 1_100)).already_dead);
@@ -394,13 +407,26 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_budget_is_bounded_per_window() {
+    fn an_unannounced_swap_does_not_report_a_recovery() {
         let epoch = Instant::now();
         let health = running(epoch);
-        for i in 0..MAX_REBUILDS_PER_WINDOW as u64 {
-            assert!(health.begin_rebuild(at(epoch, i * 1_000)));
-        }
-        assert!(!health.begin_rebuild(at(epoch, 10_000)), "budget exhausted");
-        assert!(health.begin_rebuild(at(epoch, 301_000)), "old rebuilds age out");
+        // Device-monitor hot-swap: no degraded event preceded it.
+        health.mark_running(at(epoch, 1_000), true);
+        health.on_callback(at(epoch, 1_100));
+        assert!(!health.take_recovered());
+    }
+
+    #[test]
+    fn failed_streams_are_retried_every_thirty_seconds() {
+        let epoch = Instant::now();
+        let health = running(epoch);
+        assert!(!health.retry_due(at(epoch, 60_000)), "only failed streams are retried");
+        health.mark_failed(at(epoch, 1_000));
+        assert!(health.record_error(&AudioError::StreamFailed, at(epoch, 1_500)).already_dead);
+        assert!(!health.retry_due(at(epoch, 30_000)));
+        assert!(health.retry_due(at(epoch, 31_000)));
+        assert!(!health.retry_due(at(epoch, 32_000)), "one retry per interval");
+        health.mark_running(at(epoch, 33_000), true);
+        assert!(!health.retry_due(at(epoch, 90_000)));
     }
 }
