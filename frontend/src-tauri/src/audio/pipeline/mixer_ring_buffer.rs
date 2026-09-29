@@ -1,15 +1,26 @@
 //! Time-aligns microphone and system audio for mixing.
 //!
-//! Both streams are placed on one sample timeline. A chunk is normally
+//! Both streams are placed on one sample timeline and a chunk is normally
 //! appended where its stream's previous chunk ended, so callback-size and
-//! callback-time jitter never insert silence. Its capture timestamp decides
-//! the position instead when the stream (re)appears: its first chunk, the
-//! first chunk after it was starved and padded, or a jump of more than
-//! `RESYNC_MS` (a stall, a rebuild). A late or resumed stream therefore lands
-//! at its true time — the gap before it is silence, samples older than the
-//! current window are dropped — and no fixed offset survives. Slow clock drift
-//! between two devices is corrected by dropping samples from whichever stream
-//! runs ahead, so drift correction never inserts silence either.
+//! callback-time jitter never insert silence.
+//!
+//! Chunks carry the time their callback ran, which is their capture time plus
+//! a latency that is never negative (scheduling, resampler buffering, bursty
+//! delivery). Each stream's timing is therefore estimated from its least-late
+//! recent chunks: `lag` is the minimum of (arrival-derived start − timeline
+//! position) over the last `LAG_WINDOW_MS`. From that:
+//! - A stream appears (first chunk, or first chunk after it was starved and
+//!   padded) at its capture time, aligned with the other stream's `lag`; the
+//!   gap before it is silence and anything older than the mixed audio drops.
+//! - A chunk arriving more than `RESYNC_MS` later than continuity predicts is
+//!   a gap only if that persists for `GAP_CONFIRM_MS` of arrival time. A
+//!   backlog delivered after a capture-thread stall catches up with continuity
+//!   within the burst and is kept whole; a real gap (lost samples) gets its
+//!   silence inserted where it happened.
+//! - Clock drift and residual misalignment are corrected in steps of at most
+//!   `CORRECTION_STEP_MS` per chunk: samples are dropped from the stream that
+//!   runs ahead or the last sample is held in the one that lags, so no
+//!   audible cut and no silence is introduced.
 
 use std::collections::VecDeque;
 
@@ -22,18 +33,31 @@ pub(super) const MIX_WINDOW_MS: u32 = 600;
 
 /// A stream is starved (and padded with silence) once the other stream's
 /// timeline runs this far ahead of it: it stalled, died, or does not exist.
-const STARVATION_MS: u32 = 200;
+/// Longer than a capture-thread hiccup, whose backlog should not be lost.
+const STARVATION_MS: u32 = 500;
 
-/// A chunk whose capture time is further than this from where continuity puts
-/// it re-anchors the stream at its capture time.
+/// A chunk this much later than continuity predicts may start a gap.
 const RESYNC_MS: u32 = 100;
 
-/// Relative clock drift between the streams tolerated before correcting it.
-const DRIFT_TOLERANCE_MS: u32 = 20;
+/// A suspected gap must persist over this much arrival time to be real.
+const GAP_CONFIRM_MS: u32 = 150;
 
-/// Smoothing of each stream's capture-time error, so timestamp jitter (callback
-/// latency, resampler buffering) does not trigger drift corrections.
-const LAG_SMOOTHING: f64 = 0.05;
+/// Span of arrivals over which each stream's least latency is taken.
+const LAG_WINDOW_MS: u32 = 2_000;
+
+/// Misalignment between the streams tolerated before correcting it.
+const ALIGNMENT_DEADBAND_MS: u32 = 5;
+
+/// Most audio removed or held in one correction step (one per chunk).
+const CORRECTION_STEP_MS: u32 = 1;
+
+/// A forward jump in arrival time that has not yet been confirmed as a gap.
+struct PendingGap {
+    /// Timeline index at which the jump happened.
+    at: i64,
+    /// Arrival time (sample index) at which it was first seen.
+    since: i64,
+}
 
 /// One stream's buffered samples and its place on the shared timeline.
 #[derive(Default)]
@@ -42,16 +66,45 @@ struct StreamTimeline {
     /// Timeline index just past the last buffered sample; `None` until the
     /// stream delivers.
     end: Option<i64>,
-    /// Smoothed capture index minus timeline index of this stream's samples.
-    lag: f64,
     /// Place the next chunk by its capture time rather than appending it.
     reanchor: bool,
+    /// Recent (arrival end, error + corrections) pairs, kept as a monotonic
+    /// deque so the front is the window minimum.
+    errors: VecDeque<(i64, i64)>,
+    /// Net samples held (+) or dropped (−) by corrections, so errors recorded
+    /// before a correction stay comparable with those after it.
+    corrections: i64,
+    pending_gap: Option<PendingGap>,
 }
 
 impl StreamTimeline {
     /// Delivering and placed by continuity; its `lag` is meaningful.
     fn is_tracking(&self) -> bool {
-        self.end.is_some() && !self.reanchor
+        self.end.is_some() && !self.reanchor && !self.errors.is_empty()
+    }
+
+    fn record_error(&mut self, arrival_end: i64, error: i64, window: i64) {
+        let normalized = error + self.corrections;
+        while self.errors.back().is_some_and(|&(_, e)| e >= normalized) {
+            self.errors.pop_back();
+        }
+        self.errors.push_back((arrival_end, normalized));
+        while self.errors.front().is_some_and(|&(t, _)| arrival_end - t > window) {
+            self.errors.pop_front();
+        }
+    }
+
+    /// Least recent (arrival-derived start − timeline position), in samples.
+    fn lag(&self) -> i64 {
+        self.errors.front().map_or(0, |&(_, e)| e) - self.corrections
+    }
+
+    /// Start over: the stream's placement was just set from its capture time.
+    fn reset_timing(&mut self) {
+        self.reanchor = false;
+        self.errors.clear();
+        self.corrections = 0;
+        self.pending_gap = None;
     }
 }
 
@@ -94,51 +147,86 @@ impl AudioMixerRingBuffer {
         }
     }
 
-    /// Queue a chunk whose last sample was captured at `capture_secs`
-    /// (seconds of active recording time).
-    pub(super) fn add_samples(&mut self, device_type: DeviceType, samples: &[f32], capture_secs: f64) {
+    /// Queue a chunk whose callback ran at `arrival_secs` (seconds of active
+    /// recording time, at or after the capture of its last sample).
+    pub(super) fn add_samples(&mut self, device_type: DeviceType, samples: &[f32], arrival_secs: f64) {
         if samples.is_empty() {
             return;
         }
         let n = samples.len() as i64;
-        let capture_start = (capture_secs * self.sample_rate as f64).round() as i64 - n;
-        let head = *self.head.get_or_insert(capture_start);
-        let resync = self.samples_for_ms(RESYNC_MS) as f64;
-        let drift_tolerance = self.samples_for_ms(DRIFT_TOLERANCE_MS) as f64;
+        let arrival_end = (arrival_secs * self.sample_rate as f64).round() as i64;
+        let estimated_start = arrival_end - n;
+        let head = *self.head.get_or_insert(estimated_start);
+        let resync = self.samples_for_ms(RESYNC_MS);
+        let confirm = self.samples_for_ms(GAP_CONFIRM_MS);
+        let lag_window = self.samples_for_ms(LAG_WINDOW_MS);
+        let deadband = self.samples_for_ms(ALIGNMENT_DEADBAND_MS);
+        let step = self.samples_for_ms(CORRECTION_STEP_MS).max(1);
 
         let (stream, other) = self.streams_mut(device_type);
-        // Where the other stream's samples of the same capture time sit.
-        let reference_lag = if other.is_tracking() { other.lag } else { stream.lag };
+        let other_lag = other.is_tracking().then(|| other.lag());
 
-        let continuous_end = stream.end.filter(|_| !stream.reanchor);
-        let position = match continuous_end {
-            Some(prev_end) if ((capture_start - prev_end) as f64 - stream.lag).abs() <= resync => {
-                stream.lag += ((capture_start - prev_end) as f64 - stream.lag) * LAG_SMOOTHING;
-                // Drift: this stream's samples were captured earlier than the other's
-                // at the same timeline index. Drop the surplus instead of padding the other.
-                let surplus = if other.is_tracking() { other.lag - stream.lag } else { 0.0 };
-                if surplus > drift_tolerance {
-                    let dropped = (surplus.round() as i64).min(n);
-                    stream.lag += dropped as f64;
-                    debug!("{:?} mix drift correction: dropped {} samples", device_type, dropped);
-                    prev_end - dropped
-                } else {
-                    prev_end
-                }
-            }
+        let prev_end = match stream.end {
+            Some(end) if !stream.reanchor => end,
             _ => {
-                if let Some(prev_end) = stream.end {
-                    debug!("{:?} mix re-anchored on capture time ({} samples from continuity)",
-                           device_type, capture_start - prev_end);
-                }
-                stream.lag = reference_lag;
-                stream.reanchor = false;
-                capture_start - reference_lag.round() as i64
+                // (Re)appearing: place by capture time, aligned with the other stream.
+                let reference = other_lag.unwrap_or(0);
+                stream.reset_timing();
+                let position = estimated_start - reference;
+                Self::place(stream, head, position, samples);
+                stream.record_error(arrival_end, reference, lag_window);
+                return;
             }
         };
 
-        // Place the chunk: pad a gap before it, drop what overlaps buffered or
-        // already-mixed audio.
+        let error = estimated_start - prev_end;
+        stream.record_error(arrival_end, error, lag_window);
+        let excess = error - stream.lag();
+
+        if excess > resync {
+            let pending = stream.pending_gap.get_or_insert(PendingGap { at: prev_end, since: arrival_end });
+            if arrival_end - pending.since < confirm {
+                // Possibly a backlog catching up; keep continuity for now.
+                Self::place(stream, head, prev_end, samples);
+                return;
+            }
+            // The chunks keep arriving late: samples were lost. Put the
+            // silence where they went missing.
+            let gap_at = pending.at;
+            let since = pending.since;
+            stream.pending_gap = None;
+            debug!("{:?} mix gap of {} samples confirmed", device_type, excess);
+            Self::insert_silence(stream, head, gap_at, excess);
+            stream.errors.retain(|&(t, _)| t < since);
+            stream.record_error(arrival_end, error - excess, lag_window);
+            Self::place(stream, head, prev_end + excess, samples);
+            return;
+        }
+        stream.pending_gap = None;
+
+        // Align with the other stream in small steps.
+        let misalignment = other_lag.map_or(0, |other_lag| stream.lag() - other_lag);
+        if misalignment > deadband {
+            // Placed earlier than captured relative to the other stream: hold.
+            let held = misalignment.min(step);
+            stream.samples.extend(std::iter::repeat(samples[0]).take(held as usize));
+            stream.end = Some(prev_end + held);
+            stream.corrections += held;
+            Self::place(stream, head, prev_end + held, samples);
+        } else if misalignment < -deadband {
+            // Placed later than captured: drop from the front of this chunk.
+            let dropped = (-misalignment).min(step).min(n);
+            stream.corrections -= dropped;
+            Self::place(stream, head, prev_end - dropped, samples);
+        } else {
+            Self::place(stream, head, prev_end, samples);
+        }
+    }
+
+    /// Put `samples` at timeline `position`: pad a gap before it, drop what
+    /// overlaps buffered or already-mixed audio.
+    fn place(stream: &mut StreamTimeline, head: i64, position: i64, samples: &[f32]) {
+        let n = samples.len() as i64;
         let end = stream.end.unwrap_or(head).max(head);
         if position > end {
             stream.samples.extend(std::iter::repeat(0.0).take((position - end) as usize));
@@ -146,6 +234,16 @@ impl AudioMixerRingBuffer {
         let skip = (end - position).clamp(0, n) as usize;
         stream.samples.extend(samples[skip..].iter().copied());
         stream.end = Some(end.max(position + n));
+    }
+
+    /// Insert `len` samples of silence at timeline index `at` (or at the front,
+    /// if audio from there on was already mixed).
+    fn insert_silence(stream: &mut StreamTimeline, head: i64, at: i64, len: i64) {
+        let index = (at - head).clamp(0, stream.samples.len() as i64) as usize;
+        let tail = stream.samples.split_off(index);
+        stream.samples.extend(std::iter::repeat(0.0).take(len as usize));
+        stream.samples.extend(tail);
+        stream.end = stream.end.map(|end| end.max(head) + len);
     }
 
     fn timeline_end(&self, stream: &StreamTimeline) -> i64 {
@@ -212,6 +310,7 @@ mod tests {
     const SYS_LEVEL: f32 = 0.5;
 
     /// Deterministic jitter (no RNG dependency needed).
+    #[derive(Clone)]
     struct Lcg(u64);
     impl Lcg {
         fn next_in(&mut self, lo: usize, hi: usize) -> usize {
@@ -220,21 +319,26 @@ mod tests {
         }
     }
 
-    /// A simulated capture stream. Each sample's value is its true capture
-    /// time as a 48 kHz sample index plus one (0 is reserved for padding), so
-    /// the mixed windows show exactly how the streams were aligned.
+    /// A simulated capture stream. Each sample's value is its device sample
+    /// index plus one (0 is reserved for padding), so the mixed output shows
+    /// when each sample was captured and what was dropped or held.
+    #[derive(Clone)]
     struct SimStream {
         device_type: DeviceType,
         /// Device clock relative to wall time (1.005 = 0.5% fast).
         clock: f64,
         start_ms: u64,
-        /// Wall-time ranges in which the stream captures nothing.
-        stalls: Vec<(u64, u64)>,
+        /// Wall-time ranges in which the device captures nothing (samples lost).
+        capture_stalls: Vec<(u64, u64)>,
+        /// Wall-time ranges in which captured audio is held back, then delivered at once.
+        delivery_stalls: Vec<(u64, u64)>,
+        /// Deliver only every this many ms (bursty graph quantum); 0 = as captured.
+        burst_ms: u64,
         next_sample: u64,
         pending: Vec<f32>,
         next_len: usize,
         len_range: (usize, usize),
-        /// Maximum callback latency added to the reported capture time.
+        /// Maximum callback latency added to the reported time.
         latency_ms: usize,
         jitter: Lcg,
     }
@@ -245,7 +349,9 @@ mod tests {
                 device_type,
                 clock: 1.0,
                 start_ms: 0,
-                stalls: Vec::new(),
+                capture_stalls: Vec::new(),
+                delivery_stalls: Vec::new(),
+                burst_ms: 0,
                 next_sample: 0,
                 pending: Vec::new(),
                 next_len: 480,
@@ -261,36 +367,135 @@ mod tests {
             self
         }
 
+        fn device_rate_per_ms(&self) -> f64 {
+            RATE as f64 / 1000.0 * self.clock
+        }
+
+        /// Wall time (ms) at which the sample with this value was captured.
+        fn wall_ms(&self, value: f32) -> f64 {
+            self.start_ms as f64 + (value as f64 - 1.0) / self.device_rate_per_ms()
+        }
+
         /// Deliver every buffer the device completed by `now_ms`.
         fn pump(&mut self, now_ms: u64, ring: &mut AudioMixerRingBuffer) {
             if now_ms < self.start_ms {
                 return;
             }
-            let wall_rate = RATE as f64 / 1000.0;
-            let device_rate = wall_rate * self.clock;
-            let due = ((now_ms - self.start_ms) as f64 * device_rate) as u64;
+            let due = ((now_ms - self.start_ms) as f64 * self.device_rate_per_ms()) as u64;
             while self.next_sample < due {
-                let wall_ms = self.start_ms as f64 + self.next_sample as f64 / device_rate;
+                let wall_ms = self.start_ms as f64 + self.next_sample as f64 / self.device_rate_per_ms();
                 self.next_sample += 1;
-                if self.stalls.iter().any(|&(a, b)| wall_ms >= a as f64 && wall_ms < b as f64) {
+                if self.capture_stalls.iter().any(|&(a, b)| wall_ms >= a as f64 && wall_ms < b as f64) {
                     continue;
                 }
-                self.pending.push((wall_ms * wall_rate).round() as f32 + 1.0);
+                self.pending.push(self.next_sample as f32);
+            }
+            let held_back = self.delivery_stalls.iter().any(|&(a, b)| now_ms >= a && now_ms < b)
+                || (self.burst_ms > 0 && now_ms % self.burst_ms != 0);
+            if held_back {
+                return;
             }
             while self.pending.len() >= self.next_len {
                 let chunk: Vec<f32> = self.pending.drain(..self.next_len).collect();
                 let latency = if self.latency_ms > 0 { self.jitter.next_in(0, self.latency_ms) } else { 0 };
-                let capture_secs = (now_ms + latency as u64) as f64 / 1000.0;
-                ring.add_samples(self.device_type, &chunk, capture_secs);
+                ring.add_samples(self.device_type, &chunk, (now_ms + latency as u64) as f64 / 1000.0);
                 self.next_len = self.jitter.next_in(self.len_range.0, self.len_range.1);
             }
         }
     }
 
-    /// Per mixed sample: the (mic, system) capture-time values.
-    fn run(mut mic: SimStream, mut sys: SimStream, seconds: u64) -> Vec<(f32, f32)> {
+    /// Mixed output as (mic, system) sample values, per output sample.
+    struct Mixed {
+        pairs: Vec<(f32, f32)>,
+        mic: SimStream,
+        sys: SimStream,
+    }
+
+    impl Mixed {
+        /// Offsets (mic − system capture time, ms) with the mic capture time,
+        /// where both carry audio.
+        fn offsets(&self) -> impl Iterator<Item = (f64, f64)> + '_ {
+            self.pairs.iter().filter(|(m, s)| *m != 0.0 && *s != 0.0).map(|&(m, s)| {
+                let mic_ms = self.mic.wall_ms(m);
+                (mic_ms, mic_ms - self.sys.wall_ms(s))
+            })
+        }
+
+        fn max_offset_ms(&self, after_ms: f64) -> f64 {
+            self.offsets().filter(|(t, _)| *t >= after_ms).map(|(_, o)| o.abs()).fold(0.0, f64::max)
+        }
+
+        /// Wall times (ms, from the other stream) at which `pick` was padded.
+        fn padding(&self, system: bool) -> Vec<f64> {
+            self.pairs
+                .iter()
+                .filter_map(|&(m, s)| match system {
+                    true if s == 0.0 && m != 0.0 => Some(self.mic.wall_ms(m)),
+                    false if m == 0.0 && s != 0.0 => Some(self.sys.wall_ms(s)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Padding after the first window. When the second stream first
+        /// appears, its callback latency can leave a few ms before its anchor.
+        fn steady_state_padding(&self) -> usize {
+            let late = |t: &f64| *t > MIX_WINDOW_MS as f64;
+            self.padding(true).iter().filter(|t| late(t)).count() + self.padding(false).iter().filter(|t| late(t)).count()
+        }
+
+        /// Largest run of samples removed at once and of samples held, per stream.
+        fn largest_corrections(&self, system: bool) -> (u64, u64) {
+            let values: Vec<f32> = self
+                .pairs
+                .iter()
+                .map(|&(m, s)| if system { s } else { m })
+                .filter(|v| *v != 0.0)
+                .collect();
+            let (mut dropped, mut held, mut run) = (0u64, 0u64, 0u64);
+            for pair in values.windows(2) {
+                let step = (pair[1] - pair[0]) as i64;
+                if step == 0 {
+                    run += 1;
+                    held = held.max(run);
+                } else {
+                    run = 0;
+                    dropped = dropped.max((step - 1).max(0) as u64);
+                }
+            }
+            (dropped, held)
+        }
+
+        /// Samples of this stream's captured audio missing from the output.
+        fn lost_samples(&self, system: bool) -> u64 {
+            let stream = if system { &self.sys } else { &self.mic };
+            let delivered: std::collections::HashSet<u32> = self
+                .pairs
+                .iter()
+                .map(|&(m, s)| if system { s } else { m })
+                .filter(|v| *v != 0.0)
+                .map(|v| v as u32)
+                .collect();
+            let last = delivered.iter().copied().max().unwrap_or(0);
+            (1..=last).filter(|v| !delivered.contains(v)).count() as u64 - stream.capture_stall_samples(last)
+        }
+    }
+
+    impl SimStream {
+        fn capture_stall_samples(&self, up_to: u32) -> u64 {
+            (1..=up_to)
+                .filter(|&v| {
+                    let wall = self.wall_ms(v as f32);
+                    self.capture_stalls.iter().any(|&(a, b)| wall >= a as f64 && wall < b as f64)
+                })
+                .count() as u64
+        }
+    }
+
+    fn run(mut mic: SimStream, mut sys: SimStream, seconds: u64) -> Mixed {
         let mut ring = AudioMixerRingBuffer::new(RATE);
-        let mut mixed = Vec::new();
+        let mut pairs = Vec::new();
+        let (mic_template, sys_template) = (mic.clone(), sys.clone());
         for ms in 0..seconds * 1_000 {
             if ms % 2 == 0 {
                 mic.pump(ms, &mut ring);
@@ -300,47 +505,12 @@ mod tests {
                 mic.pump(ms, &mut ring);
             }
             while let Some((m, s)) = ring.extract_window() {
-                mixed.extend(m.into_iter().zip(s));
+                pairs.extend(m.into_iter().zip(s));
             }
             let most = ring.window_size_samples * 2;
             assert!(ring.mic.samples.len() <= most && ring.system.samples.len() <= most, "buffers grew at {ms} ms");
         }
-        mixed
-    }
-
-    /// Largest |mic − system| capture-time offset, in ms, where both carry audio.
-    fn max_offset_ms(mixed: &[(f32, f32)]) -> f64 {
-        mixed
-            .iter()
-            .filter(|(m, s)| *m != 0.0 && *s != 0.0)
-            .map(|(m, s)| (*m as f64 - *s as f64).abs() * 1000.0 / RATE as f64)
-            .fold(0.0, f64::max)
-    }
-
-    /// Mic capture times (ms) of mixed samples where `pick` found padding.
-    fn padded_at_ms(mixed: &[(f32, f32)], pick: impl Fn(&(f32, f32)) -> (f32, f32)) -> Vec<f64> {
-        mixed
-            .iter()
-            .map(pick)
-            .filter(|(padded, reference)| *padded == 0.0 && *reference != 0.0)
-            .map(|(_, reference)| reference as f64 * 1000.0 / RATE as f64)
-            .collect()
-    }
-
-    fn system_padding(mixed: &[(f32, f32)]) -> Vec<f64> {
-        padded_at_ms(mixed, |&(m, s)| (s, m))
-    }
-
-    fn mic_padding(mixed: &[(f32, f32)]) -> Vec<f64> {
-        padded_at_ms(mixed, |&(m, s)| (m, s))
-    }
-
-    /// Padding after the first window. When the second stream first appears,
-    /// its callback latency can leave a few milliseconds before its anchor.
-    fn steady_state_padding(mixed: &[(f32, f32)]) -> usize {
-        let after_first_window = |t: &f64| *t > MIX_WINDOW_MS as f64;
-        mic_padding(mixed).iter().filter(|t| after_first_window(t)).count()
-            + system_padding(mixed).iter().filter(|t| after_first_window(t)).count()
+        Mixed { pairs, mic: mic_template, sys: sys_template }
     }
 
     #[test]
@@ -350,9 +520,9 @@ mod tests {
         sys.start_ms = 250;
         let mixed = run(mic, sys, 30);
 
-        assert!(max_offset_ms(&mixed) < 0.1, "offset {} ms", max_offset_ms(&mixed));
-        assert!(mic_padding(&mixed).is_empty());
-        let padded = system_padding(&mixed);
+        assert!(mixed.max_offset_ms(0.0) < 0.1, "offset {} ms", mixed.max_offset_ms(0.0));
+        assert!(mixed.padding(false).is_empty());
+        let padded = mixed.padding(true);
         assert!(!padded.is_empty() && padded.iter().all(|&t| t <= 250.1), "system padded outside its absence");
     }
 
@@ -360,44 +530,93 @@ mod tests {
     fn stalled_and_resumed_system_realigns() {
         let mic = SimStream::new(DeviceType::Microphone, 3);
         let mut sys = SimStream::new(DeviceType::System, 4);
-        sys.stalls = vec![(10_000, 11_300)];
+        sys.capture_stalls = vec![(10_000, 11_300)];
         let mixed = run(mic, sys, 30);
 
-        assert!(max_offset_ms(&mixed) < 0.1, "offset {} ms after the stall", max_offset_ms(&mixed));
-        assert!(mic_padding(&mixed).is_empty());
-        let padded = system_padding(&mixed);
+        assert!(mixed.max_offset_ms(0.0) < 0.1, "offset {} ms after the stall", mixed.max_offset_ms(0.0));
+        assert!(mixed.padding(false).is_empty());
+        let padded = mixed.padding(true);
         // At most one resumed chunk (<= 10 ms) can fall behind an already-mixed window.
         assert!(padded.iter().all(|&t| (10_000.0..11_311.0).contains(&t)), "system padded outside the stall");
         assert!(padded.len() as f64 >= 1.2 * RATE as f64, "the stall itself is silence");
     }
 
     #[test]
+    fn a_short_capture_gap_is_silence_exactly_where_audio_was_lost() {
+        let mic = SimStream::new(DeviceType::Microphone, 8);
+        let mut sys = SimStream::new(DeviceType::System, 9);
+        sys.capture_stalls = vec![(10_000, 10_150)];
+        let mixed = run(mic, sys, 20);
+
+        let padded = mixed.padding(true);
+        assert!(padded.iter().all(|&t| (9_990.0..10_160.0).contains(&t)), "silence outside the gap");
+        assert!(padded.len() >= 140 * 48, "the 150 ms gap is silence");
+        assert!(mixed.max_offset_ms(10_500.0) < 1.0, "offset {} ms after the gap", mixed.max_offset_ms(10_500.0));
+    }
+
+    #[test]
+    fn a_delayed_backlog_loses_no_audio_and_stays_aligned() {
+        let mic = SimStream::new(DeviceType::Microphone, 10).sizes(480, 1_024);
+        let mut sys = SimStream::new(DeviceType::System, 11).sizes(480, 1_024);
+        // The capture thread is blocked for 300 ms, then delivers what ALSA buffered.
+        sys.delivery_stalls = vec![(10_000, 10_300)];
+        let mixed = run(mic, sys, 20);
+
+        assert_eq!(mixed.lost_samples(true), 0, "backlog audio lost");
+        assert_eq!(mixed.steady_state_padding(), 0, "silence inserted");
+        assert!(mixed.max_offset_ms(0.0) < 1.0, "offset {} ms", mixed.max_offset_ms(0.0));
+    }
+
+    #[test]
+    fn bursty_delivery_inserts_no_silence_and_converges() {
+        for burst_ms in [85, 170, 256] {
+            let mic = SimStream::new(DeviceType::Microphone, 12).sizes(480, 1_440);
+            let mut sys = SimStream::new(DeviceType::System, 13).sizes(1_024, 1_024);
+            sys.burst_ms = burst_ms;
+            let mixed = run(mic, sys, 40);
+
+            assert_eq!(mixed.steady_state_padding(), 0, "{burst_ms} ms bursts: silence inserted");
+            // A burst's least-late chunk can still be a partial period late.
+            assert!(mixed.max_offset_ms(15_000.0) <= 15.0,
+                    "{burst_ms} ms bursts: offset {} ms", mixed.max_offset_ms(15_000.0));
+            let (dropped, held) = mixed.largest_corrections(true);
+            assert!(dropped <= 48 && held <= 48, "{burst_ms} ms bursts: correction of {dropped}/{held} samples at once");
+        }
+    }
+
+    #[test]
     fn jittered_callbacks_insert_no_silence_and_stay_aligned() {
-        // Mic: 10-30 ms buffers. System: 5-85 ms bursts. Both report capture
-        // time up to 10 ms late.
+        // Mic: 10-30 ms buffers. System: 5-85 ms bursts. Both report their
+        // callback up to 10 ms after capture.
         let mut mic = SimStream::new(DeviceType::Microphone, 7).sizes(480, 1_440);
         let mut sys = SimStream::new(DeviceType::System, 11).sizes(256, 4_096);
         mic.latency_ms = 10;
         sys.latency_ms = 10;
         let mixed = run(mic, sys, 120);
 
-        assert!(mixed.len() >= 199 * 28_800, "only {} samples mixed", mixed.len());
-        assert_eq!(steady_state_padding(&mixed), 0, "silence inserted");
-        assert!(max_offset_ms(&mixed) <= 11.0, "offset {} ms", max_offset_ms(&mixed));
+        assert!(mixed.pairs.len() >= 199 * 28_800, "only {} samples mixed", mixed.pairs.len());
+        assert_eq!(mixed.steady_state_padding(), 0, "silence inserted");
+        assert!(mixed.max_offset_ms(5_000.0) <= 7.0, "offset {} ms", mixed.max_offset_ms(5_000.0));
     }
 
     #[test]
-    fn clock_drift_is_corrected_without_silence() {
-        for (mic_clock, sys_clock) in [(1.005, 1.0), (1.0, 0.995)] {
+    fn clock_drift_is_corrected_in_small_steps_without_silence() {
+        for (mic_clock, sys_clock) in [(1.005, 1.0), (1.0, 0.995), (0.995, 1.0), (1.0, 1.005)] {
             let mut mic = SimStream::new(DeviceType::Microphone, 5).sizes(480, 1_440);
             let mut sys = SimStream::new(DeviceType::System, 6).sizes(256, 2_048);
             mic.clock = mic_clock;
             sys.clock = sys_clock;
             let mixed = run(mic, sys, 120);
 
-            assert_eq!(steady_state_padding(&mixed), 0, "drift {mic_clock}/{sys_clock}: silence inserted");
-            // 0.5% drift is 600 ms over the run; alignment stays within tolerance.
-            assert!(max_offset_ms(&mixed) <= 25.0, "drift {mic_clock}/{sys_clock}: offset {} ms", max_offset_ms(&mixed));
+            assert_eq!(mixed.steady_state_padding(), 0, "drift {mic_clock}/{sys_clock}: silence inserted");
+            assert!(mixed.max_offset_ms(2_000.0) <= 20.0,
+                    "drift {mic_clock}/{sys_clock}: offset {} ms", mixed.max_offset_ms(2_000.0));
+            for system in [false, true] {
+                let (dropped, held) = mixed.largest_corrections(system);
+                // One step is 1 ms; allow two steps landing back to back.
+                assert!(dropped <= 96 && held <= 96,
+                        "drift {mic_clock}/{sys_clock}: {dropped} samples dropped / {held} held at once");
+            }
         }
     }
 
@@ -420,10 +639,10 @@ mod tests {
     fn short_gaps_are_jitter_not_starvation() {
         let mut ring = AudioMixerRingBuffer::new(RATE);
         let window = ring.window_size_samples;
-        // Both start at 0; system has delivered to 500 ms, mic to 650 ms.
+        // Both start at 0; system has delivered to 500 ms, mic to 950 ms.
         ring.add_samples(DeviceType::System, &vec![SYS_LEVEL; window - RATE as usize / 10], 0.5);
-        ring.add_samples(DeviceType::Microphone, &vec![MIC_LEVEL; window + RATE as usize / 20], 0.65);
-        assert!(ring.extract_window().is_none(), "a 150 ms lead is not starvation");
+        ring.add_samples(DeviceType::Microphone, &vec![MIC_LEVEL; window + RATE as usize * 35 / 100], 0.95);
+        assert!(ring.extract_window().is_none(), "a 450 ms lead is not starvation");
     }
 
     #[test]

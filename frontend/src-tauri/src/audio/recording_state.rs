@@ -9,7 +9,9 @@ use super::devices::AudioDevice;
 use super::buffer_pool::AudioBufferPool;
 
 mod stream_health;
-pub use stream_health::{ErrorOutcome, StreamFault, StreamHealth, StreamHealthEvent, StreamStatus};
+pub use stream_health::{
+    ErrorOutcome, StreamFault, StreamHealth, StreamHealthEvent, StreamStatus, MAX_SHORT_LIVED_REBUILDS,
+};
 
 /// Non-stream audio errors (e.g. a failed hand-off to the pipeline) can repeat
 /// on every buffer; log them at most this often.
@@ -441,6 +443,17 @@ impl RecordingState {
         })
     }
 
+    /// System audio could not be started (no device resolved, or its stream
+    /// failed to open): tell the user and leave the stream `Failed`, so the
+    /// supervisor retries it like one that failed mid-session.
+    pub fn report_system_audio_unavailable(&self, device_name: Option<String>, reason: String) {
+        warn!("System audio unavailable ({:?}): {} — recording microphone only", device_name, reason);
+        let health = self.stream_health(DeviceType::System);
+        health.mark_failed(Instant::now());
+        health.announce_outage();
+        self.emit_health_event(StreamHealthEvent::SystemAudioUnavailable { device_name, reason });
+    }
+
     /// Report that the session can no longer capture any audio. Emitted once;
     /// the session keeps recording state so the normal stop/save still runs.
     pub fn report_capture_failed(&self, message: String) {
@@ -742,6 +755,22 @@ mod tests {
             state.report_pipeline_closed();
         }
         assert_eq!(events.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unavailable_system_audio_is_announced_and_retried() {
+        let (state, _, events) = live_session();
+        state.report_system_audio_unavailable(None, "no monitor source".to_string());
+
+        let events = events.lock().unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [StreamHealthEvent::SystemAudioUnavailable { device_name: None, reason }] if reason == "no monitor source"
+        ));
+        let health = state.stream_health(DeviceType::System);
+        assert_eq!(health.status(), StreamStatus::Failed);
+        assert!(health.retry_due(Instant::now() + Duration::from_secs(31)), "retried like a mid-session failure");
+        assert!(!state.all_streams_down(), "the microphone is still recording");
     }
 
     #[test]
