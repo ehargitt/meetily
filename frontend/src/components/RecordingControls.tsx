@@ -11,6 +11,7 @@ import Analytics from '@/lib/analytics';
 import { useRecordingState, RecordingStatus, STOP_FLOW_STATUSES } from '@/contexts/RecordingStateContext';
 import type { TranscriptionErrorPayload } from '@/services/transcriptService';
 import { stopBackendRecording, isStillRecordingAfterFailedStop } from '@/lib/stopBackendRecording';
+import { isPostStopInProgress } from '@/hooks/useRecordingStop';
 
 interface RecordingControlsProps {
   isRecording: boolean;
@@ -143,8 +144,14 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     console.log('Executing stop recording...');
     try {
       setIsProcessing(true);
+      const result = await stopBackendRecording();
       // 'in-progress': the winning stop's own flow saves; leave status alone.
-      if (await stopBackendRecording() !== 'stopped') {
+      if (result === 'in-progress') {
+        return;
+      }
+      if (result === 'not-recording') {
+        // Nothing to save; undo our STOPPING unless a stop flow owns the status.
+        if (!isPostStopInProgress()) setRecordingStatus(RecordingStatus.IDLE);
         return;
       }
       console.log('stop_recording command completed successfully');

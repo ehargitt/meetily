@@ -14,9 +14,17 @@ export const RecordingStatus = {
   ERROR: 'error',
 } as const;
 
+/** Copy of STOP_FLOW_STATUSES, exported by the real module. */
+export const STOP_FLOW_STATUSES = [
+  RecordingStatus.STOPPING,
+  RecordingStatus.PROCESSING_TRANSCRIPTS,
+  RecordingStatus.SAVING,
+];
+
 export function recordingStateModule(state: Record<string, unknown> = {}) {
   return {
     RecordingStatus,
+    STOP_FLOW_STATUSES,
     useRecordingState: () => ({ isRecording: false, ...state }),
   };
 }

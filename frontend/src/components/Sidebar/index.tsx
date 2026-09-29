@@ -232,8 +232,12 @@ const Sidebar: React.FC = () => {
       const transcriptConfigToSave = updatedConfig || transcriptModelConfig;
       await Analytics.trackSettingsChanged('transcript_config', `${transcriptConfigToSave.provider}_${transcriptConfigToSave.model}`);
     } catch (error) {
+      // The backend refuses a model switch while a recording uses the engine.
       console.error('Failed to save transcript config:', error);
       setSettingsSaveSuccess(false);
+      toast.error('Could not save transcription settings', {
+        description: error instanceof Error ? error.message : String(error),
+      });
     }
   };
 

@@ -123,7 +123,6 @@ export function useRecordingStart(
       return;
     }
     isStartingRef.current = true;
-    cancelPostSaveNavigation();
     try {
       console.log('handleRecordingStart called - checking selected transcription model status');
 
@@ -153,6 +152,10 @@ export function useRecordingStart(
 
       const randomTitle = generateMeetingTitle();
       setMeetingTitle(randomTitle);
+
+      // Only a start that passed the model check drops the pending
+      // navigation to the meeting just saved.
+      cancelPostSaveNavigation();
 
       // Set STARTING status before initiating backend recording
       setStatus(RecordingStatus.STARTING, 'Initializing recording...');
@@ -221,7 +224,6 @@ export function useRecordingStart(
           console.log('Auto-starting recording from navigation...');
           setIsAutoStarting(true);
           sessionStorage.removeItem('autoStartRecording'); // Clear the flag
-          cancelPostSaveNavigation();
 
           // Check the selected transcription model before starting.
           const modelReady = await checkModelReady();
@@ -251,6 +253,7 @@ export function useRecordingStart(
             // Generate meeting title
             const generatedMeetingTitle = generateMeetingTitle();
 
+            cancelPostSaveNavigation(); // Model check passed: this start proceeds
             // Set STARTING status before initiating backend recording
             setStatus(RecordingStatus.STARTING, 'Initializing recording...');
             clearTranscripts(); // Before start: early segments must not be wiped
@@ -321,7 +324,6 @@ export function useRecordingStart(
 
       console.log('Direct start from sidebar - checking selected transcription model status');
       setIsAutoStarting(true);
-      cancelPostSaveNavigation();
 
       // Check the selected transcription model before starting.
       const modelReady = await checkModelReady();
@@ -350,6 +352,7 @@ export function useRecordingStart(
         // Generate meeting title
         const generatedMeetingTitle = generateMeetingTitle();
 
+        cancelPostSaveNavigation(); // Model check passed: this start proceeds
         // Set STARTING status before initiating backend recording
         setStatus(RecordingStatus.STARTING, 'Initializing recording...');
         clearTranscripts(); // Before start: early segments must not be wiped

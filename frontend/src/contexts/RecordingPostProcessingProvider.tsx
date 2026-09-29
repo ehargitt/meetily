@@ -3,7 +3,7 @@
 import React, { useEffect, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
-import { useRecordingStop } from '@/hooks/useRecordingStop';
+import { useRecordingStop, isPostStopInProgress } from '@/hooks/useRecordingStop';
 import { useRecordingState, RecordingStatus, STOP_FLOW_STATUSES } from '@/contexts/RecordingStateContext';
 import { recordingService } from '@/services/recordingService';
 import { stopBackendRecording, isStillRecordingAfterFailedStop } from '@/lib/stopBackendRecording';
@@ -13,6 +13,8 @@ import { stopBackendRecording, isStillRecordingAfterFailedStop } from '@/lib/sto
 // identity is stable across renders.
 const setIsRecording = () => { };
 const setIsRecordingDisabled = () => { };
+
+const RECORDING_ERROR_TOAST_ID = 'recording-error';
 
 /**
  * RecordingPostProcessingProvider
@@ -50,7 +52,7 @@ export function RecordingPostProcessingProvider({ children }: { children: React.
     let unlistenStopComplete: (() => void) | undefined;
     let unlistenRecordingError: (() => void) | undefined;
 
-    const stopAfterRecordingError = async () => {
+    const stopAfterRecordingError = async (message: string) => {
       const latest = latestRef.current;
       if (!latest.isRecording || STOP_FLOW_STATUSES.includes(latest.status)) {
         console.log('[RecordingPostProcessing] recording-error: no active recording or a stop is already running');
@@ -60,10 +62,20 @@ export function RecordingPostProcessingProvider({ children }: { children: React.
       latest.setStatus(RecordingStatus.STOPPING, 'Stopping recording...');
       let callApi = true;
       try {
-        if (await stopBackendRecording() !== 'stopped') {
-          // Another stop is running or already ended the session; its flow owns the save.
+        const result = await stopBackendRecording();
+        if (result === 'in-progress') {
+          // Another stop is running; its flow owns the save and the status.
           return;
         }
+        if (result === 'not-recording') {
+          if (!isPostStopInProgress()) latestRef.current.setStatus(RecordingStatus.IDLE);
+          return;
+        }
+        toast.error(message, {
+          id: RECORDING_ERROR_TOAST_ID,
+          description: 'Recording stopped. Saving what was recorded so far.',
+          duration: 15000,
+        });
       } catch (error) {
         // Same as the Stop button: a failed backend stop skips the save.
         if (await isStillRecordingAfterFailedStop(error)) {
@@ -90,11 +102,9 @@ export function RecordingPostProcessingProvider({ children }: { children: React.
 
         const fnRecordingError = await recordingService.onRecordingError((message) => {
           console.error('[RecordingPostProcessing] recording-error →', message);
-          toast.error(message, {
-            description: 'Recording stopped. Saving what was recorded so far.',
-            duration: 15000,
-          });
-          stopAfterRecordingError();
+          // The description is added once the stop outcome is known.
+          toast.error(message, { id: RECORDING_ERROR_TOAST_ID, duration: 15000 });
+          stopAfterRecordingError(message);
         });
         if (cancelled) { fnRecordingError(); return; }
         unlistenRecordingError = fnRecordingError;
