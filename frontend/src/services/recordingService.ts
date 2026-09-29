@@ -14,6 +14,8 @@ export interface RecordingState {
   is_active: boolean;
   recording_duration: number | null;
   active_duration: number | null;
+  /** Highest transcription session id issued in this app process; absent from older backends. */
+  last_session_id?: number | null;
 }
 
 export interface RecordingStoppedPayload {
