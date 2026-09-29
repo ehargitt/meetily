@@ -8,9 +8,9 @@ import { listen } from '@tauri-apps/api/event';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import Analytics from '@/lib/analytics';
-import { useRecordingState, STOP_FLOW_STATUSES } from '@/contexts/RecordingStateContext';
+import { useRecordingState, RecordingStatus, STOP_FLOW_STATUSES } from '@/contexts/RecordingStateContext';
 import type { TranscriptionErrorPayload } from '@/services/transcriptService';
-import { stopBackendRecording } from '@/lib/stopBackendRecording';
+import { stopBackendRecording, isStillRecordingAfterFailedStop } from '@/lib/stopBackendRecording';
 
 interface RecordingControlsProps {
   isRecording: boolean;
@@ -44,6 +44,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
   const recordingState = useRecordingState();
   const isPaused = recordingState.isPaused;
   const isStartingRecording = recordingState.isStartingRecording;
+  const setRecordingStatus = recordingState.setStatus;
   // A stop from any source (tray, fatal error, this button) is running.
   const isStopFlowActive = STOP_FLOW_STATUSES.includes(recordingState.status);
 
@@ -142,7 +143,8 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     console.log('Executing stop recording...');
     try {
       setIsProcessing(true);
-      if (!(await stopBackendRecording())) {
+      // 'in-progress': the winning stop's own flow saves; leave status alone.
+      if (await stopBackendRecording() !== 'stopped') {
         return;
       }
       console.log('stop_recording command completed successfully');
@@ -150,13 +152,16 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
       Analytics.trackTranscriptionSuccess();
       onRecordingStop(true);
     } catch (error) {
-      console.error('Failed to stop recording:', error);
+      if (await isStillRecordingAfterFailedStop(error)) {
+        setRecordingStatus(RecordingStatus.RECORDING);
+        return;
+      }
       onRecordingStop(false);
     } finally {
       setIsProcessing(false);
       setIsStopping(false);
     }
-  }, [onRecordingStop]);
+  }, [onRecordingStop, setRecordingStatus]);
 
   const handleStopRecording = useCallback(async () => {
     console.log('handleStopRecording called - isRecording:', isRecording, 'isStarting:', isStarting, 'isStopping:', isStopping, 'isStartingRecording:', isStartingRecording);

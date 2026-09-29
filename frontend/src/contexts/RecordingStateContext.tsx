@@ -3,6 +3,7 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { recordingService, type RecordingState as BackendRecordingState } from '@/services/recordingService';
 import { useRecordingHealthNotifications } from '@/hooks/useRecordingHealthNotifications';
+import { STOP_FAILED_TOAST_ID } from '@/lib/stopBackendRecording';
 import { toast } from 'sonner';
 
 /**
@@ -182,6 +183,31 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
             : { ...prev, status: RecordingStatus.STOPPING, statusMessage: 'Stopping recording...' });
         });
         unsubscribers.push(unlistenStopping);
+
+        // Recording stop failed — the stop announced by recording-stopping did
+        // not complete. Leave STOPPING so the controls work again: back to
+        // RECORDING if the backend session is still live, otherwise IDLE.
+        const unlistenStopFailed = await recordingService.onRecordingStopFailed(async ({ message }) => {
+          console.error('[RecordingStateContext] Recording stop failed:', message);
+          toast.error('Recording could not be stopped', {
+            id: STOP_FAILED_TOAST_ID,
+            description: message,
+            duration: 10000,
+          });
+          const backendState = await syncWithBackend();
+          const stillRecording = backendState ? backendState.is_recording : isRecordingRef.current;
+          setState(prev => ({
+            ...prev,
+            status: stillRecording ? RecordingStatus.RECORDING : RecordingStatus.IDLE,
+            statusMessage: undefined,
+          }));
+          if (stillRecording) {
+            startPolling();
+          } else {
+            stopPolling();
+          }
+        });
+        unsubscribers.push(unlistenStopFailed);
 
         // Recording stopped
         const unlistenStopped = await recordingService.onRecordingStopped((payload) => {

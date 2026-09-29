@@ -44,6 +44,10 @@ export interface RecordingStoppingPayload {
   source: 'tray' | 'ui' | 'internal';
 }
 
+export interface RecordingStopFailedPayload {
+  message: string;
+}
+
 export interface RecordingSaveErrorPayload {
   message: string;
 }
@@ -274,6 +278,17 @@ export class RecordingService {
    */
   async onRecordingStopping(callback: (payload: RecordingStoppingPayload) => void): Promise<UnlistenFn> {
     return listen<RecordingStoppingPayload>('recording-stopping', (event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for recording-stop-failed event (the stop that emitted recording-stopping failed)
+   * @param callback - Function to call with the failure
+   * @returns Promise that resolves to unlisten function
+   */
+  async onRecordingStopFailed(callback: (payload: RecordingStopFailedPayload) => void): Promise<UnlistenFn> {
+    return listen<RecordingStopFailedPayload>('recording-stop-failed', (event) => {
       callback(event.payload);
     });
   }

@@ -6,7 +6,7 @@ import { toast } from 'sonner';
 import { useRecordingStop } from '@/hooks/useRecordingStop';
 import { useRecordingState, RecordingStatus, STOP_FLOW_STATUSES } from '@/contexts/RecordingStateContext';
 import { recordingService } from '@/services/recordingService';
-import { stopBackendRecording } from '@/lib/stopBackendRecording';
+import { stopBackendRecording, isStillRecordingAfterFailedStop } from '@/lib/stopBackendRecording';
 
 // No-op setters: the global RecordingStateContext already tracks recording
 // state; the hook only needs these for page-local state. Module-level so their
@@ -60,13 +60,16 @@ export function RecordingPostProcessingProvider({ children }: { children: React.
       latest.setStatus(RecordingStatus.STOPPING, 'Stopping recording...');
       let callApi = true;
       try {
-        if (!(await stopBackendRecording())) {
-          // Another stop already ended the session; its flow owns the save.
+        if (await stopBackendRecording() !== 'stopped') {
+          // Another stop is running or already ended the session; its flow owns the save.
           return;
         }
       } catch (error) {
         // Same as the Stop button: a failed backend stop skips the save.
-        console.error('[RecordingPostProcessing] Failed to stop recording after recording-error:', error);
+        if (await isStillRecordingAfterFailedStop(error)) {
+          latestRef.current.setStatus(RecordingStatus.RECORDING);
+          return;
+        }
         callApi = false;
       }
       await latestRef.current.handleRecordingStop(callApi);
