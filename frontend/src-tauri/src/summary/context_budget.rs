@@ -47,6 +47,16 @@ pub fn rough_token_count(s: &str) -> usize {
         .div_ceil(UNITS_PER_TOKEN)
 }
 
+/// How far a request's output may outgrow its prompt (see [`ContextBudget::output_room`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputKind {
+    /// A summary, merge or rewrite of the prompt, never much longer than it.
+    Rewrite,
+    /// A translation: byte-fallback tokenizers can spend several times the English source's
+    /// tokens on scripts such as Tamil, so it gets the window's whole remaining room.
+    Translation,
+}
+
 /// The context window a model runs with and the part of it kept free for the completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextBudget {
@@ -83,14 +93,17 @@ impl ContextBudget {
 
     /// Completion tokens a request with `prompt_tokens` of prompt may use: whatever the window
     /// leaves, and never less than the reserve (chunk-sized prompts leave about exactly that).
-    /// Small prompts such as the final report or a translation get more, up to twice their
-    /// prompt plus the reserve: every later stage rewrites its input rather than expanding it,
-    /// and the bound keeps a looping model from running on through the whole window.
-    pub fn output_room(&self, prompt_tokens: usize) -> usize {
-        self.context_tokens
-            .saturating_sub(prompt_tokens + CHAT_TEMPLATE_SLACK)
-            .min(2 * prompt_tokens + self.output_reserve_tokens)
-            .max(self.output_reserve_tokens)
+    /// A [`OutputKind::Rewrite`] also stops at twice its prompt plus the reserve, which keeps a
+    /// looping model from running on through the whole window.
+    pub fn output_room(&self, prompt_tokens: usize, kind: OutputKind) -> usize {
+        let window_room = self
+            .context_tokens
+            .saturating_sub(prompt_tokens + CHAT_TEMPLATE_SLACK);
+        let room = match kind {
+            OutputKind::Rewrite => window_room.min(2 * prompt_tokens + self.output_reserve_tokens),
+            OutputKind::Translation => window_room,
+        };
+        room.max(self.output_reserve_tokens)
     }
 
     /// Transcript tokens one request can carry next to `prompt_overhead_tokens` of instructions
@@ -161,12 +174,25 @@ mod tests {
     #[test]
     fn small_prompts_get_the_room_the_window_leaves() {
         let budget = ContextBudget::for_ollama(8192);
-        assert_eq!(budget.output_room(3000), 8192 - 3000 - CHAT_TEMPLATE_SLACK);
+        assert_eq!(budget.output_room(3000, OutputKind::Rewrite), 8192 - 3000 - CHAT_TEMPLATE_SLACK);
         // A tiny prompt is bounded by twice its size plus the reserve, not the whole window.
-        assert_eq!(budget.output_room(1000), 2 * 1000 + budget.output_reserve_tokens);
+        assert_eq!(budget.output_room(1000, OutputKind::Rewrite), 2 * 1000 + budget.output_reserve_tokens);
         // A chunk-sized prompt leaves only the reserve, which is never cut further.
-        assert_eq!(budget.output_room(budget.content_tokens(500) + 500), budget.output_reserve_tokens);
-        assert_eq!(budget.output_room(10_000), budget.output_reserve_tokens);
+        assert_eq!(
+            budget.output_room(budget.content_tokens(500) + 500, OutputKind::Rewrite),
+            budget.output_reserve_tokens
+        );
+        assert_eq!(budget.output_room(10_000, OutputKind::Rewrite), budget.output_reserve_tokens);
+    }
+
+    #[test]
+    fn translations_may_use_the_whole_remaining_window() {
+        let budget = ContextBudget::for_ollama(16_384);
+        // A short English summary translated into a script that tokenizes at several times
+        // its size is not held to twice its prompt.
+        assert_eq!(budget.output_room(1400, OutputKind::Translation), 16_384 - 1400 - CHAT_TEMPLATE_SLACK);
+        assert!(budget.output_room(1400, OutputKind::Rewrite) < budget.output_room(1400, OutputKind::Translation));
+        assert_eq!(budget.output_room(15_000, OutputKind::Translation), budget.output_reserve_tokens);
     }
 
     #[test]

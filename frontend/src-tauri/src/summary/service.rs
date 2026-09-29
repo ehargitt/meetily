@@ -7,6 +7,7 @@ use crate::summary::language_detection::detect_summary_language;
 use crate::summary::metadata::read_detected_summary_language_from_metadata;
 use crate::summary::processor::{
     clean_llm_markdown_detailed, extract_meeting_name_from_markdown, generate_meeting_summary,
+    CachedEnglishSummary,
     language_name_from_code, require_visible_markdown,
 };
 use crate::summary::summary_engine::models;
@@ -83,6 +84,10 @@ struct EnglishSummaryCache {
     markdown: String,
     source: SummaryCacheSource,
     output_language: Option<String>,
+    /// The English markdown was built from a cut-off combine (`combine_truncated`); a rerun
+    /// that reuses it must report that too. Rows written before this field read as false.
+    #[serde(default)]
+    combine_truncated: bool,
 }
 
 fn stable_text_fingerprint(text: &str) -> String {
@@ -166,6 +171,7 @@ fn build_summary_result_json(
             markdown: cleaned_english.markdown,
             source,
             output_language: normalise_summary_language_for_cache(output_language),
+            combine_truncated,
         },
         "reasoning_stripped": reasoning_stripped
             || cleaned_final.reasoning_stripped
@@ -182,7 +188,7 @@ fn extract_cached_english_markdown(
     raw: &str,
     expected_source: &SummaryCacheSource,
     requested_language: Option<&str>,
-) -> Result<Option<String>, serde_json::Error> {
+) -> Result<Option<CachedEnglishSummary>, serde_json::Error> {
     let requested_language = match normalise_summary_language_for_cache(requested_language) {
         Some(language) if language != "English" => language,
         _ => return Ok(None),
@@ -210,7 +216,10 @@ fn extract_cached_english_markdown(
     if markdown.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(cache.markdown))
+        Ok(Some(CachedEnglishSummary {
+            markdown: cache.markdown,
+            combine_truncated: cache.combine_truncated,
+        }))
     }
 }
 
@@ -546,7 +555,7 @@ impl SummaryService {
             Some(&cancellation_token),
             summary_language.as_deref(),
             detected_summary_language.as_deref(),
-            cached_english.as_deref(),
+            cached_english.as_ref(),
         )
         .await;
 
@@ -882,7 +891,7 @@ mod tests {
         .to_string();
 
         assert_eq!(
-            extract_cached_english_markdown(&raw, &sample_cache_source(), Some("de")).unwrap(),
+            extract_cached_english_markdown(&raw, &sample_cache_source(), Some("de")).unwrap().map(|cache| cache.markdown),
             None
         );
     }
@@ -903,7 +912,7 @@ mod tests {
         .to_string();
 
         assert_eq!(
-            extract_cached_english_markdown(&raw, &source, Some("de")).unwrap(),
+            extract_cached_english_markdown(&raw, &source, Some("de")).unwrap().map(|cache| cache.markdown),
             Some("# Meeting\n## Points\nHello".to_string())
         );
     }
@@ -924,7 +933,7 @@ mod tests {
         .to_string();
 
         assert_eq!(
-            extract_cached_english_markdown(&raw, &source, Some("fr")).unwrap(),
+            extract_cached_english_markdown(&raw, &source, Some("fr")).unwrap().map(|cache| cache.markdown),
             None
         );
     }
@@ -1048,7 +1057,7 @@ mod tests {
 
         for changed_source in changed_sources {
             assert_eq!(
-                extract_cached_english_markdown(&raw, &changed_source, Some("de")).unwrap(),
+                extract_cached_english_markdown(&raw, &changed_source, Some("de")).unwrap().map(|cache| cache.markdown),
                 None
             );
         }
@@ -1075,7 +1084,7 @@ mod tests {
         };
 
         assert_eq!(
-            extract_cached_english_markdown(&raw, &changed_template, Some("de")).unwrap(),
+            extract_cached_english_markdown(&raw, &changed_template, Some("de")).unwrap().map(|cache| cache.markdown),
             None
         );
     }
@@ -1101,7 +1110,7 @@ mod tests {
         };
 
         assert_eq!(
-            extract_cached_english_markdown(&raw, &changed_budget, Some("de")).unwrap(),
+            extract_cached_english_markdown(&raw, &changed_budget, Some("de")).unwrap().map(|cache| cache.markdown),
             None
         );
     }
@@ -1125,7 +1134,7 @@ mod tests {
         legacy_source.insert("token_threshold".to_string(), serde_json::json!(7892));
 
         assert_eq!(
-            extract_cached_english_markdown(&raw.to_string(), &source, Some("de")).unwrap(),
+            extract_cached_english_markdown(&raw.to_string(), &source, Some("de")).unwrap().map(|cache| cache.markdown),
             None
         );
     }
@@ -1196,6 +1205,33 @@ mod tests {
         .unwrap();
         assert_eq!(result["combine_truncated"], true);
         assert_eq!(result["normalization_fallback"], false);
+    }
+
+    #[test]
+    fn a_cut_off_combine_survives_a_cached_english_rerun() {
+        let source = sample_cache_source();
+        let mut raw = build_summary_result_json(
+            "# Reunion\n## Points\nBonjour",
+            "# Meeting\n## Points\nHello",
+            source.clone(),
+            Some("fr"),
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let cached = extract_cached_english_markdown(&raw.to_string(), &source, Some("de"))
+            .unwrap()
+            .expect("cache hit");
+        assert!(cached.combine_truncated);
+
+        // Rows written before the flag existed read as not truncated.
+        raw["english_cache"].as_object_mut().unwrap().remove("combine_truncated");
+        let legacy = extract_cached_english_markdown(&raw.to_string(), &source, Some("de"))
+            .unwrap()
+            .expect("cache hit");
+        assert!(!legacy.combine_truncated);
     }
 
     #[test]
