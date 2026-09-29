@@ -24,6 +24,19 @@ interface TranscriptContextType {
 
 const TranscriptContext = createContext<TranscriptContextType | undefined>(undefined);
 
+interface TranscriptSessionFilter {
+  current: number | null;  // session of the live recording, once recording-started names it
+  minimum: number;         // sessions below this belong to earlier recordings
+  highest: number;         // highest session id seen
+}
+
+/** Whether a transcript update belongs to the recording being shown. */
+function isFromCurrentSession(sessionId: number | undefined, session: TranscriptSessionFilter): boolean {
+  if (sessionId === undefined) return true;
+  if (session.current !== null) return sessionId === session.current;
+  return sessionId >= session.minimum;
+}
+
 export function TranscriptProvider({ children }: { children: ReactNode }) {
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
   const [meetingTitle, setMeetingTitle] = useState('+ New Call');
@@ -42,6 +55,15 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     transcriptsRef.current = transcripts;
   }, [transcripts]);
+
+  // Transcription session filter. `current` is the session of the live
+  // recording (from recording-started). Clearing for a new recording retires
+  // every session seen so far (`minimum`), so a previous meeting's lingering
+  // drain can't append to the new one before its own session id arrives.
+  // Nothing is known after a webview reload, so every update is accepted then.
+  const transcriptSessionRef = useRef<TranscriptSessionFilter>({ current: null, minimum: 0, highest: 0 });
+  const isRecordingRef = useRef(recordingState.isRecording);
+  isRecordingRef.current = recordingState.isRecording;
 
   // Read by the listeners below, which register once: re-subscribing when the
   // ID changes (e.g. restored after a reload) could drop transcript segments.
@@ -102,7 +124,12 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
         await indexedDBService.init();
 
         // Listen for recording-started event
-        const fnStarted = await recordingService.onRecordingStarted(async () => {
+        const fnStarted = await recordingService.onRecordingStarted(async (payload) => {
+          if (typeof payload?.session_id === 'number') {
+            const session = transcriptSessionRef.current;
+            session.current = payload.session_id;
+            session.highest = Math.max(session.highest, payload.session_id);
+          }
           try {
             // Generate unique meeting ID
             const meetingId = `meeting-${Date.now()}`;
@@ -303,6 +330,14 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       try {
         console.log('🔥 Setting up MAIN transcript listener during component initialization...');
         const fn = await transcriptService.onTranscriptUpdate((update) => {
+          const session = transcriptSessionRef.current;
+          if (!isFromCurrentSession(update.session_id, session)) {
+            console.log('🚫 MAIN LISTENER: Dropping update from transcription session', update.session_id);
+            return;
+          }
+          if (update.session_id !== undefined) {
+            session.highest = Math.max(session.highest, update.session_id);
+          }
           const now = Date.now();
           console.log('🎯 MAIN LISTENER: Received transcript update:', {
             sequence_id: update.sequence_id,
@@ -516,6 +551,13 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   // Clear transcripts (used when starting new recording)
   const clearTranscripts = useCallback(() => {
     setTranscripts([]);
+    // Only a clear between recordings retires sessions; the live one must keep
+    // its segments.
+    if (!isRecordingRef.current) {
+      const session = transcriptSessionRef.current;
+      session.minimum = session.highest + 1;
+      session.current = null;
+    }
     // Don't clear currentMeetingId here - it will be set by recording-started event
   }, []);
 

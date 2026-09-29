@@ -75,6 +75,13 @@ async function until(predicate: () => boolean, what: string, timeoutMs = 1500) {
     await act(() => new Promise(resolve => setTimeout(resolve, 10)));
   }
 }
+function transcriptUpdate(sequenceId: number, sessionId: number, text: string) {
+  return {
+    text, timestamp: '00:12', sequence_id: sequenceId, chunk_start_time: sequenceId, session_id: sessionId,
+    is_partial: false, confidence: 0.9, audio_start_time: sequenceId, audio_end_time: sequenceId + 1, duration: 1,
+  };
+}
+const shownTexts = () => transcripts.transcripts.map(t => t.text);
 const stateCalls = () => invoke.mock.calls.filter(([command]) => command === 'get_recording_state').length;
 
 beforeEach(() => {
@@ -99,10 +106,8 @@ describe('mounting while the backend is already recording (webview reload)', () 
     // Polling runs every 500 ms only while a session is live.
     await until(() => stateCalls() >= 2, 'a polled state sync');
 
-    await emit('transcript-update', {
-      text: 'after the reload', timestamp: '00:12', sequence_id: 7, chunk_start_time: 12,
-      is_partial: false, confidence: 0.9, audio_start_time: 12, audio_end_time: 13, duration: 1,
-    });
+    // No session is known after a reload, so a tagged update is still accepted.
+    await emit('transcript-update', transcriptUpdate(7, 3, 'after the reload'));
     expect(saveTranscript.mock.calls.map(([meetingId]) => meetingId)).toEqual(['meeting-before-reload']);
   });
 
@@ -143,5 +148,33 @@ describe('recording-stopping and recording-stop-failed', () => {
     await emit('recording-stop-failed', { message: 'save failed' });
     await until(() => recording.status === RecordingStatus.IDLE, 'IDLE after the failure');
     expect(recording.isRecording).toBe(false);
+  });
+});
+
+describe('transcript updates from another transcription session', () => {
+  test('only the current recording\'s session reaches the transcript', async () => {
+    await mount();
+    await emit('recording-started', { message: 'started', session_id: 5 });
+    await emit('transcript-update', transcriptUpdate(1, 4, 'previous meeting'));
+    await emit('transcript-update', transcriptUpdate(2, 5, 'this meeting'));
+
+    await until(() => shownTexts().includes('this meeting'), 'the current segment');
+    expect(shownTexts()).toEqual(['this meeting']);
+    expect(saveTranscript).toHaveBeenCalledTimes(1);
+  });
+
+  test('clearing for a new recording drops the previous session before the new id is known', async () => {
+    await mount();
+    await emit('recording-started', { message: 'started', session_id: 5 });
+    await emit('transcript-update', transcriptUpdate(1, 5, 'meeting A'));
+    await until(() => shownTexts().includes('meeting A'), 'meeting A');
+    await emit('recording-stopped', { message: 'stopped' });
+    await until(() => !recording.isRecording, 'the stop');
+
+    await act(async () => { transcripts.clearTranscripts(); });
+    await emit('transcript-update', transcriptUpdate(2, 5, 'meeting A lingering drain'));
+    await emit('transcript-update', transcriptUpdate(3, 6, 'meeting B early'));
+    await until(() => shownTexts().includes('meeting B early'), 'the new session');
+    expect(shownTexts()).toEqual(['meeting B early']);
   });
 });

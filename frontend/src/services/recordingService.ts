@@ -22,6 +22,12 @@ export interface RecordingStoppedPayload {
   meeting_name?: string;
 }
 
+export interface RecordingStartedPayload {
+  message: string;
+  /** Transcription session of this recording; tags its transcript-update events. */
+  session_id?: number;
+}
+
 export type AudioStreamType = 'microphone' | 'system';
 
 export interface AudioStreamDegradedPayload {
@@ -163,8 +169,10 @@ export class RecordingService {
    * @param callback - Function to call when recording starts
    * @returns Promise that resolves to unlisten function
    */
-  async onRecordingStarted(callback: () => void): Promise<UnlistenFn> {
-    return listen('recording-started', callback);
+  async onRecordingStarted(callback: (payload: RecordingStartedPayload) => void): Promise<UnlistenFn> {
+    return listen<RecordingStartedPayload>('recording-started', (event) => {
+      callback(event.payload);
+    });
   }
 
   /**

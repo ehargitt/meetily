@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { invoke } from '@tauri-apps/api/core';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
+import { selectTranscriptModel } from '@/lib/transcriptModelSelection';
 import {
   ModelInfo,
   ModelStatus,
@@ -257,10 +257,12 @@ export function ModelManager({
 
           // Auto-select after download using stable refs
           if (onModelSelectRef.current) {
-            onModelSelectRef.current(modelName);
-            if (autoSaveRef.current) {
-              saveModelSelection(modelName);
-            }
+            selectTranscriptModel({
+              provider: 'localWhisper',
+              modelName,
+              autoSave: autoSaveRef.current,
+              onModelSelect: onModelSelectRef.current,
+            });
           }
         }
       );
@@ -317,22 +319,6 @@ export function ModelManager({
       cancellationReconciliationModelsRef.current.clear();
     };
   }, []); // Empty dependency array - listeners use refs for stable callbacks
-
-  const saveModelSelection = async (modelName: string) => {
-    try {
-      await invoke('api_save_transcript_config', {
-        provider: 'localWhisper',
-        model: modelName,
-        apiKey: null
-      });
-    } catch (error) {
-      // The backend refuses a model switch while a recording uses the engine.
-      console.error('Failed to save model selection:', error);
-      toast.error('Could not change the transcription model', {
-        description: error instanceof Error ? error.message : String(error),
-      });
-    }
-  };
 
   const cancelDownload = async (modelName: string) => {
     const displayName = getDisplayName(modelName);
@@ -404,17 +390,12 @@ export function ModelManager({
   const selectModel = async (modelName: string) => {
     setHasUserSelection(true);
 
-    if (onModelSelect) {
-      onModelSelect(modelName);
-    }
-
-    if (autoSave) {
-      await saveModelSelection(modelName);
-    }
-
-    const displayName = getDisplayName(modelName);
-    toast.success(`Switched to ${displayName}`, {
-      duration: 3000
+    await selectTranscriptModel({
+      provider: 'localWhisper',
+      modelName,
+      autoSave,
+      onModelSelect,
+      successMessage: `Switched to ${getDisplayName(modelName)}`,
     });
   };
 
