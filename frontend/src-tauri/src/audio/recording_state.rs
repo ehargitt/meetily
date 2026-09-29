@@ -1,14 +1,24 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use anyhow::Result;
+use log::{error, warn};
 
 use super::devices::AudioDevice;
 use super::buffer_pool::AudioBufferPool;
 
+mod stream_health;
+pub use stream_health::{ErrorOutcome, StreamFault, StreamHealth, StreamHealthEvent, StreamStatus};
+
+/// Non-stream audio errors (e.g. a failed hand-off to the pipeline) can repeat
+/// on every buffer; log them at most this often.
+const PIPELINE_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+type HealthCallback = Box<dyn Fn(StreamHealthEvent) + Send + Sync>;
+
 /// Device type for audio chunks
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceType {
     Microphone,
     System,
@@ -111,7 +121,15 @@ pub struct RecordingState {
     error_count: AtomicU32,
     recoverable_error_count: AtomicU32,
     last_error: Mutex<Option<AudioError>>,
-    error_callback: Mutex<Option<Box<dyn Fn(&AudioError) + Send + Sync>>>,
+    last_error_log: Mutex<Option<Instant>>,
+
+    // Per-stream health; faults go to the session supervisor, which rebuilds
+    // dead streams and reports health changes through `health_callback`.
+    microphone_health: StreamHealth,
+    system_health: StreamHealth,
+    fault_sender: Mutex<Option<mpsc::UnboundedSender<StreamFault>>>,
+    health_callback: Mutex<Option<HealthCallback>>,
+    capture_failed: AtomicBool,
 
     // Statistics
     stats: Mutex<RecordingStats>,
@@ -135,7 +153,12 @@ impl RecordingState {
             error_count: AtomicU32::new(0),
             recoverable_error_count: AtomicU32::new(0),
             last_error: Mutex::new(None),
-            error_callback: Mutex::new(None),
+            last_error_log: Mutex::new(None),
+            microphone_health: StreamHealth::new(Instant::now()),
+            system_health: StreamHealth::new(Instant::now()),
+            fault_sender: Mutex::new(None),
+            health_callback: Mutex::new(None),
+            capture_failed: AtomicBool::new(false),
             stats: Mutex::new(RecordingStats::default()),
             recording_start: Mutex::new(None),
             pause_start: Mutex::new(None),
@@ -256,43 +279,140 @@ impl RecordingState {
     }
 
     // Error handling
-    pub fn set_error_callback<F>(&self, callback: F)
+
+    /// Receives stream health changes (degraded, recovered, system audio
+    /// unavailable, capture failed) for the frontend.
+    pub fn set_health_callback<F>(&self, callback: F)
     where
-        F: Fn(&AudioError) + Send + Sync + 'static,
+        F: Fn(StreamHealthEvent) + Send + Sync + 'static,
     {
-        *self.error_callback.lock().unwrap() = Some(Box::new(callback));
+        *self.health_callback.lock().unwrap() = Some(Box::new(callback));
     }
 
-    pub fn report_error(&self, error: AudioError) {
-        let count = self.error_count.fetch_add(1, Ordering::SeqCst) + 1;
+    pub fn emit_health_event(&self, event: StreamHealthEvent) {
+        if let Some(callback) = self.health_callback.lock().unwrap().as_ref() {
+            callback(event);
+        }
+    }
 
-        // Track recoverable vs non-recoverable errors separately
-        if error.is_recoverable() {
-            let recoverable_count = self.recoverable_error_count.fetch_add(1, Ordering::SeqCst) + 1;
-            log::warn!("Recoverable audio error ({}): {:?}", recoverable_count, error);
+    /// Where stream faults (dead streams) are delivered for rebuilding.
+    pub fn set_fault_sender(&self, sender: mpsc::UnboundedSender<StreamFault>) {
+        *self.fault_sender.lock().unwrap() = Some(sender);
+    }
 
-            // Allow more recoverable errors before stopping
-            if recoverable_count >= 10 {
-                log::error!("Too many recoverable errors ({}), stopping recording", recoverable_count);
-                self.stop_recording();
-            }
-        } else {
-            log::error!("Non-recoverable audio error: {:?}", error);
-            // Stop immediately for non-recoverable errors
-            self.stop_recording();
+    pub fn stream_health(&self, device_type: DeviceType) -> &StreamHealth {
+        match device_type {
+            DeviceType::Microphone => &self.microphone_health,
+            DeviceType::System => &self.system_health,
+        }
+    }
+
+    /// Hot path: a capture callback delivered audio.
+    pub fn note_stream_callback(&self, device_type: DeviceType) {
+        self.stream_health(device_type).on_callback(Instant::now());
+    }
+
+    /// A capture stream reported an error. Never stops the session: a stream
+    /// with persistent errors is marked dead and handed to the supervisor.
+    pub fn report_stream_error(
+        &self,
+        device_type: DeviceType,
+        device_name: &str,
+        error: AudioError,
+        detail: &str,
+    ) -> ErrorOutcome {
+        let outcome = self.stream_health(device_type).record_error(&error, Instant::now());
+        if outcome.already_dead {
+            return outcome;
         }
 
+        self.error_count.fetch_add(1, Ordering::SeqCst);
+        if error.is_recoverable() {
+            self.recoverable_error_count.fetch_add(1, Ordering::SeqCst);
+        }
         *self.last_error.lock().unwrap() = Some(error.clone());
 
-        // Call error callback if set
-        if let Some(callback) = self.error_callback.lock().unwrap().as_ref() {
-            callback(&error);
+        if let Some(suppressed) = outcome.log_now {
+            warn!(
+                "Audio stream error on {:?} '{}': {:?} ({}); {} similar errors suppressed",
+                device_type, device_name, error, detail, suppressed
+            );
         }
 
-        // Fallback: stop recording after too many total errors
-        if count >= 15 {
-            log::error!("Too many total audio errors ({}), stopping recording", count);
-            self.stop_recording();
+        if outcome.became_dead {
+            error!("{:?} stream '{}' is dead ({:?}); requesting rebuild", device_type, device_name, error);
+            self.send_fault(StreamFault {
+                device_type,
+                reason: format!("{} ({})", error.user_message(), detail),
+            });
+        }
+        outcome
+    }
+
+    fn send_fault(&self, fault: StreamFault) {
+        let sent = self
+            .fault_sender
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(false, |sender| sender.send(fault.clone()).is_ok());
+        if !sent {
+            warn!("No stream supervisor to rebuild {:?}: {}", fault.device_type, fault.reason);
+        }
+    }
+
+    /// Mark running streams that have stopped delivering callbacks as dead.
+    /// Returns the stalled streams; the caller rebuilds them.
+    ///
+    /// Linux only: the stall is cpal's ALSA overrun bug. On macOS a Bluetooth
+    /// input can legitimately deliver nothing for a while after start (see the
+    /// audio wake in recording_manager.rs), and rebuilding it there would
+    /// change behaviour this fix is not about.
+    pub fn detect_stalls(&self, now: Instant) -> Vec<DeviceType> {
+        if !cfg!(target_os = "linux") {
+            return Vec::new();
+        }
+        let active = self.is_active();
+        [DeviceType::Microphone, DeviceType::System]
+            .into_iter()
+            .filter(|device_type| self.stream_health(*device_type).check_stall(now, active))
+            .collect()
+    }
+
+    /// True when no stream can deliver audio: each is absent or failed for good.
+    pub fn all_streams_down(&self) -> bool {
+        [DeviceType::Microphone, DeviceType::System].into_iter().all(|device_type| {
+            matches!(
+                self.stream_health(device_type).status(),
+                StreamStatus::Absent | StreamStatus::Failed
+            )
+        })
+    }
+
+    /// Report that the session can no longer capture any audio. Emitted once;
+    /// the session keeps recording state so the normal stop/save still runs.
+    pub fn report_capture_failed(&self, message: String) {
+        if self.capture_failed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        error!("Recording can no longer capture audio: {}", message);
+        self.emit_health_event(StreamHealthEvent::CaptureFailed { message });
+    }
+
+    /// Record a non-stream audio error (e.g. the pipeline hand-off failed).
+    /// Logged with a rate limit; it never stops the session.
+    pub fn report_error(&self, error: AudioError) {
+        let count = self.error_count.fetch_add(1, Ordering::SeqCst) + 1;
+        if error.is_recoverable() {
+            self.recoverable_error_count.fetch_add(1, Ordering::SeqCst);
+        }
+        *self.last_error.lock().unwrap() = Some(error.clone());
+
+        let mut last_log = self.last_error_log.lock().unwrap();
+        let now = Instant::now();
+        if last_log.map_or(true, |t| now.duration_since(t) >= PIPELINE_ERROR_LOG_INTERVAL) {
+            *last_log = Some(now);
+            warn!("Audio error: {:?} ({} audio errors this session)", error, count);
         }
     }
 
@@ -309,6 +429,9 @@ impl RecordingState {
     }
 
     pub fn has_fatal_error(&self) -> bool {
+        if self.capture_failed.load(Ordering::SeqCst) {
+            return true;
+        }
         if let Some(error) = &*self.last_error.lock().unwrap() {
             !error.is_recoverable() && self.error_count.load(Ordering::SeqCst) > 0
         } else {
@@ -372,7 +495,8 @@ impl RecordingState {
         *self.system_device.lock().unwrap() = None;
         *self.audio_sender.lock().unwrap() = None;
         *self.last_error.lock().unwrap() = None;
-        *self.error_callback.lock().unwrap() = None;
+        *self.health_callback.lock().unwrap() = None;
+        *self.fault_sender.lock().unwrap() = None;
         *self.stats.lock().unwrap() = RecordingStats::default();
         *self.recording_start.lock().unwrap() = None;
         *self.pause_start.lock().unwrap() = None;
@@ -397,7 +521,12 @@ impl Default for RecordingState {
             error_count: AtomicU32::new(0),
             recoverable_error_count: AtomicU32::new(0),
             last_error: Mutex::new(None),
-            error_callback: Mutex::new(None),
+            last_error_log: Mutex::new(None),
+            microphone_health: StreamHealth::new(Instant::now()),
+            system_health: StreamHealth::new(Instant::now()),
+            fault_sender: Mutex::new(None),
+            health_callback: Mutex::new(None),
+            capture_failed: AtomicBool::new(false),
             stats: Mutex::new(RecordingStats::default()),
             recording_start: Mutex::new(None),
             pause_start: Mutex::new(None),

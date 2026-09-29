@@ -46,8 +46,28 @@ pub async fn list_audio_devices() -> Result<Vec<AudioDevice>> {
     }
 }
 
+/// Bound on the blocking permission probes below: each opens a stream and
+/// sleeps, and a wedged sound server can hang the open.
+const PERMISSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `trigger_audio_permission` on a blocking thread, bounded by
+/// `PERMISSION_PROBE_TIMEOUT`, for callers on the async runtime.
+pub async fn trigger_audio_permission_async() -> Result<bool> {
+    let probe = tokio::task::spawn_blocking(trigger_audio_permission);
+    match tokio::time::timeout(PERMISSION_PROBE_TIMEOUT, probe).await {
+        Ok(joined) => joined.map_err(|e| anyhow::anyhow!("Microphone permission probe failed: {}", e))?,
+        Err(_) => Err(anyhow::anyhow!(
+            "Microphone permission probe timed out after {:?}",
+            PERMISSION_PROBE_TIMEOUT
+        )),
+    }
+}
+
 /// Trigger audio permission request on platforms that require it
 /// Returns Ok(true) if permission is granted, Ok(false) if denied, Err if something went wrong
+///
+/// Blocking (opens a stream and sleeps 500 ms); from async code use
+/// `trigger_audio_permission_async`.
 pub fn trigger_audio_permission() -> Result<bool> {
     use log::info;
 
@@ -119,7 +139,7 @@ pub async fn verify_microphone_access() -> anyhow::Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
-    tokio::task::spawn_blocking(|| {
+    let probe = tokio::task::spawn_blocking(|| {
         let host = cpal::default_host();
         let Some(device) = host.default_input_device() else {
             // Let device resolution handle the existing system-audio-only fallback.
@@ -164,7 +184,13 @@ pub async fn verify_microphone_access() -> anyhow::Result<()> {
             "Microphone permission not granted. Please allow microphone access in \
              System Settings > Privacy & Security > Microphone, then try again."
         ))
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("Microphone verification task failed: {}", e))?
+    });
+
+    match tokio::time::timeout(PERMISSION_PROBE_TIMEOUT, probe).await {
+        Ok(joined) => joined.map_err(|e| anyhow::anyhow!("Microphone verification task failed: {}", e))?,
+        Err(_) => Err(anyhow::anyhow!(
+            "Microphone verification timed out after {:?}; the audio system is not responding",
+            PERMISSION_PROBE_TIMEOUT
+        )),
+    }
 }
