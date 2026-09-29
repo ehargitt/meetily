@@ -41,6 +41,22 @@ function showSpeakerModelsHintOnce() {
 // tray stop must not both run the post-stop save.
 let stopInProgress = false;
 
+// Pending "navigate to the saved meeting" timer (status COMPLETED meanwhile).
+let postSaveNavigationTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Cancels the pending post-save navigation. A recording started in the
+ * two seconds after a save calls this; otherwise the timer would navigate
+ * away, clear the new transcripts and reset status to IDLE mid-start.
+ */
+export function cancelPostSaveNavigation() {
+  if (postSaveNavigationTimer) {
+    console.log('Cancelling post-save navigation - a new recording is starting');
+    clearTimeout(postSaveNavigationTimer);
+    postSaveNavigationTimer = null;
+  }
+}
+
 interface UseRecordingStopReturn {
   handleRecordingStop: (callApi: boolean) => Promise<void>;
   isStopping: boolean;
@@ -388,7 +404,9 @@ export function useRecordingStop(
           });
 
           // Auto-navigate after a short delay with source parameter
-          setTimeout(() => {
+          cancelPostSaveNavigation();
+          postSaveNavigationTimer = setTimeout(() => {
+            postSaveNavigationTimer = null;
             router.push(`/meeting-details?id=${meetingId}&source=recording`);
             clearTranscripts()
             Analytics.trackPageView('meeting_details');

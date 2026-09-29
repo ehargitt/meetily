@@ -4,6 +4,7 @@ import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useConfig } from '@/contexts/ConfigContext';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
+import { cancelPostSaveNavigation } from '@/hooks/useRecordingStop';
 import { recordingService } from '@/services/recordingService';
 import Analytics from '@/lib/analytics';
 import { showRecordingNotification } from '@/lib/recordingNotification';
@@ -122,6 +123,7 @@ export function useRecordingStart(
       return;
     }
     isStartingRef.current = true;
+    cancelPostSaveNavigation();
     try {
       console.log('handleRecordingStart called - checking selected transcription model status');
 
@@ -219,6 +221,7 @@ export function useRecordingStart(
           console.log('Auto-starting recording from navigation...');
           setIsAutoStarting(true);
           sessionStorage.removeItem('autoStartRecording'); // Clear the flag
+          cancelPostSaveNavigation();
 
           // Check the selected transcription model before starting.
           const modelReady = await checkModelReady();
@@ -318,6 +321,7 @@ export function useRecordingStart(
 
       console.log('Direct start from sidebar - checking selected transcription model status');
       setIsAutoStarting(true);
+      cancelPostSaveNavigation();
 
       // Check the selected transcription model before starting.
       const modelReady = await checkModelReady();
