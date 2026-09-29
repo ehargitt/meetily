@@ -6,7 +6,24 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::summary::context_budget::ContextBudget;
+
 const REQUEST_TIMEOUT_DURATION: Duration = Duration::from_secs(300);
+/// Slowest prompt-plus-output rate an Ollama request is given time for: roughly an 8B model
+/// on CPU or partly offloaded. A full 16k window then gets 300 s + 1024 s.
+const OLLAMA_MIN_TOKENS_PER_SEC: u64 = 16;
+
+/// Total time allowed for one request. Ollama gets extra time in proportion to its window,
+/// since each chunk now fills that window instead of being truncated to Ollama's default.
+fn request_timeout(provider: &LLMProvider, context_budget: Option<ContextBudget>) -> Duration {
+    match (provider, context_budget) {
+        (LLMProvider::Ollama, Some(budget)) => {
+            REQUEST_TIMEOUT_DURATION
+                + Duration::from_secs(budget.context_tokens as u64 / OLLAMA_MIN_TOKENS_PER_SEC)
+        }
+        _ => REQUEST_TIMEOUT_DURATION,
+    }
+}
 
 async fn await_or_cancel<T>(
     operation: impl Future<Output = T>,
@@ -80,6 +97,9 @@ pub fn build_openai_compat_chat_body(
 #[derive(Debug, Serialize)]
 struct OllamaChatOptions {
     num_ctx: usize,
+    /// Caps the completion at the budget's output reserve so prompt and output always fit
+    /// `num_ctx`; unbounded output would make Ollama shift out the start of the prompt.
+    num_predict: usize,
 }
 
 /// Request body for Ollama's native `/api/chat`. The OpenAI-compatible endpoint cannot set
@@ -95,13 +115,13 @@ struct OllamaChatRequest {
     options: Option<OllamaChatOptions>,
 }
 
-/// Build the Ollama `/api/chat` body: non-streaming, thinking disabled, and `options.num_ctx`
-/// set to `num_ctx` when given.
+/// Build the Ollama `/api/chat` body: non-streaming, thinking disabled, and with a budget,
+/// `options.num_ctx` = its window and `options.num_predict` = its output reserve.
 pub fn build_ollama_chat_body(
     model_name: &str,
     system_prompt: &str,
     user_prompt: &str,
-    num_ctx: Option<usize>,
+    context_budget: Option<ContextBudget>,
 ) -> serde_json::Value {
     serde_json::json!(OllamaChatRequest {
         model: model_name.to_string(),
@@ -117,7 +137,10 @@ pub fn build_ollama_chat_body(
         ],
         stream: false,
         think: false,
-        options: num_ctx.map(|num_ctx| OllamaChatOptions { num_ctx }),
+        options: context_budget.map(|budget| OllamaChatOptions {
+            num_ctx: budget.context_tokens,
+            num_predict: budget.output_reserve_tokens,
+        }),
     })
 }
 
@@ -339,7 +362,7 @@ impl LLMProvider {
 /// * `max_tokens` - Optional max tokens (for CustomOpenAI provider)
 /// * `temperature` - Optional temperature (for CustomOpenAI provider)
 /// * `top_p` - Optional top_p (for CustomOpenAI provider)
-/// * `num_ctx` - Context window to run the model with (Ollama only; the size chunking assumed)
+/// * `context_budget` - Window and output reserve chunking assumed (Ollama sends them as options)
 /// * `app_data_dir` - Optional app data directory (for BuiltInAI provider)
 /// * `cancellation_token` - Optional token to cancel the request
 ///
@@ -356,7 +379,7 @@ pub(crate) async fn generate_summary(
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     top_p: Option<f32>,
-    num_ctx: Option<usize>,
+    context_budget: Option<ContextBudget>,
     app_data_dir: Option<&PathBuf>,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<LlmCompletion, String> {
@@ -454,7 +477,7 @@ pub(crate) async fn generate_summary(
 
     // Build request body based on provider
     let request_body = if provider == &LLMProvider::Ollama {
-        build_ollama_chat_body(model_name, system_prompt, user_prompt, num_ctx)
+        build_ollama_chat_body(model_name, system_prompt, user_prompt, context_budget)
     } else if provider != &LLMProvider::Claude {
         build_openai_compat_chat_body(
             provider,
@@ -481,12 +504,13 @@ pub(crate) async fn generate_summary(
 
     info!("🐞 LLM Request to {}: model={}", provider_name(provider), model_name);
 
+    let request_timeout = request_timeout(provider, context_budget);
     // Send request with timeout and cancellation support
     let request_future = client
         .post(api_url.clone())
         .headers(headers.clone())
         .json(&request_body)
-        .timeout(REQUEST_TIMEOUT_DURATION)
+        .timeout(request_timeout)
         .send();
 
     // Use tokio::select to race between cancellation and request completion
@@ -497,7 +521,7 @@ pub(crate) async fn generate_summary(
                     if e.is_timeout() {
                         format!(
                             "LLM request timed out after {} seconds",
-                            REQUEST_TIMEOUT_DURATION.as_secs()
+                            request_timeout.as_secs()
                         )
                     } else {
                         format!("Failed to send request to LLM: {}", e)
@@ -513,7 +537,7 @@ pub(crate) async fn generate_summary(
             if e.is_timeout() {
                 format!(
                     "LLM request timed out after {} seconds",
-                    REQUEST_TIMEOUT_DURATION.as_secs()
+                    request_timeout.as_secs()
                 )
             } else {
                 format!("Failed to send request to LLM: {}", e)
@@ -545,7 +569,7 @@ pub(crate) async fn generate_summary(
             .post(api_url)
             .headers(headers)
             .json(&retry_body)
-            .timeout(REQUEST_TIMEOUT_DURATION)
+            .timeout(request_timeout)
             .send();
         await_or_cancel(retry_future, cancellation_token)
             .await?
@@ -553,7 +577,7 @@ pub(crate) async fn generate_summary(
                 if e.is_timeout() {
                     format!(
                         "LLM retry request timed out after {} seconds",
-                        REQUEST_TIMEOUT_DURATION.as_secs()
+                        request_timeout.as_secs()
                     )
                 } else {
                     format!("Failed to send retry request to LLM: {}", e)
@@ -601,12 +625,20 @@ pub(crate) async fn generate_summary(
             done_reason = chat_response.done_reason.as_deref(),
             "🐞 LLM Response received from Ollama"
         );
-        if let Some(num_ctx) = num_ctx.filter(|&num_ctx| chat_response.filled_context(num_ctx)) {
+        if let Some(budget) =
+            context_budget.filter(|budget| chat_response.filled_context(budget.context_tokens))
+        {
             warn!(
-                num_ctx,
+                num_ctx = budget.context_tokens,
                 prompt_tokens = chat_response.prompt_eval_count,
                 output_tokens = chat_response.eval_count,
                 "Ollama request filled its context window; the start of the prompt may have been dropped"
+            );
+        }
+        if chat_response.done_reason.as_deref() == Some("length") {
+            warn!(
+                output_tokens = chat_response.eval_count,
+                "Ollama stopped at the output limit (num_predict); the completion may be cut short"
             );
         }
         Ok(chat_response.completion())
@@ -652,7 +684,7 @@ pub(crate) mod test_http {
                     name.eq_ignore_ascii_case("content-length")
                         .then(|| value.trim().parse::<usize>().unwrap())
                 })
-                .expect("request should have Content-Length");
+                .unwrap_or(0); // bodiless requests such as GET
             if request.len() >= headers_end + content_length {
                 return request;
             }
@@ -749,16 +781,29 @@ mod tests {
 
     #[test]
     fn ollama_body_uses_native_chat_with_num_ctx_and_thinking_off() {
-        let body = build_ollama_chat_body("llama3.1:8b", "sys", "user", Some(16_384));
+        let body = build_ollama_chat_body("llama3.1:8b", "sys", "user", Some(ContextBudget::for_ollama(16_384)));
         assert_eq!(body["model"], "llama3.1:8b");
         assert_eq!(body["stream"], false);
         assert_eq!(body["think"], false);
         assert_eq!(body["options"]["num_ctx"], 16_384);
+        assert_eq!(body["options"]["num_predict"], 4096);
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["content"], "user");
         assert!(body.get("reasoning_effort").is_none());
 
         assert!(build_ollama_chat_body("m", "s", "u", None).get("options").is_none());
+    }
+
+    #[test]
+    fn ollama_request_timeout_grows_with_its_context_window() {
+        let window = |tokens| Some(ContextBudget::for_ollama(tokens));
+        assert_eq!(request_timeout(&LLMProvider::Ollama, window(16_384)), Duration::from_secs(300 + 1024));
+        assert_eq!(request_timeout(&LLMProvider::Ollama, window(4096)), Duration::from_secs(300 + 256));
+        assert_eq!(request_timeout(&LLMProvider::Ollama, None), REQUEST_TIMEOUT_DURATION);
+        assert_eq!(
+            request_timeout(&LLMProvider::OpenRouter, Some(ContextBudget::for_hosted_model(200_000))),
+            REQUEST_TIMEOUT_DURATION
+        );
     }
 
     #[test]
@@ -1032,6 +1077,7 @@ mod tests {
             assert_eq!(request_path(&request), "/api/chat");
             assert!(body.get("think").is_none());
             assert_eq!(body["options"]["num_ctx"], 8192, "the retry keeps the context window");
+            assert_eq!(body["options"]["num_predict"], 2048);
 
             write_json_response(
                 &mut stream,
@@ -1057,7 +1103,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(8192),
+                Some(ContextBudget::for_ollama(8192)),
                 None,
                 Some(&cancellation_token),
             ),

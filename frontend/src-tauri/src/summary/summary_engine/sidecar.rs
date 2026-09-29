@@ -11,6 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -81,6 +82,16 @@ impl RequestGuard {
 impl Drop for RequestGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+const GENERATION_CANCELLED: &str = "Generation cancelled by user";
+
+/// Resolves when `token` is cancelled; never without a token.
+async fn cancelled(token: Option<&CancellationToken>) {
+    match token {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -329,39 +340,61 @@ impl SidecarManager {
     /// unhealthy, or its process has exited. Requests run one at a time; `timeout` covers only
     /// this request's own exchange, not the wait for earlier requests to finish. Any I/O
     /// failure marks the sidecar unhealthy so the next request starts a fresh process.
+    ///
+    /// Cancelling while the request still waits its turn just abandons it. Cancelling once it
+    /// owns the exchange shuts the sidecar down to stop the generation.
     pub async fn request(
         &self,
         model_path: PathBuf,
         request_json: String,
         timeout: Duration,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<String> {
         // Track active request
         let _guard = RequestGuard::new(self.active_request_count.clone());
-        let _exchange = self.exchange_lock.lock().await;
+        let _exchange = tokio::select! {
+            biased;
+            _ = cancelled(cancellation) => return Err(anyhow!(GENERATION_CANCELLED)),
+            exchange = self.exchange_lock.lock() => exchange,
+        };
 
         self.ensure_running(model_path).await?;
 
-        let exchange = async {
+        let exchange = tokio::time::timeout(timeout, async {
             self.write_line(&request_json).await?;
             self.read_reply(false).await
+        });
+        // Resolve to a value first so the exchange future (and the pipe locks it may hold) is
+        // dropped before any shutdown below.
+        let outcome = tokio::select! {
+            biased;
+            _ = cancelled(cancellation) => None,
+            result = exchange => Some(result),
         };
-        match tokio::time::timeout(timeout, exchange).await {
-            Ok(Ok(response)) => {
+        match outcome {
+            Some(Ok(Ok(response))) => {
                 self.update_activity().await;
                 Ok(response)
             }
-            Ok(Err(e)) => {
+            Some(Ok(Err(e))) => {
                 log::error!("Sidecar request failed, will respawn on the next request: {:#}", e);
                 self.is_healthy.store(false, Ordering::SeqCst);
                 Err(e)
             }
-            Err(_) => {
+            Some(Err(_)) => {
                 // Timeout reached - shutdown sidecar to stop generation
                 log::error!("Request timeout after {:?}, shutting down sidecar", timeout);
                 if let Err(shutdown_err) = self.shutdown().await {
                     log::error!("Failed to shutdown sidecar after timeout: {}", shutdown_err);
                 }
                 Err(anyhow!("Request timed out after {:?}", timeout))
+            }
+            None => {
+                log::warn!("Generation cancelled by user, shutting down sidecar");
+                if let Err(e) = self.shutdown().await {
+                    log::error!("Failed to shutdown sidecar during cancellation: {}", e);
+                }
+                Err(anyhow!(GENERATION_CANCELLED))
             }
         }
     }
@@ -819,10 +852,10 @@ done
         let model = dir.path().join("model.gguf");
         let timeout = Duration::from_secs(5);
 
-        assert!(manager.request(model.clone(), generate("crash"), timeout).await.is_err());
+        assert!(manager.request(model.clone(), generate("crash"), timeout, None).await.is_err());
         assert!(!manager.is_healthy());
 
-        let response = manager.request(model, generate("hello"), timeout).await.unwrap();
+        let response = manager.request(model, generate("hello"), timeout, None).await.unwrap();
         assert_eq!(response, reply("hello"));
         assert!(manager.is_healthy());
         assert_eq!(spawn_count(dir.path()), 2);
@@ -837,12 +870,12 @@ done
         let model = dir.path().join("model.gguf");
         let timeout = Duration::from_secs(5);
 
-        let first = manager.request(model.clone(), generate("exit-after-reply"), timeout).await;
+        let first = manager.request(model.clone(), generate("exit-after-reply"), timeout, None).await;
         assert_eq!(first.unwrap(), reply("exit-after-reply"));
         assert!(manager.is_healthy(), "the exit is not observed yet");
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let response = manager.request(model, generate("again"), timeout).await.unwrap();
+        let response = manager.request(model, generate("again"), timeout, None).await.unwrap();
         assert_eq!(response, reply("again"));
         assert_eq!(spawn_count(dir.path()), 2);
         manager.shutdown().await.unwrap();
@@ -856,7 +889,7 @@ done
         let model = dir.path().join("model.gguf");
 
         let response = manager
-            .request(model, generate("stray"), Duration::from_secs(5))
+            .request(model, generate("stray"), Duration::from_secs(5), None)
             .await
             .unwrap();
         assert_eq!(response, reply("stray"));
@@ -873,18 +906,70 @@ done
         let slow = {
             let (manager, model) = (manager.clone(), model.clone());
             tokio::spawn(async move {
-                manager.request(model, generate("slow"), Duration::from_secs(5)).await
+                manager.request(model, generate("slow"), Duration::from_secs(5), None).await
             })
         };
         tokio::time::sleep(Duration::from_millis(200)).await;
         // Waits ~800 ms for the slow request, longer than its own 500 ms timeout.
         let quick = manager
-            .request(model, generate("quick"), Duration::from_millis(500))
+            .request(model, generate("quick"), Duration::from_millis(500), None)
             .await;
 
         assert_eq!(slow.await.unwrap().unwrap(), reply("slow"));
         assert_eq!(quick.unwrap(), reply("quick"));
         assert_eq!(spawn_count(dir.path()), 1);
+        manager.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_queued_request_leaves_the_running_one_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SidecarManager::with_helper_binary(fake_helper(dir.path()), 300));
+        let model = dir.path().join("model.gguf");
+
+        let slow = {
+            let (manager, model) = (manager.clone(), model.clone());
+            tokio::spawn(async move {
+                manager.request(model, generate("slow"), Duration::from_secs(5), None).await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let token = CancellationToken::new();
+        let queued = manager.request(model, generate("queued"), Duration::from_secs(5), Some(&token));
+        let cancel_soon = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            token.cancel();
+        };
+        let (queued, ()) = tokio::join!(queued, cancel_soon);
+
+        assert_eq!(queued.unwrap_err().to_string(), GENERATION_CANCELLED);
+        assert_eq!(slow.await.unwrap().unwrap(), reply("slow"));
+        assert!(manager.is_healthy());
+        assert_eq!(spawn_count(dir.path()), 1);
+        manager.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_the_running_request_shuts_the_sidecar_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SidecarManager::with_helper_binary(fake_helper(dir.path()), 300);
+        let model = dir.path().join("model.gguf");
+        let token = CancellationToken::new();
+
+        let running = manager.request(model.clone(), generate("slow"), Duration::from_secs(5), Some(&token));
+        let cancel_soon = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            token.cancel();
+        };
+        let (running, ()) = tokio::join!(running, cancel_soon);
+
+        assert_eq!(running.unwrap_err().to_string(), GENERATION_CANCELLED);
+        assert!(!manager.is_healthy());
+        let next = manager.request(model, generate("next"), Duration::from_secs(5), None).await;
+        assert_eq!(next.unwrap(), reply("next"));
+        assert_eq!(spawn_count(dir.path()), 2);
         manager.shutdown().await.unwrap();
     }
 }

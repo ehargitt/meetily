@@ -94,7 +94,7 @@ Raw Audio (Mic + System)
     RecordingSaver.save()      WhisperEngine.transcribe()
 ```
 
-**Key Insight**: The pipeline performs **professional audio mixing** (RMS-based ducking, clipping prevention) for recording, while simultaneously applying **Voice Activity Detection (VAD)** to send only speech segments to Whisper for transcription.
+**Key Insight**: The pipeline performs **professional audio mixing** (mic and system summed without ducking, samples clamped to ±1.0) for recording, while simultaneously applying **Voice Activity Detection (VAD)** to send only speech segments to Whisper for transcription.
 
 ### Audio Device Modularization (Recently Completed)
 
@@ -197,7 +197,7 @@ pub async fn load_model(&self, model_name: &str) -> Result<()> {
 **Ring Buffer Mixing** (pipeline.rs):
 - Mic and system audio arrive asynchronously at different rates
 - Ring buffer accumulates samples and mixes a 600ms window only when both streams hold a full window; a stream is padded with silence only when it is starved (nothing delivered for >200ms while the other stream captured audio — i.e. stalled, dead, or absent)
-- Professional mixing applies RMS-based ducking to prevent system audio from drowning out microphone
+- Mixing sums mic and system samples (no ducking) and clamps any sample above ±1.0 to prevent clipping
 - Uses `VecDeque` for efficient windowed processing
 
 ### 2. Thread Safety and Async Boundaries
@@ -274,7 +274,7 @@ macro_rules! perf_debug {
 
 Key components:
 - `AudioMixerRingBuffer`: Manages mic + system audio synchronization
-- `ProfessionalAudioMixer`: RMS-based ducking and mixing
+- `ProfessionalAudioMixer`: sums mic + system, clamping samples to ±1.0 (no ducking)
 - `AudioPipelineManager`: Orchestrates VAD, mixing, and distribution
 
 **Testing Audio Changes**:
@@ -368,7 +368,7 @@ $env:RUST_LOG="debug"; ./clean_run_windows.bat
    - Windows: WASAPI exclusive mode can conflict with other apps
    - System audio requires virtual device (BlackHole on macOS, WASAPI loopback on Windows)
 
-3. **Whisper Model Loading**: Models are loaded once and cached. Changing models requires app restart or manual unload/reload.
+3. **Whisper Model Loading**: Models are loaded once and cached. Changing models requires app restart or manual unload/reload. While a recording is live, stopping, or its transcription is still draining in the background (`transcription_engine_in_use()` in `audio/recording_commands.rs`), changing the transcription model or provider, re-transcribing and importing audio are refused with an error, and the model unload after a batch job is skipped.
 
 4. **No Separate Backend Dependency**: Meeting persistence, transcription, and LLM features are handled by the Tauri app. Do not reintroduce the archived FastAPI backend as a supported requirement.
 
