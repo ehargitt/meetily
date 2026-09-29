@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex as StdMutex;
 // Removed unused import
@@ -131,13 +131,6 @@ struct RecordingArgs {
     save_path: String,
 }
 
-#[derive(Debug, Serialize, Clone)]
-struct TranscriptionStatus {
-    chunks_in_queue: usize,
-    is_processing: bool,
-    last_activity_ms: u64,
-}
-
 #[tauri::command]
 async fn start_recording<R: Runtime>(
     app: AppHandle<R>,
@@ -153,10 +146,7 @@ async fn start_recording<R: Runtime>(
         meeting_name
     );
 
-    if is_recording().await {
-        return Err("Recording already in progress".to_string());
-    }
-
+    // recording_commands refuses the start while recording or still stopping.
     // Call the actual audio recording system with meeting name
     match audio::recording_commands::start_recording_with_devices_and_meeting(
         app.clone(),
@@ -215,6 +205,7 @@ async fn stop_recording<R: Runtime>(app: AppHandle<R>, args: RecordingArgs) -> R
         audio::recording_commands::RecordingArgs {
             save_path: args.save_path.clone(),
         },
+        audio::recording_commands::StopSource::Ui,
     )
     .await
     {
@@ -253,10 +244,14 @@ async fn stop_recording<R: Runtime>(app: AppHandle<R>, args: RecordingArgs) -> R
 
             Ok(())
         }
+        // Another stop is already running; the frontend matches this exact string.
+        Err(e) if e == audio::recording_commands::STOP_IN_PROGRESS_ERROR => {
+            log_info!("Stop ignored: another stop is already in progress");
+            Err(e)
+        }
         Err(e) => {
+            // The recording is still active (stop_recording restored it), so the flag stays set.
             log_error!("Failed to stop audio recording: {}", e);
-            // Still update the flag even if stopping failed
-            RECORDING_FLAG.store(false, Ordering::SeqCst);
             tray::update_tray_menu(&app);
             Err(format!("Failed to stop recording: {}", e))
         }
@@ -269,12 +264,8 @@ async fn is_recording() -> bool {
 }
 
 #[tauri::command]
-fn get_transcription_status() -> TranscriptionStatus {
-    TranscriptionStatus {
-        chunks_in_queue: 0,
-        is_processing: false,
-        last_activity_ms: 0,
-    }
+fn get_transcription_status() -> audio::TranscriptionStatus {
+    audio::recording_commands::get_transcription_status()
 }
 
 #[tauri::command]
