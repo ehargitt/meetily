@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::summary::context_budget::{rough_token_count, ContextBudget};
+use crate::summary::context_budget::{rough_token_count, ContextBudget, OutputKind};
 
 const REQUEST_TIMEOUT_DURATION: Duration = Duration::from_secs(300);
 /// Slowest rates an Ollama request is given time for: roughly an 8B model on CPU or partly
@@ -21,11 +21,12 @@ const OLLAMA_MIN_OUTPUT_TOKENS_PER_SEC: u64 = 5;
 fn request_timeout(
     provider: &LLMProvider,
     context_budget: Option<ContextBudget>,
+    output_kind: OutputKind,
     prompt_tokens: usize,
 ) -> Duration {
     match (provider, context_budget) {
         (LLMProvider::Ollama, Some(budget)) => {
-            let output_tokens = budget.output_room(prompt_tokens) as u64;
+            let output_tokens = budget.output_room(prompt_tokens, output_kind) as u64;
             REQUEST_TIMEOUT_DURATION
                 + Duration::from_secs(prompt_tokens as u64 / OLLAMA_MIN_PROMPT_TOKENS_PER_SEC)
                 + Duration::from_secs(output_tokens / OLLAMA_MIN_OUTPUT_TOKENS_PER_SEC)
@@ -133,6 +134,7 @@ pub fn build_ollama_chat_body(
     system_prompt: &str,
     user_prompt: &str,
     context_budget: Option<ContextBudget>,
+    output_kind: OutputKind,
 ) -> serde_json::Value {
     serde_json::json!(OllamaChatRequest {
         model: model_name.to_string(),
@@ -150,8 +152,10 @@ pub fn build_ollama_chat_body(
         think: false,
         options: context_budget.map(|budget| OllamaChatOptions {
             num_ctx: budget.context_tokens,
-            num_predict: budget
-                .output_room(rough_token_count(system_prompt) + rough_token_count(user_prompt)),
+            num_predict: budget.output_room(
+                rough_token_count(system_prompt) + rough_token_count(user_prompt),
+                output_kind,
+            ),
         }),
     })
 }
@@ -381,6 +385,7 @@ impl LLMProvider {
 /// * `temperature` - Optional temperature (for CustomOpenAI provider)
 /// * `top_p` - Optional top_p (for CustomOpenAI provider)
 /// * `context_budget` - Window and output reserve chunking assumed (Ollama sends them as options)
+/// * `output_kind` - How far the output may outgrow the prompt (sets Ollama's `num_predict`)
 /// * `app_data_dir` - Optional app data directory (for BuiltInAI provider)
 /// * `cancellation_token` - Optional token to cancel the request
 ///
@@ -398,6 +403,7 @@ pub(crate) async fn generate_summary(
     temperature: Option<f32>,
     top_p: Option<f32>,
     context_budget: Option<ContextBudget>,
+    output_kind: OutputKind,
     app_data_dir: Option<&PathBuf>,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<LlmCompletion, String> {
@@ -496,7 +502,7 @@ pub(crate) async fn generate_summary(
 
     // Build request body based on provider
     let request_body = if provider == &LLMProvider::Ollama {
-        build_ollama_chat_body(model_name, system_prompt, user_prompt, context_budget)
+        build_ollama_chat_body(model_name, system_prompt, user_prompt, context_budget, output_kind)
     } else if provider != &LLMProvider::Claude {
         build_openai_compat_chat_body(
             provider,
@@ -524,7 +530,7 @@ pub(crate) async fn generate_summary(
     info!("🐞 LLM Request to {}: model={}", provider_name(provider), model_name);
 
     let prompt_tokens = rough_token_count(system_prompt) + rough_token_count(user_prompt);
-    let request_timeout = request_timeout(provider, context_budget, prompt_tokens);
+    let request_timeout = request_timeout(provider, context_budget, output_kind, prompt_tokens);
     // Send request with timeout and cancellation support
     let request_future = client
         .post(api_url.clone())
@@ -802,7 +808,7 @@ mod tests {
 
     #[test]
     fn ollama_body_uses_native_chat_with_num_ctx_and_thinking_off() {
-        let body = build_ollama_chat_body("llama3.1:8b", "sys", "user", Some(ContextBudget::for_ollama(16_384)));
+        let body = build_ollama_chat_body("llama3.1:8b", "sys", "user", Some(ContextBudget::for_ollama(16_384)), OutputKind::Rewrite);
         assert_eq!(body["model"], "llama3.1:8b");
         assert_eq!(body["stream"], false);
         assert_eq!(body["think"], false);
@@ -814,7 +820,12 @@ mod tests {
         assert_eq!(body["messages"][1]["content"], "user");
         assert!(body.get("reasoning_effort").is_none());
 
-        assert!(build_ollama_chat_body("m", "s", "u", None).get("options").is_none());
+        assert!(build_ollama_chat_body("m", "s", "u", None, OutputKind::Rewrite).get("options").is_none());
+
+        // A translation request gets the window's whole remaining room.
+        let translation =
+            build_ollama_chat_body("llama3.1:8b", "sys", "user", Some(ContextBudget::for_ollama(16_384)), OutputKind::Translation);
+        assert_eq!(translation["options"]["num_predict"], 16_384 - prompt_tokens - 64);
     }
 
     #[test]
@@ -822,17 +833,17 @@ mod tests {
         let window = |tokens| Some(ContextBudget::for_ollama(tokens));
         // A chunk-sized prompt at 16k leaves exactly the 4096 reserve: read it at 30/s, write at 5/s.
         assert_eq!(
-            request_timeout(&LLMProvider::Ollama, window(16_384), 12_224),
+            request_timeout(&LLMProvider::Ollama, window(16_384), OutputKind::Rewrite, 12_224),
             Duration::from_secs(300 + 12_224 / 30 + 4096 / 5)
         );
         // A 3k final-report prompt at 16k may write up to 2 * 3000 + 4096 tokens.
         assert_eq!(
-            request_timeout(&LLMProvider::Ollama, window(16_384), 3000),
+            request_timeout(&LLMProvider::Ollama, window(16_384), OutputKind::Rewrite, 3000),
             Duration::from_secs(300 + 100 + 10_096 / 5)
         );
-        assert_eq!(request_timeout(&LLMProvider::Ollama, None, 3000), REQUEST_TIMEOUT_DURATION);
+        assert_eq!(request_timeout(&LLMProvider::Ollama, None, OutputKind::Rewrite, 3000), REQUEST_TIMEOUT_DURATION);
         assert_eq!(
-            request_timeout(&LLMProvider::OpenRouter, Some(ContextBudget::for_hosted_model(200_000)), 3000),
+            request_timeout(&LLMProvider::OpenRouter, Some(ContextBudget::for_hosted_model(200_000)), OutputKind::Rewrite, 3000),
             REQUEST_TIMEOUT_DURATION
         );
     }
@@ -976,6 +987,7 @@ mod tests {
             None,
             None,
             None,
+            OutputKind::Rewrite,
             None,
             Some(&cancellation_token),
         );
@@ -1063,6 +1075,7 @@ mod tests {
             None,
             None,
             None,
+            OutputKind::Rewrite,
             None,
             Some(&cancellation_token),
         );
@@ -1117,7 +1130,7 @@ mod tests {
             assert!(body.get("think").is_none());
             assert_eq!(body["options"]["num_ctx"], 8192, "the retry keeps the context window");
             let prompt_tokens = rough_token_count("system") + rough_token_count("user");
-            assert_eq!(body["options"]["num_predict"], ContextBudget::for_ollama(8192).output_room(prompt_tokens));
+            assert_eq!(body["options"]["num_predict"], ContextBudget::for_ollama(8192).output_room(prompt_tokens, OutputKind::Rewrite));
 
             write_json_response(
                 &mut stream,
@@ -1144,6 +1157,7 @@ mod tests {
                 None,
                 None,
                 Some(ContextBudget::for_ollama(8192)),
+                OutputKind::Rewrite,
                 None,
                 Some(&cancellation_token),
             ),

@@ -1,5 +1,5 @@
 use crate::summary::context_budget::{
-    char_token_units, rough_token_count, ContextBudget, UNITS_PER_TOKEN,
+    char_token_units, rough_token_count, ContextBudget, OutputKind, UNITS_PER_TOKEN,
 };
 use crate::summary::llm_client::{generate_summary, LLMProvider, LlmCompletion};
 use crate::summary::templates::Template;
@@ -75,9 +75,12 @@ const CHUNK_OVERLAP_TOKENS: usize = 100;
 const CHUNK_SYSTEM_PROMPT: &str = "You are an expert meeting summarizer.";
 const COMBINE_SYSTEM_PROMPT: &str = "You are an expert at synthesizing meeting summaries.";
 const SUMMARY_SEPARATOR: &str = "\n---\n";
-/// Errors for stages whose output was cut off at the model's output limit. The final report's
-/// room grows as its prompt shrinks, so the template length and the model's window help there.
-const FINAL_REPORT_CUT_OFF: &str = "The final summary was cut off at the model's output limit. Try a shorter template or a model with a larger context window.";
+/// Errors for stages whose output was cut off at the model's output limit. A final report
+/// gets at most twice its prompt plus the reserve (`OutputKind::Rewrite`). With a short prompt
+/// that bound applies, so a cut means an unusually long or looping reply, and a shorter
+/// template would only lower the bound. Only a prompt that nearly fills the window is cut for
+/// lack of window, which a larger window (or a shorter template) helps; hence the advice.
+const FINAL_REPORT_CUT_OFF: &str = "The final summary was cut off at the model's output limit. Please retry; for long meetings a model with a larger context window may help.";
 const TRANSLATION_CUT_OFF: &str = "the translated summary was cut off at the model's output limit";
 const NORMALIZATION_CUT_OFF: &str = "the English summary was cut off at the model's output limit";
 
@@ -100,6 +103,15 @@ struct LlmCall<'a> {
 
 impl LlmCall<'_> {
     async fn complete(&self, system_prompt: &str, user_prompt: &str) -> Result<LlmCompletion, String> {
+        self.complete_as(OutputKind::Rewrite, system_prompt, user_prompt).await
+    }
+
+    async fn complete_as(
+        &self,
+        output_kind: OutputKind,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<LlmCompletion, String> {
         generate_summary(
             self.client,
             self.provider,
@@ -113,6 +125,7 @@ impl LlmCall<'_> {
             self.temperature,
             self.top_p,
             self.context_budget,
+            output_kind,
             self.app_data_dir,
             self.cancellation_token,
         )
@@ -125,11 +138,12 @@ impl LlmCall<'_> {
     /// handle cut replies themselves.)
     async fn complete_whole(
         &self,
+        output_kind: OutputKind,
         system_prompt: &str,
         user_prompt: &str,
         cut_off_error: &str,
     ) -> Result<LlmCompletion, String> {
-        let completion = self.complete(system_prompt, user_prompt).await?;
+        let completion = self.complete_as(output_kind, system_prompt, user_prompt).await?;
         if completion.truncated {
             return Err(cut_off_error.to_string());
         }
@@ -155,6 +169,15 @@ const ENGLISH_BASE_SUMMARY_INSTRUCTION: &str =
 
 /// Transcripts with identified speakers arrive as `[MM:SS] Name: text` lines.
 const SPEAKER_ATTRIBUTION_RULE: &str = "Transcript lines may look like `[MM:SS] Name: text`, where Name is the speaker. Attribute decisions and action items to that Name. \"Me\" is the person who recorded the meeting. Keep labels such as \"Speaker 2\" verbatim and never invent names.";
+
+/// An English summary from an earlier run with the same inputs, reused when only the output
+/// language changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CachedEnglishSummary {
+    pub markdown: String,
+    /// Carried into the new result: the reused text still lacks what the cut-off combine lost.
+    pub combine_truncated: bool,
+}
 
 fn resolve_cached_english<'a>(
     cached: Option<&'a str>,
@@ -539,9 +562,10 @@ async fn combine_chunk_summaries(
 }
 
 /// Merges one group of summaries into one, or into fewer. A reply cut off at the output limit
-/// for a group of more than two is redone as pairs, whose smaller prompts leave more output
-/// room for less text. A cut-off pair keeps the text it produced and reports it as truncated:
-/// failing there would discard every chunk already summarized.
+/// for a group of more than two is redone as pairs: each pair asks for a shorter merge, which
+/// can fit where the group's did not, though its output room is not necessarily larger (see
+/// `ContextBudget::output_room`). A cut-off pair keeps the text it produced and reports it as
+/// truncated: failing there would discard every chunk already summarized.
 async fn combine_group(
     llm: &LlmCall<'_>,
     group: &[String],
@@ -654,7 +678,7 @@ pub(crate) async fn generate_meeting_summary(
     cancellation_token: Option<&CancellationToken>,
     summary_language: Option<&str>,
     detected_transcript_language: Option<&str>,
-    cached_english: Option<&str>,
+    cached_english: Option<&CachedEnglishSummary>,
 ) -> Result<GeneratedMeetingSummary, String> {
     let llm = LlmCall {
         client,
@@ -676,9 +700,12 @@ pub(crate) async fn generate_meeting_summary(
     info!("Starting summary generation with provider: {:?}, model: {}", provider, model_name);
 
     let (mut english_markdown, successful_chunk_count, mut reasoning_stripped, combine_truncated) =
-        if let Some(cached) = resolve_cached_english(cached_english, summary_language) {
+        if let Some((cached, cached_combine_truncated)) = cached_english.and_then(|cache| {
+            resolve_cached_english(Some(&cache.markdown), summary_language)
+                .map(|markdown| (markdown, cache.combine_truncated))
+        }) {
             info!("✓ Using cached English summary ({} chars), skipping pass 1", cached.len());
-            (cached.to_string(), 1_i64, false, false)
+            (cached.to_string(), 1_i64, false, cached_combine_truncated)
         } else {
             let mut content_to_summarize = text.to_string();
             let successful_chunk_count;
@@ -778,7 +805,7 @@ pub(crate) async fn generate_meeting_summary(
             info!("Generating final markdown report with template: {}", template_id);
             let final_user_prompt = build_final_report_user_prompt(&content_to_summarize, custom_prompt);
             let completion = llm
-                .complete_whole(&final_system_prompt, &final_user_prompt, FINAL_REPORT_CUT_OFF)
+                .complete_whole(OutputKind::Rewrite, &final_system_prompt, &final_user_prompt, FINAL_REPORT_CUT_OFF)
                 .await?;
             let cleaned = clean_llm_markdown_detailed(&completion.content);
             stage_reasoning_stripped |= completion.reasoning_stripped || cleaned.reasoning_stripped;
@@ -820,6 +847,7 @@ pub(crate) async fn generate_meeting_summary(
 
 async fn run_markdown_transform(
     llm: &LlmCall<'_>,
+    output_kind: OutputKind,
     system_prompt: &str,
     user_prompt: &str,
     cut_off_error: &str,
@@ -830,7 +858,7 @@ async fn run_markdown_transform(
     // A cut-off normalization falls back to the intact pass-1 markdown; a cut-off translation
     // fails the summary.
     let completion = llm
-        .complete_whole(system_prompt, user_prompt, cut_off_error)
+        .complete_whole(output_kind, system_prompt, user_prompt, cut_off_error)
         .await?;
     let mut cleaned = clean_llm_markdown_detailed(&completion.content);
     cleaned.reasoning_stripped |= completion.reasoning_stripped;
@@ -846,7 +874,14 @@ async fn translate_markdown(
     let user_prompt = format!(
         "Translate the following Markdown document into {target_language}. Return ONLY the translated Markdown, nothing else.\n\n<document>\n{english_markdown}\n</document>"
     );
-    let cleaned = run_markdown_transform(llm, &system_prompt, &user_prompt, TRANSLATION_CUT_OFF).await?;
+    let cleaned = run_markdown_transform(
+        llm,
+        OutputKind::Translation,
+        &system_prompt,
+        &user_prompt,
+        TRANSLATION_CUT_OFF,
+    )
+    .await?;
     require_visible_markdown("Translation", &cleaned)?;
     Ok(cleaned)
 }
@@ -860,6 +895,7 @@ async fn normalize_markdown_to_english(
     );
     run_markdown_transform(
         llm,
+        OutputKind::Rewrite,
         english_normalization_system_prompt(),
         &user_prompt,
         NORMALIZATION_CUT_OFF,
@@ -1002,6 +1038,16 @@ mod tests {
         summary_language: Option<&str>,
         reply: impl Fn(&serde_json::Value) -> serde_json::Value + Send + 'static,
     ) -> (Result<GeneratedMeetingSummary, String>, Vec<serde_json::Value>) {
+        summarize_with_fake_ollama_and_cache(budget, transcript, summary_language, None, reply).await
+    }
+
+    async fn summarize_with_fake_ollama_and_cache(
+        budget: ContextBudget,
+        transcript: &str,
+        summary_language: Option<&str>,
+        cached_english: Option<&CachedEnglishSummary>,
+        reply: impl Fn(&serde_json::Value) -> serde_json::Value + Send + 'static,
+    ) -> (Result<GeneratedMeetingSummary, String>, Vec<serde_json::Value>) {
         use crate::summary::llm_client::test_http::{read_http_request, request_json, write_json_response};
         use std::sync::{Arc, Mutex};
 
@@ -1039,7 +1085,7 @@ mod tests {
             None,
             summary_language,
             summary_language,
-            None,
+            cached_english,
         )
         .await;
         server.abort();
@@ -1079,7 +1125,7 @@ mod tests {
             let prompt_tokens = rough_token_count(body["messages"][0]["content"].as_str().unwrap())
                 + rough_token_count(body["messages"][1]["content"].as_str().unwrap());
             let num_predict = body["options"]["num_predict"].as_u64().unwrap() as usize;
-            assert_eq!(num_predict, budget.output_room(prompt_tokens));
+            assert_eq!(num_predict, budget.output_room(prompt_tokens, OutputKind::Rewrite));
             assert!(num_predict >= budget.output_reserve_tokens);
             assert!(
                 prompt_tokens + num_predict <= budget.context_tokens,
@@ -1157,6 +1203,50 @@ mod tests {
         assert!(bodies.last().map(is_final_report).unwrap(), "the final report still runs");
     }
 
+    fn is_translation(body: &serde_json::Value) -> bool {
+        body["messages"][0]["content"] == translation_system_prompt("French")
+    }
+
+    #[tokio::test]
+    async fn a_translation_may_use_the_whole_remaining_window() {
+        let budget = ContextBudget::for_ollama(16_384);
+        let (result, bodies) = summarize_with_fake_ollama(
+            budget,
+            "[00:01] Alice: ship on friday\n",
+            Some("fr"),
+            |_| ollama_reply(40, "stop"),
+        )
+        .await;
+
+        result.unwrap();
+        let translation = bodies.iter().find(|body| is_translation(body)).expect("a translation request");
+        let prompt_tokens = rough_token_count(translation["messages"][0]["content"].as_str().unwrap())
+            + rough_token_count(translation["messages"][1]["content"].as_str().unwrap());
+        // Not held to twice its (short) prompt: the window's whole remaining room.
+        assert_eq!(translation["options"]["num_predict"], budget.context_tokens - prompt_tokens - 64);
+        assert!(2 * prompt_tokens + budget.output_reserve_tokens < budget.context_tokens - prompt_tokens - 64);
+    }
+
+    #[tokio::test]
+    async fn a_rerun_from_a_cut_off_cached_english_summary_stays_flagged() {
+        let cached = CachedEnglishSummary {
+            markdown: "# Meeting\n## Points\nHello".to_string(),
+            combine_truncated: true,
+        };
+        let (result, bodies) = summarize_with_fake_ollama_and_cache(
+            ContextBudget::for_ollama(8192),
+            "[00:01] Alice: ship on friday\n",
+            Some("fr"),
+            Some(&cached),
+            |_| ollama_reply(40, "stop"),
+        )
+        .await;
+
+        let generated = result.unwrap();
+        assert_eq!(bodies.len(), 1, "only the translation runs");
+        assert!(generated.combine_truncated);
+    }
+
     #[tokio::test]
     async fn a_cut_off_translation_fails_with_one_clear_message() {
         let (result, _) = summarize_with_fake_ollama(
@@ -1164,7 +1254,7 @@ mod tests {
             "[00:01] Alice: ship on friday\n",
             Some("fr"),
             |body| {
-                let translating = body["messages"][0]["content"] == translation_system_prompt("French");
+                let translating = is_translation(body);
                 ollama_reply(40, if translating { "length" } else { "stop" })
             },
         )
