@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { parseSummaryContent } from '../../src/lib/summary-content';
 import type { MeetingSummary, SummaryProcessResponse } from '../../src/types';
+import { recordingStateModule } from '../support/recording-state-mock';
 
 // Bun shares module mocks between test files; restore application modules after this suite.
 const originalAnalytics = { ...await import('../../src/lib/analytics') };
@@ -15,7 +16,7 @@ afterAll(() => {
 });
 
 mock.module('next/navigation', () => ({ usePathname: () => '/meeting-details', useRouter: () => ({}) }));
-mock.module('../../src/contexts/RecordingStateContext', () => ({ useRecordingState: () => ({ isRecording: false }) }));
+mock.module('../../src/contexts/RecordingStateContext', () => recordingStateModule());
 const notify = mock(() => {});
 mock.module('sonner', () => ({ toast: { info: notify, error: notify, success: notify, warning: notify } }));
 const trackCompletion = mock(async (..._args: Parameters<typeof originalAnalytics.default.trackSummaryGenerationCompleted>) => {});
@@ -30,6 +31,7 @@ const invoke = mock(async (command: string, args?: Record<string, unknown>): Pro
   if (command === 'api_get_summary') return getSummary(args!.meetingId as string);
   if (command === 'api_get_meeting_transcripts') return { transcripts: [{ text: 'Meeting transcript', timestamp: '00:00' }], total_count: 1 };
   if (command === 'get_ollama_models') return [{ name: 'test' }];
+  if (command === 'api_get_meeting_speakers') return [];
   if (command === 'api_process_transcript') return startProcess();
   if (command === 'api_cancel_summary') return { cancelled: true };
   throw new Error(`Unexpected command: ${command}`);
@@ -245,6 +247,19 @@ describe('summary state restored when returning to a meeting', () => {
     await tick();
     expect(state.summaryStatus).toBe('completed');
   });
+
+  test.each([
+    [{ survivesUnmount: true }, 1],
+    [{}, 0],
+  ])('a generation requested as the page unmounts reaches the backend only when it survives unmount (%o)',
+    async (options, expectedStarts) => {
+      await show(response({ status: 'idle', start: null }));
+      const generation = state.handleGenerateSummary('', options);
+      await show(null);
+      await act(async () => { await generation; });
+      expect(invoke.mock.calls.filter(([command]) => command === 'api_process_transcript')).toHaveLength(expectedStarts);
+      expect(timers.size).toBe(0);
+    });
 
   test('completion analytics retain the model used to start the attempt after settings change', async () => {
     const initial = response({ status: 'idle', start: null });

@@ -4,6 +4,10 @@ mod ffmpeg;
 mod onnxruntime;
 
 fn main() {
+    // tauri-build emits its own rerun-if-changed lines, which disables cargo's default
+    // rescan; without this, a new migration file would not rebuild sqlx::migrate!.
+    println!("cargo:rerun-if-changed=migrations");
+
     // GPU Acceleration Detection and Build Guidance
     detect_and_report_gpu_capabilities();
 

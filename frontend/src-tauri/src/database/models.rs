@@ -35,6 +35,11 @@ pub struct Transcript {
     pub audio_start_time: Option<f64>,
     pub audio_end_time: Option<f64>,
     pub duration: Option<f64>,
+    // Diarized speaker, joined from transcript_speakers (absent from plain `SELECT *` queries)
+    #[sqlx(default)]
+    pub speaker_key: Option<String>,
+    #[sqlx(default)]
+    pub speaker_overlap: Option<f64>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

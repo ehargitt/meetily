@@ -23,6 +23,13 @@ pub struct RecordingPreferences {
     #[cfg(target_os = "macos")]
     #[serde(default)]
     pub system_audio_backend: Option<String>,
+    /// Identify speakers automatically after a recording or import (needs the models).
+    #[serde(default = "default_true")]
+    pub auto_identify_speakers: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for RecordingPreferences {
@@ -35,6 +42,7 @@ impl Default for RecordingPreferences {
             preferred_system_device: None,
             #[cfg(target_os = "macos")]
             system_audio_backend: Some("coreaudio".to_string()),
+            auto_identify_speakers: true,
         }
     }
 }
@@ -128,9 +136,10 @@ pub async fn load_recording_preferences<R: Runtime>(
         RecordingPreferences::default()
     };
 
-    info!("Loaded recording preferences: save_folder={:?}, auto_save={}, format={}, mic={:?}, system={:?}",
+    info!("Loaded recording preferences: save_folder={:?}, auto_save={}, format={}, mic={:?}, system={:?}, auto_identify_speakers={}",
           prefs.save_folder, prefs.auto_save, prefs.file_format,
-          prefs.preferred_mic_device, prefs.preferred_system_device);
+          prefs.preferred_mic_device, prefs.preferred_system_device,
+          prefs.auto_identify_speakers);
     Ok(prefs)
 }
 
@@ -139,9 +148,10 @@ pub async fn save_recording_preferences<R: Runtime>(
     app: &AppHandle<R>,
     preferences: &RecordingPreferences,
 ) -> Result<()> {
-    info!("Saving recording preferences: save_folder={:?}, auto_save={}, format={}, mic={:?}, system={:?}",
+    info!("Saving recording preferences: save_folder={:?}, auto_save={}, format={}, mic={:?}, system={:?}, auto_identify_speakers={}",
           preferences.save_folder, preferences.auto_save, preferences.file_format,
-          preferences.preferred_mic_device, preferences.preferred_system_device);
+          preferences.preferred_mic_device, preferences.preferred_system_device,
+          preferences.auto_identify_speakers);
 
     // Get or create store
     let store = app

@@ -1,0 +1,16 @@
+[
+  {"start": 0.031, "end": 17.1422, "speaker": 0},
+  {"start": 10.5441, "end": 10.8985, "speaker": 1},
+  {"start": 17.3278, "end": 20.1797, "speaker": 1},
+  {"start": 21.0235, "end": 28.2797, "speaker": 1},
+  {"start": 21.1585, "end": 21.9685, "speaker": 0},
+  {"start": 22.4747, "end": 23.4366, "speaker": 0},
+  {"start": 27.6385, "end": 27.8241, "speaker": 2},
+  {"start": 28.8028, "end": 31.9753, "speaker": 2},
+  {"start": 33.0722, "end": 35.0635, "speaker": 1},
+  {"start": 34.3716, "end": 39.2822, "speaker": 3},
+  {"start": 35.0635, "end": 35.3841, "speaker": 2},
+  {"start": 38.2528, "end": 49.6435, "speaker": 2},
+  {"start": 43.636, "end": 44.041, "speaker": 3},
+  {"start": 48.6816, "end": 59.9035, "speaker": 3}
+]

@@ -2,9 +2,12 @@
 
 use crate::audio::decoder::decode_audio_file;
 use crate::audio::vad::get_speech_chunks_with_progress;
-use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
-use super::constants::AUDIO_EXTENSIONS;
+use super::common::{
+    create_transcript_segments, find_audio_file, split_segment_at_silence, write_transcripts_json,
+};
 use crate::config::{DEFAULT_WHISPER_MODEL, DEFAULT_PARAKEET_MODEL};
+use crate::database::repositories::speaker::SpeakerRepository;
+use meetily_diarization::timeline::TranscriptClock;
 use crate::parakeet_engine::ParakeetEngine;
 use crate::state::AppState;
 use crate::whisper_engine::WhisperEngine;
@@ -13,35 +16,40 @@ use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
-/// Global flag to track if retranscription is in progress
-static RETRANSCRIPTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+/// The meeting being retranscribed, if any (one retranscription runs at a time)
+static RETRANSCRIPTION_MEETING: Mutex<Option<String>> = Mutex::new(None);
 
 /// Global flag to signal cancellation
 static RETRANSCRIPTION_CANCELLED: AtomicBool = AtomicBool::new(false);
 
-/// RAII guard for RETRANSCRIPTION_IN_PROGRESS flag
-/// Ensures flag is cleared even if retranscription panics or returns early
+fn retranscription_meeting() -> std::sync::MutexGuard<'static, Option<String>> {
+    RETRANSCRIPTION_MEETING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// RAII guard for RETRANSCRIPTION_MEETING
+/// Ensures it is cleared even if retranscription panics or returns early
 struct RetranscriptionGuard;
 
 impl RetranscriptionGuard {
-    /// Create guard and set flag atomically
-    fn acquire() -> Result<Self, String> {
-        if RETRANSCRIPTION_IN_PROGRESS
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
+    /// Create guard and record the meeting atomically
+    fn acquire(meeting_id: &str) -> Result<Self, String> {
+        let mut current = retranscription_meeting();
+        if current.is_some() {
             return Err("Retranscription already in progress".to_string());
         }
+        *current = Some(meeting_id.to_string());
         Ok(RetranscriptionGuard)
     }
 }
 
 impl Drop for RetranscriptionGuard {
     fn drop(&mut self) {
-        RETRANSCRIPTION_IN_PROGRESS.store(false, Ordering::SeqCst);
+        *retranscription_meeting() = None;
     }
 }
 
@@ -79,7 +87,12 @@ pub struct RetranscriptionError {
 
 /// Check if retranscription is currently in progress
 pub fn is_retranscription_in_progress() -> bool {
-    RETRANSCRIPTION_IN_PROGRESS.load(Ordering::SeqCst)
+    retranscription_meeting().is_some()
+}
+
+/// Whether this meeting is the one being retranscribed
+pub fn is_retranscribing(meeting_id: &str) -> bool {
+    retranscription_meeting().as_deref() == Some(meeting_id)
 }
 
 /// Cancel ongoing retranscription
@@ -97,7 +110,7 @@ pub async fn start_retranscription<R: Runtime>(
     provider: Option<String>,
 ) -> Result<RetranscriptionResult> {
     // Acquire guard - ensures flag is cleared even on panic/early return
-    let _guard = RetranscriptionGuard::acquire().map_err(|e| anyhow!(e))?;
+    let _guard = RetranscriptionGuard::acquire(&meeting_id).map_err(|e| anyhow!(e))?;
 
     // Reset cancellation flag
     RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
@@ -109,7 +122,7 @@ pub async fn start_retranscription<R: Runtime>(
     super::common::unload_engine_after_batch(use_parakeet).await;
 
     // Guard will automatically clear flag on drop
-    // No need for manual: RETRANSCRIPTION_IN_PROGRESS.store(false, Ordering::SeqCst);
+    // No need to clear RETRANSCRIPTION_MEETING manually
 
     match &result {
         Ok(res) => {
@@ -135,38 +148,6 @@ pub async fn start_retranscription<R: Runtime>(
     }
 
     result
-}
-
-/// Find audio file in meeting folder
-/// Tries common names first, then scans for any file with an audio extension
-fn find_audio_file(folder: &Path) -> Result<PathBuf> {
-    let candidates = [
-        "audio.mp4", "audio.m4a", "audio.wav", "audio.mp3",
-        "audio.flac", "audio.ogg", "recording.mp4",
-        "audio.mkv", "audio.webm", "audio.wma",
-    ];
-
-    for name in candidates {
-        let path = folder.join(name);
-        if path.exists() {
-            return Ok(path);
-        }
-    }
-
-    // Fallback: scan folder for any file with an audio extension
-    if let Ok(entries) = std::fs::read_dir(folder) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(ext) = path.extension() {
-                let ext = ext.to_string_lossy().to_lowercase();
-                if AUDIO_EXTENSIONS.contains(&ext.as_str()) {
-                    return Ok(path);
-                }
-            }
-        }
-    }
-
-    Err(anyhow!("No audio file found in: {}", folder.display()))
 }
 
 /// Internal function to run retranscription
@@ -489,6 +470,13 @@ async fn run_retranscription<R: Runtime>(
         warn!("Failed to update metadata.json: {}", e);
     }
 
+    // The transcript DELETE above cascaded away the speaker labels; re-attach them from the
+    // stored speaker turns. The rows just written are timed from the audio file, so the file
+    // clock applies whether or not the metadata write above succeeded.
+    if let Err(e) = SpeakerRepository::realign_meeting(pool, &meeting_id, TranscriptClock::File).await {
+        warn!("Failed to re-attach speaker labels for {}: {}", meeting_id, e);
+    }
+
     emit_progress(&app, &meeting_id, "complete", 100, "Retranscription complete");
 
     Ok(RetranscriptionResult {
@@ -788,8 +776,13 @@ pub async fn start_retranscription_command<R: Runtime>(
 ) -> Result<RetranscriptionStarted, String> {
 
     // Check if retranscription is already in progress (guard will be acquired in start_retranscription)
-    if RETRANSCRIPTION_IN_PROGRESS.load(Ordering::SeqCst) {
+    if is_retranscription_in_progress() {
         return Err("Retranscription already in progress".to_string());
+    }
+
+    // Speaker identification writes this meeting's labels; the two must not overlap.
+    if crate::diarization::job::is_active(&meeting_id) {
+        return Err("Speaker identification is running for this meeting; try again when it finishes".to_string());
     }
 
     // Clone values for the spawned task
@@ -837,6 +830,7 @@ pub async fn is_retranscription_in_progress_command() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::constants::AUDIO_EXTENSIONS;
 
     #[test]
     fn test_create_transcript_segments_empty() {
@@ -918,9 +912,6 @@ mod tests {
     fn test_cancellation_flag() {
         // Reset flag to known state
         RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
-        RETRANSCRIPTION_IN_PROGRESS.store(false, Ordering::SeqCst);
-
-        assert!(!is_retranscription_in_progress());
 
         // Test cancellation
         cancel_retranscription();
@@ -931,70 +922,23 @@ mod tests {
     }
 
     #[test]
+    fn test_retranscription_guard_tracks_its_meeting() {
+        let guard = RetranscriptionGuard::acquire("meeting-being-retranscribed").unwrap();
+
+        assert!(is_retranscription_in_progress());
+        assert!(is_retranscribing("meeting-being-retranscribed"));
+        assert!(!is_retranscribing("another-meeting"));
+        assert!(RetranscriptionGuard::acquire("another-meeting").is_err());
+
+        drop(guard);
+        assert!(!is_retranscription_in_progress());
+        assert!(!is_retranscribing("meeting-being-retranscribed"));
+    }
+
+    #[test]
     fn test_vad_redemption_time_constant() {
         // Batch processing uses 2000ms to bridge natural pauses in full-file VAD
         assert_eq!(VAD_REDEMPTION_TIME_MS, 2000);
-    }
-
-    #[test]
-    fn test_find_audio_file_common_candidates() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // No audio file → error
-        assert!(find_audio_file(dir.path()).is_err());
-
-        // Create audio.mp4 — should be found first
-        std::fs::write(dir.path().join("audio.mp4"), b"fake").unwrap();
-        let found = find_audio_file(dir.path()).unwrap();
-        assert_eq!(found.file_name().unwrap(), "audio.mp4");
-    }
-
-    #[test]
-    fn test_find_audio_file_non_mp4_extensions() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // Create audio.wav (imported as .wav, not .mp4)
-        std::fs::write(dir.path().join("audio.wav"), b"fake").unwrap();
-        let found = find_audio_file(dir.path()).unwrap();
-        assert_eq!(found.file_name().unwrap(), "audio.wav");
-    }
-
-    #[test]
-    fn test_find_audio_file_fallback_scan() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // Create a file with an audio extension but non-standard name
-        std::fs::write(dir.path().join("my_recording.flac"), b"fake").unwrap();
-        // Also add a non-audio file that should be ignored
-        std::fs::write(dir.path().join("notes.txt"), b"text").unwrap();
-
-        let found = find_audio_file(dir.path()).unwrap();
-        assert_eq!(found.file_name().unwrap(), "my_recording.flac");
-    }
-
-    #[test]
-    fn test_find_audio_file_priority_order() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // Create both audio.m4a and audio.mp4 — mp4 should win (listed first in candidates)
-        std::fs::write(dir.path().join("audio.m4a"), b"fake").unwrap();
-        std::fs::write(dir.path().join("audio.mp4"), b"fake").unwrap();
-        let found = find_audio_file(dir.path()).unwrap();
-        assert_eq!(found.file_name().unwrap(), "audio.mp4");
-    }
-
-    #[test]
-    fn test_find_audio_file_empty_folder() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = find_audio_file(dir.path());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No audio file found"));
-    }
-
-    #[test]
-    fn test_find_audio_file_nonexistent_folder() {
-        let result = find_audio_file(Path::new("/nonexistent/path/12345"));
-        assert!(result.is_err());
     }
 
     #[test]

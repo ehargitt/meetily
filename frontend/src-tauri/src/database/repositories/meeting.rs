@@ -75,7 +75,12 @@ impl MeetingsRepository {
         if let Some(meeting) = meeting {
             // Get all transcripts for this meeting
             let transcripts =
-                sqlx::query_as::<_, Transcript>("SELECT * FROM transcripts WHERE meeting_id = ?")
+                sqlx::query_as::<_, Transcript>(
+                    "SELECT t.*, ts.speaker_key AS speaker_key, ts.overlap AS speaker_overlap
+                     FROM transcripts t
+                     LEFT JOIN transcript_speakers ts ON ts.transcript_id = t.id
+                     WHERE t.meeting_id = ?",
+                )
                     .bind(meeting_id)
                     .fetch_all(&mut *transaction)
                     .await?;
@@ -92,6 +97,8 @@ impl MeetingsRepository {
                     audio_start_time: t.audio_start_time,
                     audio_end_time: t.audio_end_time,
                     duration: t.duration,
+                    speaker_key: t.speaker_key,
+                    speaker_overlap: t.speaker_overlap,
                 })
                 .collect::<Vec<_>>();
 
@@ -128,6 +135,17 @@ impl MeetingsRepository {
         Ok(meeting)
     }
 
+    /// End of the meeting's last timed transcript segment, in seconds; `None` without one
+    pub async fn get_last_audio_end_time(
+        pool: &SqlitePool,
+        meeting_id: &str,
+    ) -> Result<Option<f64>, SqlxError> {
+        sqlx::query_scalar("SELECT MAX(audio_end_time) FROM transcripts WHERE meeting_id = ?")
+            .bind(meeting_id)
+            .fetch_one(pool)
+            .await
+    }
+
     /// Get meeting transcripts with pagination support
     pub async fn get_meeting_transcripts_paginated(
         pool: &SqlitePool,
@@ -151,9 +169,11 @@ impl MeetingsRepository {
 
         // Get paginated transcripts ordered by audio_start_time
         let transcripts = sqlx::query_as::<_, Transcript>(
-            "SELECT * FROM transcripts
-             WHERE meeting_id = ?
-             ORDER BY audio_start_time ASC
+            "SELECT t.*, ts.speaker_key AS speaker_key, ts.overlap AS speaker_overlap
+             FROM transcripts t
+             LEFT JOIN transcript_speakers ts ON ts.transcript_id = t.id
+             WHERE t.meeting_id = ?
+             ORDER BY t.audio_start_time ASC
              LIMIT ? OFFSET ?"
         )
         .bind(meeting_id)

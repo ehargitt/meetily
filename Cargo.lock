@@ -3637,6 +3637,7 @@ dependencies = [
  "infer 0.15.0",
  "lazy_static",
  "log",
+ "meetily-diarization",
  "memory-stats",
  "ndarray",
  "nnnoiseless",
@@ -3684,6 +3685,26 @@ dependencies = [
  "whisper-rs",
  "xz2",
  "zip 2.4.2",
+]
+
+[[package]]
+name = "meetily-diarization"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "hound",
+ "log",
+ "ndarray",
+ "ort",
+ "rayon",
+ "realfft",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

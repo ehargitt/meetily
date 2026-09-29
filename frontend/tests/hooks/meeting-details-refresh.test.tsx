@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from 'b
 import { useEffect } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import type { SummaryProcessResponse } from '../../src/types';
+import { recordingStateModule } from '../support/recording-state-mock';
 
 const originalCore = { ...await import('@tauri-apps/api/core') };
 const originalAnalytics = { ...await import('../../src/lib/analytics') };
@@ -9,6 +10,7 @@ const originalPreferences = { ...await import('../../src/lib/summary-language-pr
 const originalToast = { ...await import('sonner') };
 const originalNavigation = { ...await import('next/navigation') };
 const originalConfig = { ...await import('../../src/contexts/ConfigContext') };
+const originalPageContent = { ...await import('../../src/app/meeting-details/page-content') };
 afterAll(() => {
   mock.module('@tauri-apps/api/core', () => originalCore);
   mock.module('../../src/lib/analytics', () => originalAnalytics);
@@ -16,6 +18,7 @@ afterAll(() => {
   mock.module('sonner', () => originalToast);
   mock.module('next/navigation', () => originalNavigation);
   mock.module('../../src/contexts/ConfigContext', () => originalConfig);
+  mock.module('../../src/app/meeting-details/page-content', () => originalPageContent);
 });
 
 let selectedMeeting = 'meeting-a';
@@ -23,7 +26,7 @@ mock.module('next/navigation', () => ({
   usePathname: () => '/meeting-details', useRouter: () => ({}),
   useSearchParams: () => new URLSearchParams({ id: selectedMeeting }),
 }));
-mock.module('../../src/contexts/RecordingStateContext', () => ({ useRecordingState: () => ({ isRecording: false }) }));
+mock.module('../../src/contexts/RecordingStateContext', () => recordingStateModule());
 mock.module('../../src/contexts/ConfigContext', () => ({ useConfig: () => ({ isAutoSummary: false }) }));
 const notify = mock(() => {});
 mock.module('sonner', () => ({ toast: { info: notify, error: notify, success: notify, warning: notify } }));
@@ -48,6 +51,7 @@ const invoke = mock(async (command: string, args?: Record<string, unknown>): Pro
   if (command === 'api_get_summary') return { ...savedSummary, meeting_id: args!.meetingId };
   if (command === 'api_get_meeting_metadata') return readMetadata(args!.meetingId as string);
   if (command === 'api_get_meeting_transcripts') return readTranscripts(args!.meetingId as string);
+  if (command === 'api_get_meeting_speakers') return [];
   if (command === 'api_process_transcript') return { process_id: 'attempt-b' };
   if (command === 'api_cancel_summary') return { cancelled: true };
   throw new Error(`Unexpected command: ${command}`);

@@ -147,6 +147,22 @@ describe('paginated transcript request ownership', () => {
     expect(state.transcripts[0].text).toBe('fresh');
   });
 
+  test('speaker key and overlap pass through to display segments', async () => {
+    await show('A');
+    await resolve(request('metadata', 'A'), metadata('A'));
+    await resolve(request('transcripts', 'A'), {
+      transcripts: [
+        { id: 'a1', text: 'labelled', timestamp: '00:00', audio_start_time: 0, speaker_key: 'S2', speaker_overlap: 0.42 },
+        { id: 'a2', text: 'unlabelled', timestamp: '00:05', audio_start_time: 5 },
+      ],
+      total_count: 2, has_more: false,
+    } satisfies PaginatedTranscriptsResponse);
+    expect(state.segments.map(({ id, speakerKey, speakerOverlap }) => ({ id, speakerKey, speakerOverlap }))).toEqual([
+      { id: 'a1', speakerKey: 'S2', speakerOverlap: 0.42 },
+      { id: 'a2', speakerKey: undefined, speakerOverlap: undefined },
+    ]);
+  });
+
   test('unmount prevents a pending metadata read from starting transcript IPC', async () => {
     await show('A');
     const stale = request('metadata', 'A');

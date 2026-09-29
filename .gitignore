@@ -47,6 +47,7 @@ next-env.d.ts
 
 # Audio files
 *.wav
+!diarization/tests/fixtures/*.wav
 
 # Large media files
 docs/demo.mov

@@ -79,6 +79,9 @@ fn should_retry_chunk_failure(
 const ENGLISH_BASE_SUMMARY_INSTRUCTION: &str =
     "**Write the summary/report in English regardless of transcript language; non-English prose is invalid.**";
 
+/// Transcripts with identified speakers arrive as `[MM:SS] Name: text` lines.
+const SPEAKER_ATTRIBUTION_RULE: &str = "Transcript lines may look like `[MM:SS] Name: text`, where Name is the speaker. Attribute decisions and action items to that Name. \"Me\" is the person who recorded the meeting. Keep labels such as \"Speaker 2\" verbatim and never invent names.";
+
 fn resolve_cached_english<'a>(
     cached: Option<&'a str>,
     summary_language: Option<&str>,
@@ -217,7 +220,7 @@ fn translation_system_prompt(target_language: &str) -> String {
 
 fn build_chunk_summary_user_prompt(chunk: &str) -> String {
     format!(
-        "{ENGLISH_BASE_SUMMARY_INSTRUCTION}\n\nProvide a concise but comprehensive summary of the following transcript chunk. Capture all key points, decisions, action items, and mentioned individuals. Do not include reasoning, self-correction, or meta-commentary — output only the summary content.\n\n<transcript_chunk>\n{chunk}\n</transcript_chunk>"
+        "{ENGLISH_BASE_SUMMARY_INSTRUCTION}\n\nProvide a concise but comprehensive summary of the following transcript chunk. Capture all key points, decisions, action items, and mentioned individuals. {SPEAKER_ATTRIBUTION_RULE} Do not include reasoning, self-correction, or meta-commentary — output only the summary content.\n\n<transcript_chunk>\n{chunk}\n</transcript_chunk>"
     )
 }
 
@@ -242,6 +245,7 @@ fn build_final_report_system_prompt(
 6. Output **only** the completed Markdown report.
 7. Do not include reasoning, thinking, self-correction, decision strategy, or any meta-commentary sections — output only the completed Markdown report.
 8. If unsure about something, omit it.
+9. {SPEAKER_ATTRIBUTION_RULE}
 
 **SECTION-SPECIFIC INSTRUCTIONS:**
 {section_instructions}
@@ -267,7 +271,7 @@ pub fn rough_token_count(s: &str) -> usize {
 /// * `overlap_tokens` - Number of overlapping tokens between chunks
 ///
 /// # Returns
-/// Vector of text chunks with smart word-boundary splitting
+/// Vector of text chunks split at a line, sentence or word boundary (in that preference)
 pub fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -> Vec<String> {
     info!(
         "Chunking text with token-based chunk_size: {} and overlap: {}",
@@ -304,16 +308,18 @@ pub fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -
         let start_byte: usize = chars[..start_char].iter().map(|c| c.len_utf8()).sum();
         let mut end_byte: usize = chars[..end_char].iter().map(|c| c.len_utf8()).sum();
 
-        // Try to break at sentence or word boundary for cleaner chunks
+        // Break at a line, sentence or word boundary, in that order of preference. Ending on
+        // a line break, and starting the next chunk on a line start (below), keeps each
+        // "[MM:SS] Name: text" line together with its speaker label.
         if end_char < total_chars {
             let slice = &text[start_byte..end_byte];
+            let line_boundary = slice.rfind('\n').map(|index| index + 1);
             let sentence_boundary = slice.rfind(". ").map(|index| index + 2);
             let word_boundary = slice.rfind(' ').map(|index| index + 1);
-            let boundary = sentence_boundary
-                .filter(|end| slice[..*end].chars().count() > overlap_chars)
-                .or_else(|| {
-                    word_boundary.filter(|end| slice[..*end].chars().count() > overlap_chars)
-                });
+            let boundary = [line_boundary, sentence_boundary, word_boundary]
+                .into_iter()
+                .flatten()
+                .find(|end| slice[..*end].chars().count() > overlap_chars);
 
             if let Some(boundary) = boundary {
                 end_byte = start_byte + boundary;
@@ -328,13 +334,28 @@ pub fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -
             break;
         }
 
-        start_char = emitted_end_char
+        let overlap_start = emitted_end_char
             .saturating_sub(overlap_chars)
             .max(start_char + 1);
+        start_char = line_start_near(&chars, overlap_start, start_char, emitted_end_char);
     }
 
     info!("Created {} chunks from text", chunks.len());
     chunks
+}
+
+/// Where the next chunk starts: the start of the line containing `position` when that is past
+/// `chunk_start` (so chunking progresses), else the next line start up to `chunk_end`, else
+/// `position` itself (text without line breaks).
+fn line_start_near(chars: &[char], position: usize, chunk_start: usize, chunk_end: usize) -> usize {
+    let is_break = |c: &char| *c == '\n';
+    if let Some(offset) = chars[chunk_start..position].iter().rposition(is_break) {
+        return chunk_start + offset + 1;
+    }
+    chars[position..chunk_end]
+        .iter()
+        .position(is_break)
+        .map_or(position, |offset| position + offset + 1)
 }
 
 /// Extracts meeting name from the first heading in markdown
@@ -666,6 +687,58 @@ mod tests {
     #[test]
     fn chunk_text_progresses_when_overlap_matches_window() {
         assert_eq!(chunk_text("abcd", 1, 1), vec!["abc", "bcd"]);
+    }
+
+    #[test]
+    fn chunk_text_prefers_line_boundary_over_later_sentence_boundary() {
+        let text = "[00:01] A: hi\n[00:05] B: Yes. More words follow here";
+
+        let chunks = chunk_text(text, 11, 0);
+
+        assert_eq!(chunks[0], "[00:01] A: hi\n");
+        assert!(chunks[1].starts_with("[00:05] B: "), "{chunks:?}");
+    }
+
+    #[test]
+    fn chunk_text_starts_every_chunk_on_a_labelled_line() {
+        let text: String = (0..400)
+            .map(|i| format!("[{:02}:{:02}] Speaker {}: ship the release on friday and bob owns the notes\n", i / 60, i % 60, i % 3))
+            .collect();
+
+        let chunks = chunk_text(&text, 3700, 100);
+
+        assert!(chunks.len() > 1, "{}", chunks.len());
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert!(chunk.starts_with('['), "chunk {index} starts mid-line: {:?}", &chunk[..40]);
+        }
+        assert!(chunks.windows(2).all(|pair| pair[0].ends_with('\n')), "chunks end on a line break");
+    }
+
+    #[test]
+    fn chunk_text_start_moves_forward_to_a_line_start_when_the_line_began_in_the_previous_chunk() {
+        // The overlap point lies inside the chunk's first line, so the next chunk starts on the
+        // following line instead of before the previous chunk's start.
+        let text = format!("[00:01] A: {}\n[00:02] B: short\n[00:03] C: {}", "x".repeat(30), "y".repeat(40));
+
+        let chunks = chunk_text(&text, 20, 10);
+
+        assert_eq!(chunks.len(), 3, "{chunks:?}");
+        assert!(chunks[1].starts_with("[00:02] B: "), "{chunks:?}");
+        // Chunk 1 cannot end on a line break past the overlap, so it is cut mid-line inside the
+        // "[00:03]" line; the overlap point lies in that line, so chunk 2 starts on it.
+        assert_eq!(chunks[2], format!("[00:03] C: {}", "y".repeat(40)), "{chunks:?}");
+    }
+
+    #[test]
+    fn chunk_prompt_attributes_to_named_speakers() {
+        let prompt = build_chunk_summary_user_prompt("[00:01] Alice: ship it");
+        assert!(prompt.contains(SPEAKER_ATTRIBUTION_RULE));
+    }
+
+    #[test]
+    fn final_report_prompt_attributes_to_named_speakers() {
+        let prompt = build_final_report_system_prompt("Fill", "# Title");
+        assert!(prompt.contains(SPEAKER_ATTRIBUTION_RULE));
     }
 
     #[test]

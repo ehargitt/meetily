@@ -41,6 +41,7 @@ pub mod audio;
 pub mod config;
 pub mod console_utils;
 pub mod database;
+pub mod diarization;
 pub mod notifications;
 pub mod ollama;
 pub mod onboarding;
@@ -830,6 +831,17 @@ pub fn run() {
             audio::import::start_import_audio_command,
             audio::import::cancel_import_command,
             audio::import::is_import_in_progress_command,
+            // Speaker identification commands
+            diarization::commands::start_speaker_identification,
+            diarization::commands::cancel_speaker_identification,
+            diarization::commands::get_speaker_identification_status,
+            diarization::commands::api_get_meeting_speakers,
+            diarization::commands::api_update_meeting_speaker,
+            diarization::commands::api_merge_meeting_speakers,
+            diarization::commands::forget_self_voiceprint,
+            diarization::commands::get_diarization_models_status,
+            diarization::commands::download_diarization_models,
+            diarization::commands::cancel_diarization_models_download,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

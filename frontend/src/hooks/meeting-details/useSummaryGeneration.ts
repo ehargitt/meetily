@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import {
   CancelSummaryResponse,
+  MeetingSpeaker,
   MeetingSummary,
   ProcessTranscriptResponse,
   SummaryProcessResponse,
@@ -18,6 +19,8 @@ import {
   readCachedDetectedSummaryLanguage,
 } from '@/lib/summary-language-preferences';
 import { parseSummaryContent, readSummaryMetadata } from '@/lib/summary-content';
+import { formatTranscriptForSummary } from '@/lib/transcript-format';
+import { fetchMeetingSpeakers } from './useMeetingSpeakers';
 
 async function resolveSummaryLanguage(
   meetingId: string,
@@ -55,6 +58,14 @@ async function resolveSummaryLanguage(
 }
 
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
+
+export interface GenerateSummaryOptions {
+  /**
+   * Start the summary even if the page unmounts first. It then runs in Rust unobserved, and the
+   * page picks it up again from the saved summary status when the meeting is reopened.
+   */
+  survivesUnmount?: boolean;
+}
 
 function restoredSummaryStatus(response?: SummaryProcessResponse | null): SummaryStatus {
   if (!response) return 'idle';
@@ -309,11 +320,13 @@ export function useSummaryGeneration({
     transcriptTexts,
     customPrompt = '',
     isRegeneration = false,
+    survivesUnmount = false,
   }: {
     transcriptText: string;
     transcriptTexts?: string[];
     customPrompt?: string;
     isRegeneration?: boolean;
+    survivesUnmount?: boolean;
   }) => {
     const previousAttempt = trackedAttemptRef.current;
     if (previousAttempt && !previousAttempt.finished) {
@@ -357,7 +370,8 @@ export function useSummaryGeneration({
         meeting.id,
         transcriptTexts?.length ? transcriptTexts : [transcriptText],
       );
-      if (!mountedRef.current || visibleMeetingIdRef.current !== meeting.id || generationId !== generationIdRef.current) {
+      const leftPage = !mountedRef.current || visibleMeetingIdRef.current !== meeting.id;
+      if (generationId !== generationIdRef.current || (leftPage && !survivesUnmount)) {
         return;
       }
 
@@ -433,22 +447,11 @@ export function useSummaryGeneration({
     }
   }, []);
 
-  const buildSummaryTranscriptPayload = useCallback((allTranscripts: Transcript[]) => {
-    const formatTime = (seconds: number | undefined, fallbackTimestamp: string): string => {
-      if (seconds === undefined) {
-        return fallbackTimestamp;
-      }
-      const totalSecs = Math.floor(seconds);
-      return `[${Math.floor(totalSecs / 60).toString().padStart(2, '0')}:${(totalSecs % 60).toString().padStart(2, '0')}]`;
-    };
-
-    return {
-      transcriptText: allTranscripts
-        .map((transcript) => `${formatTime(transcript.audio_start_time, transcript.timestamp)} ${transcript.text}`)
-        .join('\n'),
-      transcriptTexts: allTranscripts.map((transcript) => transcript.text),
-    };
-  }, []);
+  // Speaker names go only into the summary text; language detection sees the spoken words alone.
+  const buildSummaryTranscriptPayload = useCallback((allTranscripts: Transcript[], speakers: MeetingSpeaker[]) => ({
+    transcriptText: formatTranscriptForSummary(allTranscripts, speakers),
+    transcriptTexts: allTranscripts.map((transcript) => transcript.text),
+  }), []);
 
   const showPreflightError = useCallback((message: string) => {
     setSummaryError(message);
@@ -456,7 +459,10 @@ export function useSummaryGeneration({
     toast.error(message);
   }, []);
 
-  const handleGenerateSummary = useCallback(async (customPrompt: string = '') => {
+  const handleGenerateSummary = useCallback(async (
+    customPrompt: string = '',
+    { survivesUnmount = false }: GenerateSummaryOptions = {},
+  ) => {
     if (isModelConfigLoading) {
       toast.info('Loading model configuration, please wait...');
       return;
@@ -499,9 +505,11 @@ export function useSummaryGeneration({
       return;
     }
 
+    const speakers = await fetchMeetingSpeakers(meeting.id);
     await processSummary({
-      ...buildSummaryTranscriptPayload(allTranscripts),
+      ...buildSummaryTranscriptPayload(allTranscripts, speakers),
       customPrompt,
+      survivesUnmount,
     });
   }, [
     buildSummaryTranscriptPayload,
@@ -524,8 +532,9 @@ export function useSummaryGeneration({
       return;
     }
 
+    const speakers = await fetchMeetingSpeakers(meeting.id);
     await processSummary({
-      ...buildSummaryTranscriptPayload(allTranscripts),
+      ...buildSummaryTranscriptPayload(allTranscripts, speakers),
       isRegeneration: true
     });
   }, [meeting.id, fetchAllTranscripts, buildSummaryTranscriptPayload, processSummary]);
