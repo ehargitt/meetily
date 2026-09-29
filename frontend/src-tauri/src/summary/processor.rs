@@ -87,8 +87,8 @@ struct LlmCall<'a> {
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     top_p: Option<f32>,
-    /// The context window chunking assumed, requested from Ollama as `num_ctx`.
-    num_ctx: Option<usize>,
+    /// The window and output reserve chunking assumed; Ollama receives them as options.
+    context_budget: Option<ContextBudget>,
     app_data_dir: Option<&'a PathBuf>,
     cancellation_token: Option<&'a CancellationToken>,
 }
@@ -107,7 +107,7 @@ impl LlmCall<'_> {
             self.max_tokens,
             self.temperature,
             self.top_p,
-            self.num_ctx,
+            self.context_budget,
             self.app_data_dir,
             self.cancellation_token,
         )
@@ -459,6 +459,11 @@ fn group_within_budget(summaries: &[String], content_tokens: usize) -> Vec<Range
     groups
 }
 
+/// Consecutive pairs `0..2, 2..4, …`, the last group holding one summary when `len` is odd.
+fn pairwise_groups(len: usize) -> Vec<Range<usize>> {
+    (0..len).step_by(2).map(|start| start..(start + 2).min(len)).collect()
+}
+
 /// Merges chunk summaries into one in rounds, each request carrying only as many summaries as
 /// fit `content_tokens`, so a long meeting's summaries never overflow the combine prompt.
 async fn combine_chunk_summaries(
@@ -470,11 +475,13 @@ async fn combine_chunk_summaries(
     while summaries.len() > 1 {
         let mut groups = group_within_budget(&summaries, content_tokens);
         if groups.len() == summaries.len() {
+            // Pairs still halve the count each round and overflow far less than one request
+            // holding every summary would.
             warn!(
                 summaries = summaries.len(),
-                content_tokens, "No two chunk summaries fit one request; combining all at once"
+                content_tokens, "No two chunk summaries fit one request; combining them in pairs"
             );
-            groups = vec![0..summaries.len()];
+            groups = pairwise_groups(summaries.len());
         }
         info!(
             summaries = summaries.len(),
@@ -574,7 +581,7 @@ pub(crate) async fn generate_meeting_summary(
         max_tokens,
         temperature,
         top_p,
-        num_ctx: context_budget.map(|budget| budget.context_tokens),
+        context_budget,
         app_data_dir,
         cancellation_token,
     };
@@ -605,7 +612,7 @@ pub(crate) async fn generate_meeting_summary(
                 info!(
                     total_tokens,
                     content_limit,
-                    num_ctx = llm.num_ctx,
+                    num_ctx = context_budget.map(|budget| budget.context_tokens),
                     "Transcript exceeds one request; summarizing in chunks"
                 );
                 let chunks = chunk_text(text, content_limit, CHUNK_OVERLAP_TOKENS);
@@ -866,6 +873,12 @@ mod tests {
         assert!(group_within_budget(&[], 10).is_empty());
     }
 
+    #[test]
+    fn oversized_summaries_fall_back_to_pairs() {
+        assert_eq!(pairwise_groups(5), vec![0..2, 2..4, 4..5]);
+        assert_eq!(pairwise_groups(2), vec![0..2]);
+    }
+
     fn test_template() -> Template {
         Template {
             name: "Test".to_string(),
@@ -880,8 +893,13 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn ollama_requests_carry_the_chunking_num_ctx_and_fit_it() {
+    /// Runs a summary of `transcript` against a fake Ollama server whose every reply is
+    /// `reply_words` words long, returning the result and every request body it received.
+    async fn summarize_with_fake_ollama(
+        budget: ContextBudget,
+        transcript: &str,
+        reply_words: usize,
+    ) -> (Result<GeneratedMeetingSummary, String>, Vec<serde_json::Value>) {
         use crate::summary::llm_client::test_http::{read_http_request, request_json, write_json_response};
         use std::sync::{Arc, Mutex};
 
@@ -889,9 +907,8 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
         let recorded = bodies.clone();
-        // Every reply is ~1500 tokens, so chunk summaries need more than one combine round.
         let reply = serde_json::json!({
-            "message": {"role": "assistant", "content": format!("# Title\n## Summary\n{}", "word ".repeat(850))},
+            "message": {"role": "assistant", "content": format!("# Title\n## Summary\n{}", "word ".repeat(reply_words))},
             "done": true
         })
         .to_string();
@@ -904,19 +921,13 @@ mod tests {
             }
         });
 
-        let budget = ContextBudget::for_ollama(8192);
-        let transcript: String = (0..1200)
-            .map(|i| format!("[{:02}:{:02}] Speaker {}: we agreed to ship the release on friday and bob owns the notes\n", i / 60 % 60, i % 60, i % 3))
-            .collect();
-        assert!(rough_token_count(&transcript) > 3 * budget.context_tokens);
-
         let client = Client::new();
         let result = generate_meeting_summary(
             &client,
             &LLMProvider::Ollama,
             "llama3.1:8b",
             "",
-            &transcript,
+            transcript,
             "",
             "test",
             &test_template(),
@@ -934,23 +945,60 @@ mod tests {
         )
         .await;
         server.abort();
+        let bodies = bodies.lock().unwrap().clone();
+        (result, bodies)
+    }
+
+    fn long_transcript(lines: usize) -> String {
+        (0..lines)
+            .map(|i| format!("[{:02}:{:02}] Speaker {}: we agreed to ship the release on friday and bob owns the notes\n", i / 60 % 60, i % 60, i % 3))
+            .collect()
+    }
+
+    fn combine_prompts(bodies: &[serde_json::Value]) -> Vec<&str> {
+        bodies
+            .iter()
+            .filter(|body| body["messages"][0]["content"] == COMBINE_SYSTEM_PROMPT)
+            .map(|body| body["messages"][1]["content"].as_str().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn ollama_requests_carry_the_chunking_num_ctx_and_fit_it() {
+        let budget = ContextBudget::for_ollama(8192);
+        let transcript = long_transcript(1200);
+        assert!(rough_token_count(&transcript) > 3 * budget.context_tokens);
+
+        // Every reply is ~1500 tokens, so chunk summaries need more than one combine round.
+        let (result, bodies) = summarize_with_fake_ollama(budget, &transcript, 850).await;
 
         let generated = result.unwrap();
         assert!(generated.successful_chunk_count > 1);
-        let bodies = bodies.lock().unwrap();
-        let combine_requests = bodies
-            .iter()
-            .filter(|body| body["messages"][0]["content"] == COMBINE_SYSTEM_PROMPT)
-            .count();
+        let combine_requests = combine_prompts(&bodies).len();
         assert!(combine_requests > 1, "expected several combine requests, got {combine_requests}");
-        for body in bodies.iter() {
+        for body in &bodies {
             assert_eq!(body["options"]["num_ctx"], budget.context_tokens);
+            assert_eq!(body["options"]["num_predict"], budget.output_reserve_tokens);
             let prompt_tokens = rough_token_count(body["messages"][0]["content"].as_str().unwrap())
                 + rough_token_count(body["messages"][1]["content"].as_str().unwrap());
             assert!(
                 prompt_tokens + budget.output_reserve_tokens <= budget.context_tokens,
                 "{prompt_tokens} prompt tokens overflow the window"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn summaries_too_large_to_pair_are_combined_two_at_a_time() {
+        // A 4k window leaves ~2.4k content tokens; ~1.4k-token replies never fit two together.
+        let budget = ContextBudget::for_ollama(4096);
+        let (result, bodies) = summarize_with_fake_ollama(budget, &long_transcript(400), 800).await;
+
+        result.unwrap();
+        let prompts = combine_prompts(&bodies);
+        assert!(prompts.len() > 1, "{} combine requests", prompts.len());
+        for prompt in prompts {
+            assert!(prompt.matches(SUMMARY_SEPARATOR).count() <= 1, "more than two summaries in one request");
         }
     }
 
