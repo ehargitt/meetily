@@ -83,10 +83,13 @@ impl ContextBudget {
 
     /// Completion tokens a request with `prompt_tokens` of prompt may use: whatever the window
     /// leaves, and never less than the reserve (chunk-sized prompts leave about exactly that).
-    /// Small prompts such as the final report or a translation get the larger room.
+    /// Small prompts such as the final report or a translation get more, up to twice their
+    /// prompt plus the reserve: every later stage rewrites its input rather than expanding it,
+    /// and the bound keeps a looping model from running on through the whole window.
     pub fn output_room(&self, prompt_tokens: usize) -> usize {
         self.context_tokens
             .saturating_sub(prompt_tokens + CHAT_TEMPLATE_SLACK)
+            .min(2 * prompt_tokens + self.output_reserve_tokens)
             .max(self.output_reserve_tokens)
     }
 
@@ -158,7 +161,9 @@ mod tests {
     #[test]
     fn small_prompts_get_the_room_the_window_leaves() {
         let budget = ContextBudget::for_ollama(8192);
-        assert_eq!(budget.output_room(2000), 8192 - 2000 - CHAT_TEMPLATE_SLACK);
+        assert_eq!(budget.output_room(3000), 8192 - 3000 - CHAT_TEMPLATE_SLACK);
+        // A tiny prompt is bounded by twice its size plus the reserve, not the whole window.
+        assert_eq!(budget.output_room(1000), 2 * 1000 + budget.output_reserve_tokens);
         // A chunk-sized prompt leaves only the reserve, which is never cut further.
         assert_eq!(budget.output_room(budget.content_tokens(500) + 500), budget.output_reserve_tokens);
         assert_eq!(budget.output_room(10_000), budget.output_reserve_tokens);

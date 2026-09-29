@@ -9,17 +9,26 @@ use tracing::{info, warn};
 use crate::summary::context_budget::{rough_token_count, ContextBudget};
 
 const REQUEST_TIMEOUT_DURATION: Duration = Duration::from_secs(300);
-/// Slowest prompt-plus-output rate an Ollama request is given time for: roughly an 8B model
-/// on CPU or partly offloaded. A full 16k window then gets 300 s + 1024 s.
-const OLLAMA_MIN_TOKENS_PER_SEC: u64 = 16;
+/// Slowest rates an Ollama request is given time for: roughly an 8B model on CPU or partly
+/// offloaded, which reads a prompt far faster than it writes output.
+const OLLAMA_MIN_PROMPT_TOKENS_PER_SEC: u64 = 30;
+const OLLAMA_MIN_OUTPUT_TOKENS_PER_SEC: u64 = 5;
 
-/// Total time allowed for one request. Ollama gets extra time in proportion to its window,
-/// since each chunk now fills that window instead of being truncated to Ollama's default.
-fn request_timeout(provider: &LLMProvider, context_budget: Option<ContextBudget>) -> Duration {
+/// Total time allowed for one request. Ollama gets extra time for reading its
+/// `prompt_tokens`-long prompt and writing up to the `num_predict` it is given
+/// ([`ContextBudget::output_room`]), since requests now fill the window instead of being
+/// truncated to Ollama's default.
+fn request_timeout(
+    provider: &LLMProvider,
+    context_budget: Option<ContextBudget>,
+    prompt_tokens: usize,
+) -> Duration {
     match (provider, context_budget) {
         (LLMProvider::Ollama, Some(budget)) => {
+            let output_tokens = budget.output_room(prompt_tokens) as u64;
             REQUEST_TIMEOUT_DURATION
-                + Duration::from_secs(budget.context_tokens as u64 / OLLAMA_MIN_TOKENS_PER_SEC)
+                + Duration::from_secs(prompt_tokens as u64 / OLLAMA_MIN_PROMPT_TOKENS_PER_SEC)
+                + Duration::from_secs(output_tokens / OLLAMA_MIN_OUTPUT_TOKENS_PER_SEC)
         }
         _ => REQUEST_TIMEOUT_DURATION,
     }
@@ -514,7 +523,8 @@ pub(crate) async fn generate_summary(
 
     info!("🐞 LLM Request to {}: model={}", provider_name(provider), model_name);
 
-    let request_timeout = request_timeout(provider, context_budget);
+    let prompt_tokens = rough_token_count(system_prompt) + rough_token_count(user_prompt);
+    let request_timeout = request_timeout(provider, context_budget, prompt_tokens);
     // Send request with timeout and cancellation support
     let request_future = client
         .post(api_url.clone())
@@ -797,9 +807,9 @@ mod tests {
         assert_eq!(body["stream"], false);
         assert_eq!(body["think"], false);
         assert_eq!(body["options"]["num_ctx"], 16_384);
-        // A small prompt gets the room the window leaves, not just the 4096 reserve.
+        // A small prompt gets more than the 4096 reserve, bounded by twice its own size.
         let prompt_tokens = rough_token_count("sys") + rough_token_count("user");
-        assert_eq!(body["options"]["num_predict"], 16_384 - prompt_tokens - 64);
+        assert_eq!(body["options"]["num_predict"], 2 * prompt_tokens + 4096);
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["content"], "user");
         assert!(body.get("reasoning_effort").is_none());
@@ -808,13 +818,21 @@ mod tests {
     }
 
     #[test]
-    fn ollama_request_timeout_grows_with_its_context_window() {
+    fn ollama_request_timeout_covers_reading_the_prompt_and_writing_its_output_room() {
         let window = |tokens| Some(ContextBudget::for_ollama(tokens));
-        assert_eq!(request_timeout(&LLMProvider::Ollama, window(16_384)), Duration::from_secs(300 + 1024));
-        assert_eq!(request_timeout(&LLMProvider::Ollama, window(4096)), Duration::from_secs(300 + 256));
-        assert_eq!(request_timeout(&LLMProvider::Ollama, None), REQUEST_TIMEOUT_DURATION);
+        // A chunk-sized prompt at 16k leaves exactly the 4096 reserve: read it at 30/s, write at 5/s.
         assert_eq!(
-            request_timeout(&LLMProvider::OpenRouter, Some(ContextBudget::for_hosted_model(200_000))),
+            request_timeout(&LLMProvider::Ollama, window(16_384), 12_224),
+            Duration::from_secs(300 + 12_224 / 30 + 4096 / 5)
+        );
+        // A 3k final-report prompt at 16k may write up to 2 * 3000 + 4096 tokens.
+        assert_eq!(
+            request_timeout(&LLMProvider::Ollama, window(16_384), 3000),
+            Duration::from_secs(300 + 100 + 10_096 / 5)
+        );
+        assert_eq!(request_timeout(&LLMProvider::Ollama, None, 3000), REQUEST_TIMEOUT_DURATION);
+        assert_eq!(
+            request_timeout(&LLMProvider::OpenRouter, Some(ContextBudget::for_hosted_model(200_000)), 3000),
             REQUEST_TIMEOUT_DURATION
         );
     }

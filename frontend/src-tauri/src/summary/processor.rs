@@ -75,6 +75,11 @@ const CHUNK_OVERLAP_TOKENS: usize = 100;
 const CHUNK_SYSTEM_PROMPT: &str = "You are an expert meeting summarizer.";
 const COMBINE_SYSTEM_PROMPT: &str = "You are an expert at synthesizing meeting summaries.";
 const SUMMARY_SEPARATOR: &str = "\n---\n";
+/// Errors for stages whose output was cut off at the model's output limit. The final report's
+/// room grows as its prompt shrinks, so the template length and the model's window help there.
+const FINAL_REPORT_CUT_OFF: &str = "The final summary was cut off at the model's output limit. Try a shorter template or a model with a larger context window.";
+const TRANSLATION_CUT_OFF: &str = "the translated summary was cut off at the model's output limit";
+const NORMALIZATION_CUT_OFF: &str = "the English summary was cut off at the model's output limit";
 
 /// The model and connection settings shared by every request of one summary run.
 struct LlmCall<'a> {
@@ -114,21 +119,19 @@ impl LlmCall<'_> {
         .await
     }
 
-    /// Like [`Self::complete`], but a completion cut off at the output limit is an error: the
-    /// combine, final-report, translation and normalization outputs are saved or built on as
-    /// they are, so a cut one must not pass as complete. (A cut chunk summary only loses detail
-    /// of its chunk and is kept.)
+    /// Like [`Self::complete`], but a completion cut off at the output limit fails with
+    /// `cut_off_error`: the final-report, translation and normalization outputs are saved or
+    /// built on as they are, so a cut one must not pass as complete. (Chunk and combine stages
+    /// handle cut replies themselves.)
     async fn complete_whole(
         &self,
-        stage: &str,
         system_prompt: &str,
         user_prompt: &str,
+        cut_off_error: &str,
     ) -> Result<LlmCompletion, String> {
         let completion = self.complete(system_prompt, user_prompt).await?;
         if completion.truncated {
-            return Err(format!(
-                "{stage} was cut off at the model's output limit; try a model with a larger context window or a shorter template"
-            ));
+            return Err(cut_off_error.to_string());
         }
         Ok(completion)
     }
@@ -483,6 +486,14 @@ fn pairwise_groups(len: usize) -> Vec<Range<usize>> {
     (0..len).step_by(2).map(|start| start..(start + 2).min(len)).collect()
 }
 
+/// Chunk summaries merged into one.
+struct CombinedSummary {
+    markdown: String,
+    /// Some pair of summaries could not be merged within the model's output limit, so part of
+    /// that pair's merged text is missing.
+    truncated: bool,
+}
+
 /// Merges chunk summaries into one in rounds, each request carrying only as many summaries as
 /// fit `content_tokens`, so a long meeting's summaries never overflow the combine prompt.
 async fn combine_chunk_summaries(
@@ -490,7 +501,8 @@ async fn combine_chunk_summaries(
     mut summaries: Vec<String>,
     content_tokens: usize,
     reasoning_stripped: &mut bool,
-) -> Result<String, String> {
+) -> Result<CombinedSummary, String> {
+    let mut truncated = false;
     while summaries.len() > 1 {
         let mut groups = group_within_budget(&summaries, content_tokens);
         if groups.len() == summaries.len() {
@@ -513,21 +525,69 @@ async fn combine_chunk_summaries(
                 combined.push(std::mem::take(&mut summaries[group.start]));
                 continue;
             }
-            let prompt =
-                build_combine_summary_user_prompt(&summaries[group].join(SUMMARY_SEPARATOR));
-            let completion = llm
-                .complete_whole("Combined summary", COMBINE_SYSTEM_PROMPT, &prompt)
-                .await?;
-            let cleaned = clean_llm_markdown_detailed(&completion.content);
-            *reasoning_stripped |= completion.reasoning_stripped || cleaned.reasoning_stripped;
-            require_visible_markdown("Combined summary", &cleaned)?;
-            combined.push(cleaned.markdown);
+            let (merged, group_truncated) =
+                combine_group(llm, &summaries[group], reasoning_stripped).await?;
+            truncated |= group_truncated;
+            combined.extend(merged);
         }
         summaries = combined;
     }
-    summaries
+    let markdown = summaries
         .pop()
-        .ok_or_else(|| "Multi-level summarization failed: no chunk summaries to combine.".to_string())
+        .ok_or_else(|| "Multi-level summarization failed: no chunk summaries to combine.".to_string())?;
+    Ok(CombinedSummary { markdown, truncated })
+}
+
+/// Merges one group of summaries into one, or into fewer. A reply cut off at the output limit
+/// for a group of more than two is redone as pairs, whose smaller prompts leave more output
+/// room for less text. A cut-off pair keeps the text it produced and reports it as truncated:
+/// failing there would discard every chunk already summarized.
+async fn combine_group(
+    llm: &LlmCall<'_>,
+    group: &[String],
+    reasoning_stripped: &mut bool,
+) -> Result<(Vec<String>, bool), String> {
+    let (markdown, cut) = combine_request(llm, group, reasoning_stripped).await?;
+    if !cut {
+        return Ok((vec![markdown], false));
+    }
+    if group.len() <= 2 {
+        warn!("Merging two chunk summaries was cut off at the output limit; keeping the partial merge");
+        return Ok((vec![markdown], true));
+    }
+    warn!(
+        summaries = group.len(),
+        "Combined summary was cut off at the output limit; merging this group in pairs"
+    );
+    let mut merged = Vec::with_capacity(group.len().div_ceil(2));
+    let mut truncated = false;
+    for pair in pairwise_groups(group.len()) {
+        if pair.len() == 1 {
+            merged.push(group[pair.start].clone());
+            continue;
+        }
+        let (markdown, cut) = combine_request(llm, &group[pair], reasoning_stripped).await?;
+        if cut {
+            warn!("Merging two chunk summaries was cut off at the output limit; keeping the partial merge");
+        }
+        truncated |= cut;
+        merged.push(markdown);
+    }
+    Ok((merged, truncated))
+}
+
+/// One combine request: the merged markdown and whether it was cut off at the output limit.
+async fn combine_request(
+    llm: &LlmCall<'_>,
+    summaries: &[String],
+    reasoning_stripped: &mut bool,
+) -> Result<(String, bool), String> {
+    let prompt = build_combine_summary_user_prompt(&summaries.join(SUMMARY_SEPARATOR));
+    let completion = llm.complete(COMBINE_SYSTEM_PROMPT, &prompt).await?;
+    let cleaned = clean_llm_markdown_detailed(&completion.content);
+    *reasoning_stripped |= completion.reasoning_stripped || cleaned.reasoning_stripped;
+    require_visible_markdown("Combined summary", &cleaned)?;
+    Ok((cleaned.markdown, completion.truncated))
 }
 
 /// Where the next chunk starts: the start of the line containing `position` when that is past
@@ -565,6 +625,9 @@ pub(crate) struct GeneratedMeetingSummary {
     pub successful_chunk_count: i64,
     pub reasoning_stripped: bool,
     pub normalization_fallback: bool,
+    /// Merging chunk summaries hit the output limit and part of a merged pair was kept cut off
+    /// (see `combine_group`).
+    pub combine_truncated: bool,
 }
 
 /// Generates the meeting summary. With a `context_budget` (Ollama, BuiltInAI, and OpenRouter
@@ -612,14 +675,15 @@ pub(crate) async fn generate_meeting_summary(
     }
     info!("Starting summary generation with provider: {:?}, model: {}", provider, model_name);
 
-    let (mut english_markdown, successful_chunk_count, mut reasoning_stripped) =
+    let (mut english_markdown, successful_chunk_count, mut reasoning_stripped, combine_truncated) =
         if let Some(cached) = resolve_cached_english(cached_english, summary_language) {
             info!("✓ Using cached English summary ({} chars), skipping pass 1", cached.len());
-            (cached.to_string(), 1_i64, false)
+            (cached.to_string(), 1_i64, false, false)
         } else {
             let mut content_to_summarize = text.to_string();
             let successful_chunk_count;
             let mut stage_reasoning_stripped = false;
+            let mut combine_truncated = false;
 
             let final_system_prompt = build_final_report_system_prompt(
                 &template.to_section_instructions(),
@@ -698,13 +762,15 @@ pub(crate) async fn generate_meeting_summary(
                     return Err("Multi-level summarization failed: No chunks were processed successfully.".to_string());
                 }
                 successful_chunk_count = chunk_summaries.len() as i64;
-                content_to_summarize = combine_chunk_summaries(
+                let combined = combine_chunk_summaries(
                     &llm,
                     chunk_summaries,
                     content_limit,
                     &mut stage_reasoning_stripped,
                 )
                 .await?;
+                combine_truncated = combined.truncated;
+                content_to_summarize = combined.markdown;
             } else {
                 successful_chunk_count = 1;
             }
@@ -712,12 +778,12 @@ pub(crate) async fn generate_meeting_summary(
             info!("Generating final markdown report with template: {}", template_id);
             let final_user_prompt = build_final_report_user_prompt(&content_to_summarize, custom_prompt);
             let completion = llm
-                .complete_whole("Final summary", &final_system_prompt, &final_user_prompt)
+                .complete_whole(&final_system_prompt, &final_user_prompt, FINAL_REPORT_CUT_OFF)
                 .await?;
             let cleaned = clean_llm_markdown_detailed(&completion.content);
             stage_reasoning_stripped |= completion.reasoning_stripped || cleaned.reasoning_stripped;
             require_visible_markdown("Final summary", &cleaned)?;
-            (cleaned.markdown, successful_chunk_count, stage_reasoning_stripped)
+            (cleaned.markdown, successful_chunk_count, stage_reasoning_stripped, combine_truncated)
         };
 
     let (final_markdown, normalization_fallback) =
@@ -748,6 +814,7 @@ pub(crate) async fn generate_meeting_summary(
         successful_chunk_count,
         reasoning_stripped,
         normalization_fallback,
+        combine_truncated,
     })
 }
 
@@ -755,7 +822,7 @@ async fn run_markdown_transform(
     llm: &LlmCall<'_>,
     system_prompt: &str,
     user_prompt: &str,
-    failure_label: &str,
+    cut_off_error: &str,
 ) -> Result<CleanedLlmMarkdown, String> {
     if llm.is_cancelled() {
         return Err("Summary generation was cancelled".to_string());
@@ -763,9 +830,8 @@ async fn run_markdown_transform(
     // A cut-off normalization falls back to the intact pass-1 markdown; a cut-off translation
     // fails the summary.
     let completion = llm
-        .complete_whole(failure_label, system_prompt, user_prompt)
-        .await
-        .map_err(|error| format!("{failure_label} failed: {error}"))?;
+        .complete_whole(system_prompt, user_prompt, cut_off_error)
+        .await?;
     let mut cleaned = clean_llm_markdown_detailed(&completion.content);
     cleaned.reasoning_stripped |= completion.reasoning_stripped;
     Ok(cleaned)
@@ -780,7 +846,7 @@ async fn translate_markdown(
     let user_prompt = format!(
         "Translate the following Markdown document into {target_language}. Return ONLY the translated Markdown, nothing else.\n\n<document>\n{english_markdown}\n</document>"
     );
-    let cleaned = run_markdown_transform(llm, &system_prompt, &user_prompt, "Translation pass").await?;
+    let cleaned = run_markdown_transform(llm, &system_prompt, &user_prompt, TRANSLATION_CUT_OFF).await?;
     require_visible_markdown("Translation", &cleaned)?;
     Ok(cleaned)
 }
@@ -796,7 +862,7 @@ async fn normalize_markdown_to_english(
         llm,
         english_normalization_system_prompt(),
         &user_prompt,
-        "English normalization pass",
+        NORMALIZATION_CUT_OFF,
     )
     .await
 }
@@ -1040,7 +1106,74 @@ mod tests {
         .await;
 
         let error = result.unwrap_err();
-        assert!(error.contains("Final summary was cut off"), "{error}");
+        assert!(error.contains("final summary was cut off"), "{error}");
+    }
+
+    fn is_combine(body: &serde_json::Value) -> bool {
+        body["messages"][0]["content"] == COMBINE_SYSTEM_PROMPT
+    }
+
+    fn summaries_in(combine_prompt: &str) -> usize {
+        combine_prompt.matches(SUMMARY_SEPARATOR).count() + 1
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_combine_of_several_summaries_is_redone_in_pairs() {
+        // ~525-token chunk summaries all fit one 8k combine request, whose reply is cut off
+        // whenever it merges more than two.
+        let (result, bodies) = summarize_with_fake_ollama(
+            ContextBudget::for_ollama(8192),
+            &long_transcript(600),
+            Some("en"),
+            |body| {
+                let cut = is_combine(body)
+                    && summaries_in(body["messages"][1]["content"].as_str().unwrap()) > 2;
+                ollama_reply(300, if cut { "length" } else { "stop" })
+            },
+        )
+        .await;
+
+        let generated = result.unwrap();
+        assert!(!generated.combine_truncated);
+        let sizes: Vec<usize> = combine_prompts(&bodies).into_iter().map(summaries_in).collect();
+        assert!(sizes[0] > 2, "the first combine merges the whole group: {sizes:?}");
+        assert!(sizes[1..].iter().all(|&size| size == 2), "the retry merges pairs: {sizes:?}");
+        assert!(sizes.len() >= 3, "{sizes:?}");
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_pair_is_kept_and_flagged_instead_of_failing_the_summary() {
+        let (result, bodies) = summarize_with_fake_ollama(
+            ContextBudget::for_ollama(8192),
+            &long_transcript(600),
+            Some("en"),
+            |body| ollama_reply(300, if is_combine(body) { "length" } else { "stop" }),
+        )
+        .await;
+
+        let generated = result.unwrap();
+        assert!(generated.combine_truncated);
+        assert!(generated.successful_chunk_count > 2);
+        assert!(bodies.last().map(is_final_report).unwrap(), "the final report still runs");
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_translation_fails_with_one_clear_message() {
+        let (result, _) = summarize_with_fake_ollama(
+            ContextBudget::for_ollama(8192),
+            "[00:01] Alice: ship on friday\n",
+            Some("fr"),
+            |body| {
+                let translating = body["messages"][0]["content"] == translation_system_prompt("French");
+                ollama_reply(40, if translating { "length" } else { "stop" })
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            format!("Translation to French failed: {TRANSLATION_CUT_OFF}")
+        );
     }
 
     #[tokio::test]

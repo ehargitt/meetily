@@ -148,6 +148,7 @@ fn build_summary_result_json(
     output_language: Option<&str>,
     reasoning_stripped: bool,
     normalization_fallback: bool,
+    combine_truncated: bool,
 ) -> Result<serde_json::Value, String> {
     let cleaned_final = clean_llm_markdown_detailed(final_markdown);
     require_visible_markdown("Final summary", &cleaned_final)?;
@@ -170,6 +171,7 @@ fn build_summary_result_json(
             || cleaned_final.reasoning_stripped
             || cleaned_english.reasoning_stripped,
         "normalization_fallback": normalization_fallback,
+        "combine_truncated": combine_truncated,
     }))
 }
 
@@ -563,6 +565,7 @@ impl SummaryService {
                     summary_language.as_deref(),
                     generated.reasoning_stripped,
                     generated.normalization_fallback,
+                    generated.combine_truncated,
                 ) {
                     Ok(result) => result,
                     Err(error) => {
@@ -894,6 +897,7 @@ mod tests {
             Some("fr"),
             false,
             false,
+            false,
         )
         .unwrap()
         .to_string();
@@ -912,6 +916,7 @@ mod tests {
             "# Meeting\n## Points\nHello",
             source.clone(),
             Some("fr"),
+            false,
             false,
             false,
         )
@@ -933,6 +938,7 @@ mod tests {
             "# Meeting\n## Points\nHello",
             source,
             Some("fr"),
+            false,
             false,
             false,
         )
@@ -1058,6 +1064,7 @@ mod tests {
             Some("fr"),
             false,
             false,
+            false,
         )
         .unwrap()
         .to_string();
@@ -1081,6 +1088,7 @@ mod tests {
             "# Meeting\n## Points\nHello",
             source.clone(),
             Some("fr"),
+            false,
             false,
             false,
         )
@@ -1109,6 +1117,7 @@ mod tests {
             Some("fr"),
             false,
             false,
+            false,
         )
         .unwrap();
         let legacy_source = raw["english_cache"]["source"].as_object_mut().unwrap();
@@ -1128,6 +1137,7 @@ mod tests {
             "# English Title\n## Decisions\nDone",
             sample_cache_source(),
             Some("fr"),
+            false,
             false,
             false,
         )
@@ -1150,6 +1160,7 @@ mod tests {
                 None,
                 false,
                 false,
+                false,
             ),
             Err("Final summary contains no visible content after title removal".to_string())
         );
@@ -1164,10 +1175,27 @@ mod tests {
             None,
             true,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(result["reasoning_stripped"], true);
         assert!(result.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn result_json_records_a_cut_off_combine() {
+        let result = build_summary_result_json(
+            "# Title\nVisible",
+            "# Title\nVisible",
+            sample_cache_source(),
+            None,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(result["combine_truncated"], true);
+        assert_eq!(result["normalization_fallback"], false);
     }
 
     #[test]
