@@ -192,24 +192,11 @@ pub async fn generate_with_builtin(
 
     log::info!("Sending generation request to sidecar");
 
-    // Race between the request and cancellation token
-    let response_json = if let Some(token) = cancellation_token {
-        tokio::select! {
-            result = manager.request(model_path, request_json, timeout) => {
-                result?
-            }
-            _ = token.cancelled() => {
-                log::warn!("Generation cancelled by user, shutting down sidecar");
-                // Shutdown sidecar to stop generation immediately
-                if let Err(e) = manager.shutdown().await {
-                    log::error!("Failed to shutdown sidecar during cancellation: {}", e);
-                }
-                return Err(anyhow!("Generation cancelled by user"));
-            }
-        }
-    } else {
-        manager.request(model_path, request_json, timeout).await?
-    };
+    // Cancellation stops only this request: the sidecar is shut down only if it was generating
+    // for it, not while it serves another summary ahead in the queue
+    let response_json = manager
+        .request(model_path, request_json, timeout, cancellation_token)
+        .await?;
 
     // Check cancellation before parsing response
     if let Some(token) = cancellation_token {
