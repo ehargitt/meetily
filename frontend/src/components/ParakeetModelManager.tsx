@@ -263,7 +263,11 @@ export function ParakeetModelManager({
         apiKey: null
       });
     } catch (error) {
+      // The backend refuses a model switch while a recording uses the engine.
       console.error('Failed to save model selection:', error);
+      toast.error('Could not change the transcription model', {
+        description: error instanceof Error ? error.message : String(error),
+      });
     }
   };
 
