@@ -202,6 +202,31 @@ fn save_timeout_for(recorded_seconds: u64) -> std::time::Duration {
     BASE + std::time::Duration::from_secs(recorded_seconds / 4)
 }
 
+/// Upper bound on a whole stop of a recording that ran `recorded_seconds`: the
+/// transcription drain, the save, plus a margin for the stream stop and the
+/// config/analytics calls in between.
+fn stop_time_bound_for(recorded_seconds: u64) -> std::time::Duration {
+    const MARGIN: std::time::Duration = std::time::Duration::from_secs(120);
+    TRANSCRIPTION_DRAIN_TIMEOUT + save_timeout_for(recorded_seconds) + MARGIN
+}
+
+/// Length of the recording being stopped, captured when its stop began
+/// (the recording clock is cleared once the streams stop).
+static STOPPING_RECORDED_SECONDS: Mutex<Option<u64>> = Mutex::new(None);
+
+/// How long a stop of the current recording can take, whether it is still
+/// live or already stopping. Tray Quit waits this long.
+pub fn current_stop_time_bound() -> std::time::Duration {
+    let live = RECORDING_MANAGER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|manager| manager.get_recording_duration())
+        .map(|seconds| seconds as u64);
+    let stopping = *STOPPING_RECORDED_SECONDS.lock().unwrap_or_else(|e| e.into_inner());
+    stop_time_bound_for(live.or(stopping).unwrap_or(0))
+}
+
 /// When the last successful stop finished, and how many meetings the frontend
 /// had saved by then; its own save of that meeting comes after.
 #[derive(Debug, Clone, Copy)]
@@ -266,13 +291,14 @@ fn map_recording_start_error<R: Runtime>(
 
 /// Shared tail of both start commands, run once `RecordingManager::start_recording`
 /// has succeeded: refuse a recording that would save no audio, then install the
-/// manager globally, flip recording live and start transcription.
+/// manager globally, flip recording live and start transcription. Returns the
+/// transcription session id that this recording's `transcript-update`s carry.
 async fn activate_recording<R: Runtime>(
     app: &AppHandle<R>,
     mut manager: RecordingManager,
     transcription_receiver: tokio::sync::mpsc::UnboundedReceiver<super::AudioChunk>,
     auto_save: bool,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let saver_session = super::recording_saver::take_started_session();
 
     // With auto-save on, a missing meeting folder means the whole meeting's
@@ -291,6 +317,11 @@ async fn activate_recording<R: Runtime>(
             ));
         }
     }
+
+    // Nothing can fail from here on, so only now stop a previous recording's
+    // background transcription (a failed start leaves it running). The new
+    // pipeline's chunks wait in `transcription_receiver` meanwhile.
+    abandon_lingering_drain(app).await;
 
     // Take the device event receiver BEFORE storing manager globally.
     // A background task will process device events (hot-swap) without frontend polling.
@@ -330,7 +361,7 @@ async fn activate_recording<R: Runtime>(
         register_transcript_listener(app, saver_session.transcripts, session_id);
     }
 
-    Ok(())
+    Ok(session_id)
 }
 
 /// Save every `transcript-update` of transcription session `session_id` into
@@ -404,17 +435,27 @@ async fn close_transcript_listener(listener: TranscriptListener, unlisten: impl 
 /// loaded for the new recording.
 async fn abandon_lingering_drain<R: Runtime>(app: &AppHandle<R>) {
     use tauri::Listener;
+    abandon_lingering_drain_with(|id| app.unlisten(id)).await;
+}
+
+/// Before the app exits: stop a background transcription the same way a new
+/// recording does, so what it has transcribed so far reaches transcripts.json.
+pub async fn close_lingering_drain_for_exit<R: Runtime>(app: &AppHandle<R>) {
+    abandon_lingering_drain(app).await;
+}
+
+async fn abandon_lingering_drain_with(unlisten: impl FnOnce(tauri::EventId)) {
     let Some(drain) = LINGERING_DRAIN.lock().unwrap_or_else(|e| e.into_inner()).take() else {
         return;
     };
     if !drain.finisher.is_finished() {
-        warn!("Starting a new recording: abandoning the previous recording's unfinished transcription");
+        warn!("Abandoning the previous recording's unfinished background transcription");
     }
     drain.cancel.cancel();
     drain.transcription.abort();
     drain.finisher.abort();
     if let Some(listener) = drain.listener {
-        close_transcript_listener(listener, |id| app.unlisten(id)).await;
+        close_transcript_listener(listener, unlisten).await;
     }
 }
 
@@ -632,9 +673,6 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     }
     info!("✅ Transcription model validation passed");
 
-    // Only now that this start can proceed: stop a previous recording's background transcription.
-    abandon_lingering_drain(&app).await;
-
     // Notify frontend that startup has begun (surfaces STARTING state)
     app.emit("recording-starting", serde_json::json!({
         "message": "Recording initialization started"
@@ -692,14 +730,16 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         .await
         .map_err(|error| map_recording_start_error(&app, error))?;
 
-    activate_recording(&app, manager, transcription_receiver, auto_save).await?;
+    let session_id = activate_recording(&app, manager, transcription_receiver, auto_save).await?;
     drop(engine_lifecycle_guard);
 
     // Emit success event
     app.emit("recording-started", serde_json::json!({
         "message": "Recording started successfully with parallel processing",
         "devices": ["Default Microphone", "Default System Audio"],
-        "workers": transcription::TRANSCRIPTION_WORKERS
+        "workers": transcription::TRANSCRIPTION_WORKERS,
+        // The frontend keeps only transcript-updates carrying this id.
+        "session_id": session_id
     })).map_err(|e| e.to_string())?;
 
     // Update tray menu to reflect recording state
@@ -763,9 +803,6 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     }
     info!("✅ Transcription model validation passed");
 
-    // Only now that this start can proceed: stop a previous recording's background transcription.
-    abandon_lingering_drain(&app).await;
-
     // Notify frontend that startup has begun (surfaces STARTING state)
     app.emit("recording-starting", serde_json::json!({
         "message": "Recording initialization started"
@@ -820,7 +857,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         .await
         .map_err(|error| map_recording_start_error(&app, error))?;
 
-    activate_recording(&app, manager, transcription_receiver, auto_save).await?;
+    let session_id = activate_recording(&app, manager, transcription_receiver, auto_save).await?;
     drop(engine_lifecycle_guard);
 
     // Emit success event
@@ -830,7 +867,9 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             mic_device_name.unwrap_or_else(|| "Default Microphone".to_string()),
             system_device_name.unwrap_or_else(|| "Default System Audio".to_string())
         ],
-        "workers": transcription::TRANSCRIPTION_WORKERS
+        "workers": transcription::TRANSCRIPTION_WORKERS,
+        // The frontend keeps only transcript-updates carrying this id.
+        "session_id": session_id
     })).map_err(|e| e.to_string())?;
 
     // Update tray menu to reflect recording state
@@ -900,6 +939,12 @@ async fn stop_recording_tail<R: Runtime>(app: &AppHandle<R>) -> Result<(), Strin
 
     // Step 1: Stop audio capture immediately (no more new chunks)
     let taken_manager = RECORDING_MANAGER.lock().unwrap().take();
+    // Read before the streams stop: stopping clears the recording clock.
+    let recorded_seconds = taken_manager
+        .as_ref()
+        .and_then(|manager| manager.get_recording_duration())
+        .map_or(0, |seconds| seconds as u64);
+    *STOPPING_RECORDED_SECONDS.lock().unwrap() = Some(recorded_seconds);
     let manager_for_cleanup = match taken_manager {
         Some(mut manager) => {
             // Use FORCE FLUSH to immediately process all accumulated audio - eliminates 30s delay!
@@ -1042,9 +1087,8 @@ async fn stop_recording_tail<R: Runtime>(app: &AppHandle<R>) -> Result<(), Strin
         let meeting_folder = manager.get_meeting_folder();
         let meeting_name = manager.get_meeting_name();
 
-        // Checkpoints are 30 s each; the final encode takes time proportional to them.
-        let (checkpoints, _) = manager.get_recording_stats();
-        let save_timeout = save_timeout_for(checkpoints as u64 * 30);
+        // The final encode takes time proportional to the recording.
+        let save_timeout = save_timeout_for(recorded_seconds);
         match tokio::time::timeout(save_timeout, manager.save_recording_only(app)).await {
             Ok(Ok(_)) => {
                 info!("✅ Recording data saved successfully during cleanup");
@@ -1235,7 +1279,7 @@ async fn drain_transcription<R: Runtime>(app: &AppHandle<R>) {
                 app,
                 &snapshot,
                 format!(
-                    "Transcription could not keep up: {} of {} speech segments were not transcribed before the meeting was saved. They are still being transcribed in the background and will be added to transcripts.json in the meeting folder, unless a new recording starts first.",
+                    "Transcription could not keep up: {} of {} speech segments were not transcribed before the meeting was saved. They are still being transcribed in the background and will be added to transcripts.json in the meeting folder, unless a new recording starts or Meetily quits first.",
                     snapshot.not_transcribed(),
                     snapshot.queued
                 ),
@@ -1282,29 +1326,15 @@ fn finish_transcription_in_background<R: Runtime>(
     // Hold the slot while spawning so the finisher cannot look for its entry before it exists.
     let mut slot = LINGERING_DRAIN.lock().unwrap_or_else(|e| e.into_inner());
     let finisher = tokio::spawn(async move {
-        if let Err(e) = task_handle.await {
-            warn!("Background transcription ended with error: {:?}", e);
-        }
-        // The stop that spawned this is still saving and holds the stop guard;
-        // judge "is a recording using the model" only once it has finished.
-        wait_for_stop_to_finish().await;
-        // Serialized with starts, which abandon this drain under the same lock.
-        let _engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
-        let drain = LINGERING_DRAIN.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(listener) = drain.and_then(|d| d.listener) {
-            close_transcript_listener(listener, |id| app.unlisten(id)).await;
-        }
-
-        let snapshot = progress.snapshot();
-        info!(
-            "Background transcription finished: {}/{} chunks transcribed",
-            snapshot.completed, snapshot.queued
-        );
-        if transcription_engine_idle() {
-            unload_transcription_engine(&app, progress.engine_kind()).await;
-        } else {
-            info!("Keeping the transcription model loaded: a recording is using it");
-        }
+        let engine_kind = progress.engine_kind();
+        let unload_app = app.clone();
+        complete_lingering_drain(
+            task_handle,
+            &progress,
+            |id| app.unlisten(id),
+            || async move { unload_transcription_engine(&unload_app, engine_kind).await },
+        )
+        .await;
     });
     *slot = Some(LingeringDrain {
         finisher,
@@ -1312,6 +1342,44 @@ fn finish_transcription_in_background<R: Runtime>(
         cancel,
         listener,
     });
+}
+
+/// The finisher's work once its task is spawned, kept free of `AppHandle` so
+/// tests drive the real sequence: wait for the task, wait for the stop that
+/// spawned it, close the listener (flushing transcripts.json), then unload the
+/// model only if no recording is using it.
+async fn complete_lingering_drain<U, F>(
+    task: JoinHandle<()>,
+    progress: &TranscriptionProgress,
+    unlisten: impl FnOnce(tauri::EventId),
+    unload: U,
+) where
+    U: FnOnce() -> F,
+    F: std::future::Future<Output = ()>,
+{
+    if let Err(e) = task.await {
+        warn!("Background transcription ended with error: {:?}", e);
+    }
+    // The stop that spawned this is still saving and holds the stop guard;
+    // judge "is a recording using the model" only once it has finished.
+    wait_for_stop_to_finish().await;
+    // Serialized with starts, which abandon this drain under the same lock.
+    let _engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock().await;
+    let drain = LINGERING_DRAIN.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(listener) = drain.and_then(|d| d.listener) {
+        close_transcript_listener(listener, unlisten).await;
+    }
+
+    let snapshot = progress.snapshot();
+    info!(
+        "Background transcription finished: {}/{} chunks transcribed",
+        snapshot.completed, snapshot.queued
+    );
+    if transcription_engine_idle() {
+        unload().await;
+    } else {
+        info!("Keeping the transcription model loaded: a recording is using it");
+    }
 }
 
 /// Wait until no stop is running.
@@ -2135,28 +2203,86 @@ mod tests {
         assert!(StopGuard::try_acquire().is_some());
     }
 
-    #[tokio::test]
-    async fn background_finisher_waits_for_its_own_stop_before_deciding_to_unload() {
-        let _serial = STOP_FLAG_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        let stop = StopGuard::try_acquire().expect("no other stop in this test");
-        assert!(!transcription_engine_idle(), "the finishing stop still owns the engine");
+    /// A lingering drain whose listener store holds one segment written only
+    /// in memory (its debounced writer would not run for an hour).
+    fn install_lingering_drain(folder: &std::path::Path) -> CancellationToken {
+        let store = TranscriptStore::for_test(folder.to_path_buf());
+        store.upsert(segment_for_session(&update_payload(1, 1), 1).unwrap());
+        let cancel = CancellationToken::new();
+        let transcription = tokio::spawn(async {}).abort_handle();
+        *LINGERING_DRAIN.lock().unwrap() = Some(LingeringDrain {
+            finisher: tokio::spawn(async {}),
+            transcription,
+            cancel: cancel.clone(),
+            listener: Some(TranscriptListener { id: 9, store }),
+        });
+        cancel
+    }
 
-        let waiter = tokio::spawn(wait_for_stop_to_finish());
+    fn written_segments(folder: &std::path::Path) -> usize {
+        let json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(folder.join("transcripts.json")).expect("transcripts.json written"),
+        )
+        .unwrap();
+        json["segments"].as_array().unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn background_finisher_flushes_and_unloads_only_after_its_own_stop() {
+        let _serial = STOP_FLAG_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let folder = tempfile::tempdir().unwrap();
+        install_lingering_drain(folder.path());
+        let stop = StopGuard::try_acquire().expect("no other stop in this test");
+
+        let unloaded = Arc::new(AtomicBool::new(false));
+        let unlistened = Arc::new(Mutex::new(None));
+        let (unload_flag, unlisten_log) = (Arc::clone(&unloaded), Arc::clone(&unlistened));
+        let finisher = tokio::spawn(async move {
+            let progress = TranscriptionProgress::new();
+            complete_lingering_drain(
+                tokio::spawn(async {}),
+                &progress,
+                move |id| *unlisten_log.lock().unwrap() = Some(id),
+                move || async move { unload_flag.store(true, Ordering::SeqCst) },
+            )
+            .await;
+        });
+
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        assert!(!waiter.is_finished(), "must not decide while its own stop is saving");
+        assert!(!finisher.is_finished(), "must wait while its own stop is still saving");
+        assert!(!unloaded.load(Ordering::SeqCst));
 
         drop(stop);
-        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        tokio::time::timeout(std::time::Duration::from_secs(5), finisher)
             .await
-            .expect("stops waiting once the stop finished")
+            .expect("finishes once the stop has finished")
             .unwrap();
-        assert!(transcription_engine_idle(), "then the model is free to unload");
+        assert!(unloaded.load(Ordering::SeqCst), "the model is unloaded once nothing uses it");
+        assert_eq!(*unlistened.lock().unwrap(), Some(9));
+        assert_eq!(written_segments(folder.path()), 1, "the late segment reaches transcripts.json");
+        assert!(LINGERING_DRAIN.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn abandoning_a_drain_cancels_its_worker_and_flushes_its_transcripts() {
+        let _serial = STOP_FLAG_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let folder = tempfile::tempdir().unwrap();
+        let cancel = install_lingering_drain(folder.path());
+
+        let mut unlistened = None;
+        abandon_lingering_drain_with(|id| unlistened = Some(id)).await;
+
+        assert!(cancel.is_cancelled(), "the worker must be cancelled, not just detached");
+        assert_eq!(unlistened, Some(9));
+        assert_eq!(written_segments(folder.path()), 1);
+        assert!(LINGERING_DRAIN.lock().unwrap().is_none());
     }
 
     #[test]
     fn save_timeout_grows_with_the_recording_it_encodes() {
         assert_eq!(save_timeout_for(0).as_secs(), 300);
         assert_eq!(save_timeout_for(2 * 3600).as_secs(), 300 + 1800);
+        assert_eq!(stop_time_bound_for(2 * 3600).as_secs(), 600 + 300 + 1800 + 120);
     }
 
     fn update_payload(session_id: u64, sequence_id: u64) -> String {

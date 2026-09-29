@@ -805,10 +805,11 @@ impl WhisperEngine {
         }
         let mut result = String::new();
 
-        for (i, segment_text) in segments.iter().enumerate() {
+        // `_segment_index` is only read by perf_trace!, which compiles out in release.
+        for (_segment_index, segment_text) in segments.iter().enumerate() {
             // Only log segments for very long audio (>30s) to avoid hot-path I/O
             if duration_seconds > 30.0 {
-                perf_trace!("Segment {}: '{}'", i, segment_text);
+                perf_trace!("Segment {}: '{}'", _segment_index, segment_text);
             }
 
             // Clean and append segment text

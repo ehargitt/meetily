@@ -222,6 +222,11 @@ impl IncrementalAudioSaver {
     pub fn get_checkpoint_count(&self) -> u32 {
         self.checkpoint_count
     }
+
+    /// Audio is buffered that no checkpoint holds yet.
+    pub fn has_unsaved_audio(&self) -> bool {
+        !self.pending.is_empty()
+    }
 }
 
 /// Write mono samples as a 16-bit PCM WAV via a temp file and rename, so a

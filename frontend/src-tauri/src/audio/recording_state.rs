@@ -148,8 +148,40 @@ pub struct RecordingState {
     // Recording start time for accurate timestamps
     recording_start: Mutex<Option<Instant>>,
     // Pause time tracking
-    pause_start: Mutex<Option<Instant>>,
-    total_pause_duration: Mutex<std::time::Duration>,
+    pause_clock: Mutex<PauseClock>,
+}
+
+/// Pause bookkeeping kept under one lock. Capture timestamps are computed from
+/// it on the audio threads while pause/resume run on another; with the two
+/// fields under separate locks a reader could see the pause already ended but
+/// not yet added to the total, and time jumped ahead by the whole pause.
+#[derive(Debug, Default, Clone, Copy)]
+struct PauseClock {
+    /// When the current pause began; `None` while not paused.
+    pause_start: Option<Instant>,
+    /// Sum of all finished pauses.
+    total: Duration,
+}
+
+impl PauseClock {
+    fn pause(&mut self, now: Instant) {
+        self.pause_start.get_or_insert(now);
+    }
+
+    /// End the current pause; returns its length.
+    fn resume(&mut self, now: Instant) -> Option<Duration> {
+        let paused_for = now.saturating_duration_since(self.pause_start.take()?);
+        self.total += paused_for;
+        Some(paused_for)
+    }
+
+    /// Time spent paused up to `now`, including a pause still in progress.
+    fn paused_until(&self, now: Instant) -> Duration {
+        self.total
+            + self
+                .pause_start
+                .map_or(Duration::ZERO, |start| now.saturating_duration_since(start))
+    }
 }
 
 impl RecordingState {
@@ -172,8 +204,7 @@ impl RecordingState {
             capture_failed: AtomicBool::new(false),
             stats: Mutex::new(RecordingStats::default()),
             recording_start: Mutex::new(None),
-            pause_start: Mutex::new(None),
-            total_pause_duration: Mutex::new(std::time::Duration::ZERO),
+            pause_clock: Mutex::new(PauseClock::default()),
         })
     }
 
@@ -191,7 +222,7 @@ impl RecordingState {
         self.is_recording.store(false, Ordering::SeqCst);
         self.is_paused.store(false, Ordering::SeqCst);
         // Clear pause tracking when stopping
-        *self.pause_start.lock().unwrap() = None;
+        self.pause_clock.lock().unwrap().pause_start = None;
         // CRITICAL: Clear audio sender to close the pipeline channel
         // This ensures the pipeline loop exits properly after processing all chunks
         *self.audio_sender.lock().unwrap() = None;
@@ -210,8 +241,8 @@ impl RecordingState {
             return Err(anyhow::anyhow!("Recording is already paused"));
         }
 
+        self.pause_clock.lock().unwrap().pause(Instant::now());
         self.is_paused.store(true, Ordering::SeqCst);
-        *self.pause_start.lock().unwrap() = Some(Instant::now());
         log::info!("Recording paused");
         Ok(())
     }
@@ -224,10 +255,9 @@ impl RecordingState {
             return Err(anyhow::anyhow!("Recording is not paused"));
         }
 
-        // Calculate pause duration and add to total
-        if let Some(pause_start) = self.pause_start.lock().unwrap().take() {
-            let pause_duration = pause_start.elapsed();
-            *self.total_pause_duration.lock().unwrap() += pause_duration;
+        // Ends the pause and adds it to the total in one step (see PauseClock).
+        let paused_for = self.pause_clock.lock().unwrap().resume(Instant::now());
+        if let Some(pause_duration) = paused_for {
             log::info!("Recording resumed after pause of {:.2}s", pause_duration.as_secs_f64());
         }
 
@@ -474,35 +504,22 @@ impl RecordingState {
     }
 
     pub fn get_active_recording_duration(&self) -> Option<f64> {
-        self.recording_start.lock().unwrap().map(|start| {
-            let total_duration = start.elapsed().as_secs_f64();
-            let pause_duration = self.get_total_pause_duration();
-            let current_pause = if self.is_paused() {
-                self.pause_start
-                    .lock()
-                    .unwrap()
-                    .map(|p| p.elapsed().as_secs_f64())
-                    .unwrap_or(0.0)
-            } else {
-                0.0
-            };
-            total_duration - pause_duration - current_pause
-        })
+        let start = (*self.recording_start.lock().unwrap())?;
+        let now = Instant::now();
+        let paused = self.pause_clock.lock().unwrap().paused_until(now);
+        Some(now.saturating_duration_since(start).saturating_sub(paused).as_secs_f64())
     }
 
     pub fn get_total_pause_duration(&self) -> f64 {
-        self.total_pause_duration.lock().unwrap().as_secs_f64()
+        self.pause_clock.lock().unwrap().total.as_secs_f64()
     }
 
     pub fn get_current_pause_duration(&self) -> Option<f64> {
-        if self.is_paused() {
-            self.pause_start
-                .lock()
-                .unwrap()
-                .map(|start| start.elapsed().as_secs_f64())
-        } else {
-            None
-        }
+        self.pause_clock
+            .lock()
+            .unwrap()
+            .pause_start
+            .map(|start| start.elapsed().as_secs_f64())
     }
 
     // Memory management
@@ -521,8 +538,7 @@ impl RecordingState {
         *self.fault_sender.lock().unwrap() = None;
         *self.stats.lock().unwrap() = RecordingStats::default();
         *self.recording_start.lock().unwrap() = None;
-        *self.pause_start.lock().unwrap() = None;
-        *self.total_pause_duration.lock().unwrap() = std::time::Duration::ZERO;
+        *self.pause_clock.lock().unwrap() = PauseClock::default();
         self.error_count.store(0, Ordering::SeqCst);
         self.recoverable_error_count.store(0, Ordering::SeqCst);
 
@@ -551,8 +567,7 @@ impl Default for RecordingState {
             capture_failed: AtomicBool::new(false),
             stats: Mutex::new(RecordingStats::default()),
             recording_start: Mutex::new(None),
-            pause_start: Mutex::new(None),
-            total_pause_duration: Mutex::new(std::time::Duration::ZERO),
+            pause_clock: Mutex::new(PauseClock::default()),
         }
     }
 }
@@ -571,6 +586,37 @@ impl Clone for RecordingStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The active clock is continuous across resume: at the instant a pause
+    /// ends, the time recorded as paused is the same whether read just before
+    /// or just after, so a capture timestamp can never jump by the pause.
+    #[test]
+    fn resume_moves_the_pause_into_the_total_without_a_jump() {
+        let start = Instant::now();
+        let mut clock = PauseClock::default();
+        clock.pause(start + Duration::from_secs(10));
+
+        let resumed_at = start + Duration::from_secs(70);
+        let paused_before = clock.paused_until(resumed_at);
+        assert_eq!(clock.resume(resumed_at), Some(Duration::from_secs(60)));
+        assert_eq!(clock.paused_until(resumed_at), paused_before);
+        assert_eq!(clock.paused_until(resumed_at + Duration::from_secs(5)), Duration::from_secs(60));
+        assert_eq!(clock.resume(resumed_at), None, "resuming twice adds nothing");
+    }
+
+    #[test]
+    fn active_duration_excludes_pauses() {
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        state.pause_recording().unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        let while_paused = state.get_active_recording_duration().unwrap();
+        state.resume_recording().unwrap();
+        let after_resume = state.get_active_recording_duration().unwrap();
+
+        assert!(state.get_total_pause_duration() >= 0.12);
+        assert!(after_resume - while_paused < 0.05, "resume must not move active time forward by the pause");
+    }
 
     /// A recording session with both streams running, a fault channel and a
     /// health callback that records every event.

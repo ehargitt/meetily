@@ -91,7 +91,8 @@ impl ContinuousVadProcessor {
         // Use the caller's redemption time without additional capping. The batch
         // paths (`import.rs`, `retranscription.rs`) pass 2000ms to bridge natural
         // pauses; the live path (`pipeline.rs`) passes 500ms to reduce pause-induced
-        // latency. Uninterrupted speech is cut at MAX_SEGMENT_SECONDS (#756).
+        // latency. The live processor (`new`) also cuts uninterrupted speech at
+        // MAX_SEGMENT_SECONDS (#756); the batch one (`new_for_batch`) does not.
         config.redemption_time = Duration::from_millis(redemption_time_ms as u64);
         config.pre_speech_pad = Duration::from_millis(300);   // Pre-speech padding for context
         config.post_speech_pad = Duration::from_millis(400);  // Increased: more context at end
@@ -823,9 +824,13 @@ mod tests {
         let audio = generate_continuous_speech(95);
         let segments = get_speech_chunks(&audio, 2000).expect("batch VAD failed");
 
-        let max_samples = MAX_SEGMENT_SECONDS * VAD_SAMPLE_RATE as usize;
+        // Batch VAD is fed 160 000-sample chunks and a forced cut is only checked
+        // at a chunk end, so a cut segment is at most 30 s + one chunk long.
+        // Anything longer proves no cut happened, wherever the first utterance starts.
+        const BATCH_FEED_CHUNK: usize = 160_000;
+        let longest_possible_cut = MAX_SEGMENT_SECONDS * VAD_SAMPLE_RATE as usize + BATCH_FEED_CHUNK;
         assert!(
-            segments.iter().any(|segment| segment.samples.len() > max_samples + 4_800),
+            segments.iter().any(|segment| segment.samples.len() > longest_possible_cut),
             "batch segments were cut at the live cap: {:?}",
             segments.iter().map(|s| s.samples.len()).collect::<Vec<_>>()
         );
