@@ -441,7 +441,14 @@ fn resolve_mic_or_default<R: Runtime>(
 /// ponytail: no cpal enumeration check (unlike the mic helper) — Linux system
 /// devices are Pulse/ALSA monitor *inputs* tagged Output, so output_devices()
 /// would false-negative them. stream.rs still hard-fails on a missing device.
-fn resolve_system_or_default(requested_name: Option<&str>) -> Option<Arc<super::AudioDevice>> {
+///
+/// When nothing resolves (e.g. Linux with no monitor source configured) the
+/// user is told with `system-audio-unavailable` that participants' audio will
+/// not be recorded.
+fn resolve_system_or_default<R: Runtime>(
+    app: &AppHandle<R>,
+    requested_name: Option<&str>,
+) -> Option<Arc<super::AudioDevice>> {
     if let Some(name) = requested_name {
         match parse_audio_device(name) {
             Ok(device) => {
@@ -462,6 +469,13 @@ fn resolve_system_or_default(requested_name: Option<&str>) -> Option<Arc<super::
         }
         Err(e) => {
             warn!("⚠️ No system audio available: {} — recording will continue with microphone only", e);
+            emit_stream_health_event(
+                app,
+                StreamHealthEvent::SystemAudioUnavailable {
+                    device_name: None,
+                    reason: format!("No system audio device found: {}", e),
+                },
+            );
             None
         }
     }
@@ -570,7 +584,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     #[cfg(not(target_os = "macos"))]
     let microphone_device = resolve_mic_or_default(&app, preferred_mic_name.as_deref());
 
-    let system_device = resolve_system_or_default(preferred_system_name.as_deref());
+    let system_device = resolve_system_or_default(&app, preferred_system_name.as_deref());
 
     #[cfg(target_os = "macos")]
     prepare_audio_for_recording(system_device.as_deref()).await?;
@@ -686,7 +700,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     #[cfg(not(target_os = "macos"))]
     let mic_device = resolve_mic_or_default(&app, mic_device_name.as_deref());
 
-    let system_device = resolve_system_or_default(system_device_name.as_deref());
+    let system_device = resolve_system_or_default(&app, system_device_name.as_deref());
 
     #[cfg(target_os = "macos")]
     prepare_audio_for_recording(system_device.as_deref()).await?;
