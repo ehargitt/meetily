@@ -197,6 +197,13 @@ struct LingeringDrain {
 
 static LINGERING_DRAIN: Mutex<Option<LingeringDrain>> = Mutex::new(None);
 
+/// Bound on saving a stopped recording: finalizing encodes all of its audio, so
+/// the bound grows with its length (encoding must run at least 4x real time).
+fn save_timeout_for(recorded_seconds: u64) -> std::time::Duration {
+    const BASE: std::time::Duration = std::time::Duration::from_secs(300);
+    BASE + std::time::Duration::from_secs(recorded_seconds / 4)
+}
+
 /// When the last successful stop finished, and how many meetings the frontend
 /// had saved by then; its own save of that meeting comes after.
 #[derive(Debug, Clone, Copy)]
@@ -1023,10 +1030,10 @@ async fn stop_recording_tail<R: Runtime>(app: &AppHandle<R>) -> Result<(), Strin
         let meeting_folder = manager.get_meeting_folder();
         let meeting_name = manager.get_meeting_name();
 
-        match tokio::time::timeout(
-            tokio::time::Duration::from_secs(300), // 5 minutes max for file I/O
-            manager.save_recording_only(app)
-        ).await {
+        // Checkpoints are 30 s each; the final encode takes time proportional to them.
+        let (checkpoints, _) = manager.get_recording_stats();
+        let save_timeout = save_timeout_for(checkpoints as u64 * 30);
+        match tokio::time::timeout(save_timeout, manager.save_recording_only(app)).await {
             Ok(Ok(_)) => {
                 info!("✅ Recording data saved successfully during cleanup");
             }
@@ -1038,11 +1045,18 @@ async fn stop_recording_tail<R: Runtime>(app: &AppHandle<R>) -> Result<(), Strin
                 // Don't fail shutdown - transcripts are already preserved
             }
             Err(_) => {
-                warn!("⏱️ File I/O timeout (5 minutes) reached during save, continuing shutdown");
+                warn!("⏱️ Save timeout ({}s) reached, continuing shutdown", save_timeout.as_secs());
+                let location = meeting_folder
+                    .as_ref()
+                    .map(|folder| folder.join(".checkpoints").display().to_string())
+                    .unwrap_or_else(|| "the meeting folder's .checkpoints folder".to_string());
                 let _ = app.emit(
                     "recording-save-error",
                     serde_json::json!({
-                        "message": "Saving the meeting audio took too long and was stopped. The recorded audio is kept in the meeting folder for recovery."
+                        "message": format!(
+                            "Encoding the meeting audio took too long and was stopped, so the meeting has no audio file. The recorded audio is kept as WAV files in {}.",
+                            location
+                        )
                     }),
                 );
             }
@@ -2267,6 +2281,12 @@ mod tests {
             .expect("stops waiting once the stop finished")
             .unwrap();
         assert!(transcription_engine_idle(), "then the model is free to unload");
+    }
+
+    #[test]
+    fn save_timeout_grows_with_the_recording_it_encodes() {
+        assert_eq!(save_timeout_for(0).as_secs(), 300);
+        assert_eq!(save_timeout_for(2 * 3600).as_secs(), 300 + 1800);
     }
 
     fn update_payload(session_id: u64, sequence_id: u64) -> String {

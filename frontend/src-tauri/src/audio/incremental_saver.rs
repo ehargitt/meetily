@@ -15,6 +15,8 @@ const CHECKPOINT_SECONDS: usize = 30;
 const MAX_PENDING_SECONDS: usize = 600;
 const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(5);
 const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// While audio is being dropped at the cap, log the running total at most this often.
+const DROP_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Incremental audio saver that writes a 16-bit PCM WAV checkpoint every 30 seconds
 /// to bound memory use and enable crash recovery, then encodes all checkpoints
@@ -33,6 +35,9 @@ pub struct IncrementalAudioSaver {
     sample_rate: u32,
     consecutive_failures: u32,
     next_attempt_at: Option<Instant>,
+    /// Samples dropped at the in-memory cap since the last drop log.
+    dropped_since_log: usize,
+    last_drop_log: Option<Instant>,
     #[cfg(test)]
     write_attempts: u64,
 }
@@ -61,6 +66,8 @@ impl IncrementalAudioSaver {
             sample_rate,
             consecutive_failures: 0,
             next_attempt_at: None,
+            dropped_since_log: 0,
+            last_drop_log: None,
             #[cfg(test)]
             write_attempts: 0,
         })
@@ -82,7 +89,7 @@ impl IncrementalAudioSaver {
             return Ok(());
         }
         if self.next_attempt_at.is_some_and(|retry_at| now < retry_at) {
-            return self.enforce_pending_limit();
+            return self.enforce_pending_limit(now);
         }
 
         match self.write_pending_checkpoint() {
@@ -103,21 +110,29 @@ impl IncrementalAudioSaver {
                     backoff.as_secs(),
                     e
                 );
-                self.enforce_pending_limit()?;
+                self.enforce_pending_limit(now)?;
                 Err(e)
             }
         }
     }
 
     /// Drop the oldest unsaved audio beyond the in-memory cap.
-    fn enforce_pending_limit(&mut self) -> Result<()> {
+    fn enforce_pending_limit(&mut self, now: Instant) -> Result<()> {
         let excess = self.pending.len().saturating_sub(self.max_pending_samples);
         if excess == 0 {
             return Ok(());
         }
         self.pending.drain(..excess);
+        self.dropped_since_log += excess;
+        if self.last_drop_log.map_or(true, |at| now.duration_since(at) >= DROP_LOG_INTERVAL) {
+            error!(
+                "Dropped {:.1}s of unsaved audio: checkpoints cannot be written",
+                self.dropped_since_log as f64 / self.sample_rate as f64
+            );
+            self.dropped_since_log = 0;
+            self.last_drop_log = Some(now);
+        }
         let dropped_seconds = excess as f64 / self.sample_rate as f64;
-        error!("Dropped {:.1}s of unsaved audio: checkpoints cannot be written", dropped_seconds);
         Err(anyhow!(
             "Audio cannot be saved to disk; {:.0} seconds of audio were lost",
             dropped_seconds
@@ -158,7 +173,22 @@ impl IncrementalAudioSaver {
 
         if !self.pending.is_empty() {
             info!("Saving final checkpoint with remaining {} samples", self.pending.len());
-            self.write_pending_checkpoint()?;
+            // Up to MAX_PENDING_SECONDS of audio after write failures: write it off the runtime.
+            let path = self.checkpoints_dir
+                .join(format!("audio_chunk_{:03}.wav", self.checkpoint_count));
+            let samples = std::mem::take(&mut self.pending);
+            let sample_rate = self.sample_rate;
+            let (written, samples) = tokio::task::spawn_blocking(move || {
+                let written = write_wav_atomically(&path, &samples, sample_rate);
+                (written, samples)
+            })
+            .await
+            .map_err(|e| anyhow!("Final checkpoint write task failed: {}", e))?;
+            if let Err(e) = written {
+                self.pending = samples;
+                return Err(e);
+            }
+            self.checkpoint_count += 1;
         }
 
         if self.checkpoint_count == 0 {
@@ -611,6 +641,23 @@ mod tests {
 
         assert!(last.unwrap_err().to_string().contains("were lost"));
         assert_eq!(saver.pending.len(), 48000 * MAX_PENDING_SECONDS);
+    }
+
+    #[tokio::test]
+    async fn a_failed_finalize_keeps_the_checkpoints_for_recovery() {
+        let (_temp_dir, meeting_folder) = meeting_with_checkpoints_dir("Encode_Fails");
+        let mut saver = IncrementalAudioSaver::new(meeting_folder.clone(), 48000).unwrap();
+        for i in 0..130 {  // two checkpoints plus 5 s pending
+            saver.add_chunk(chunk(24000, i)).unwrap();
+        }
+        std::fs::remove_file(meeting_folder.join(".checkpoints/audio_chunk_000.wav")).unwrap();
+
+        assert!(saver.finalize().await.is_err());
+
+        let checkpoints = meeting_folder.join(".checkpoints");
+        assert!(checkpoints.join("audio_chunk_001.wav").exists());
+        assert!(checkpoints.join("audio_chunk_002.wav").exists(), "the pending tail is written too");
+        assert!(!meeting_folder.join("audio.mp4").exists());
     }
 
     #[tokio::test]

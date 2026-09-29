@@ -196,7 +196,6 @@ impl SaveErrorReporter {
 
     /// Returns whether the report reached the sink (false when rate-limited).
     fn report_at(&self, message: &str, now: Instant) -> bool {
-        error!("Recording save error: {}", message);
         {
             let mut last = self.last_reported.lock().unwrap_or_else(|e| e.into_inner());
             if last.is_some_and(|at| now.duration_since(at) < SAVE_ERROR_REPORT_INTERVAL) {
@@ -204,6 +203,7 @@ impl SaveErrorReporter {
             }
             *last = Some(now);
         }
+        error!("Recording save error: {}", message);
         if let Some(sink) = self.sink.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             sink(message);
         }
@@ -339,9 +339,13 @@ impl RecordingSaver {
                     continue;
                 }
                 if let Some(saver_arc) = &incremental_saver_arc {
-                    let mut saver_guard = saver_arc.lock().await;
-                    if let Err(e) = saver_guard.add_chunk(chunk) {
-                        save_errors.report(&format!("Audio could not be saved to disk: {}", e));
+                    // add_chunk writes and fsyncs a checkpoint every 30 s: keep that off the runtime.
+                    let saver = Arc::clone(saver_arc);
+                    let added = tokio::task::spawn_blocking(move || saver.blocking_lock().add_chunk(chunk)).await;
+                    match added {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => save_errors.report(&format!("Audio could not be saved to disk: {}", e)),
+                        Err(e) => save_errors.report(&format!("Audio could not be saved to disk: {}", e)),
                     }
                 }
             }
@@ -482,9 +486,12 @@ impl RecordingSaver {
                 }
                 Err(e) => {
                     error!("❌ Failed to finalize incremental saver: {}", e);
+                    let checkpoints = self.meeting_folder.as_ref()
+                        .map(|folder| folder.join(".checkpoints").display().to_string())
+                        .unwrap_or_else(|| "the meeting folder's .checkpoints folder".to_string());
                     let message = format!(
-                        "The meeting audio could not be finalized: {}. The recorded audio is kept in the meeting folder for recovery.",
-                        e
+                        "The meeting audio could not be finalized ({}), so the meeting has no audio file. The recorded audio is kept as WAV files in {}.",
+                        e, checkpoints
                     );
                     if let Err(emit_error) = app.emit("recording-save-error", serde_json::json!({ "message": message })) {
                         warn!("Failed to emit recording-save-error: {}", emit_error);
