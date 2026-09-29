@@ -374,6 +374,7 @@ fn resolve_mic_or_default<R: Runtime>(
     app: &AppHandle<R>,
     requested_name: Option<&str>,
 ) -> Option<Arc<super::AudioDevice>> {
+    #[cfg(not(target_os = "linux"))]
     use cpal::traits::{DeviceTrait, HostTrait};
 
     let requested_specific = requested_name.is_some();
@@ -381,6 +382,10 @@ fn resolve_mic_or_default<R: Runtime>(
     if let Some(name) = requested_name {
         match parse_audio_device(name) {
             Ok(device) => {
+                // Linux: check ALSA name hints; cpal enumeration opens every PCM.
+                #[cfg(target_os = "linux")]
+                let exists = super::devices::platform::resolve_capture_pcm(&device).is_ok();
+                #[cfg(not(target_os = "linux"))]
                 let exists = cpal::default_host()
                     .input_devices()
                     .map(|mut it| it.any(|d| d.name().map(|n| n == device.name).unwrap_or(false)))
