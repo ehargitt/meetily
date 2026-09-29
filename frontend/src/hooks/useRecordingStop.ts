@@ -41,6 +41,11 @@ function showSpeakerModelsHintOnce() {
 // tray stop must not both run the post-stop save.
 let stopInProgress = false;
 
+/** Whether a post-stop flow (transcription wait, save, navigation) is running. */
+export function isPostStopInProgress() {
+  return stopInProgress;
+}
+
 // Pending "navigate to the saved meeting" timer (status COMPLETED meanwhile).
 let postSaveNavigationTimer: ReturnType<typeof setTimeout> | null = null;
 

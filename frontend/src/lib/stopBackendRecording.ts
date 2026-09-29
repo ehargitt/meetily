@@ -6,7 +6,8 @@ import { recordingService } from '@/services/recordingService';
  * - `stopped`: this call ran the backend stop; the caller runs the post-stop save.
  * - `in-progress`: another stop holds the backend stop guard; its own flow
  *   (`recording-stopped` / `recording-stop-complete`) saves — do nothing.
- * - `not-recording`: there was no recording to stop.
+ * - `not-recording`: the backend was not recording, so there is nothing to
+ *   save; the caller only resets its stop state.
  */
 export type BackendStopResult = 'stopped' | 'in-progress' | 'not-recording';
 
@@ -25,6 +26,15 @@ const errorText = (error: unknown) => (error instanceof Error ? error.message : 
  * @throws the backend error for a stop that failed
  */
 export async function stopBackendRecording(): Promise<BackendStopResult> {
+  // stop_recording returns Ok when nothing is recording, which would look
+  // like a real stop and run a full save; ask first. A failed check falls
+  // through to the stop itself.
+  const recording = await recordingService.isRecording().catch(() => true);
+  if (!recording) {
+    console.log('Stop requested but the backend is not recording');
+    return 'not-recording';
+  }
+
   const dataDir = await appDataDir();
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   const savePath = `${dataDir}/recording-${timestamp}.wav`;
@@ -37,9 +47,6 @@ export async function stopBackendRecording(): Promise<BackendStopResult> {
     if (message === STOP_IN_PROGRESS) {
       console.log('stop_recording lost the stop guard - another stop is already running');
       return 'in-progress';
-    }
-    if (message.includes('No recording in progress')) {
-      return 'not-recording';
     }
     throw error;
   }
