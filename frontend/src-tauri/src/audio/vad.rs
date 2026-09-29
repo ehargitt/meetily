@@ -8,10 +8,14 @@ use std::time::Duration;
 /// sample count and timestamp inside this module is expressed in it.
 const VAD_SAMPLE_RATE: u32 = 16000;
 
-/// Continuous speech is cut into segments of at most this length (#756).
+/// Live continuous speech is cut into segments of at most this length (#756).
 /// Without a cut, uninterrupted audio (a podcast played as system audio, a
 /// long monologue) keeps one segment, and silero's buffer, growing for as
 /// long as it lasts. 30 s matches Whisper's input window.
+///
+/// Only the live processor (`new`) cuts. The batch paths (`new_for_batch`)
+/// hand whole utterances to `split_segment_at_silence`, which splits at the
+/// quietest point instead of mid-word, and their input is finite anyway.
 const MAX_SEGMENT_SECONDS: usize = 30;
 
 /// Between utterances, silero's buffer is trimmed back to `IDLE_AUDIO_KEEP`
@@ -45,13 +49,33 @@ pub struct ContinuousVadProcessor {
     silero_start_sample: usize,
     /// End of the last forced cut; audio before it has already been emitted.
     cut_sample: usize,
-    max_segment_samples: usize,
+    /// Forced-cut length; `None` lets utterances run until silero ends them.
+    max_segment_samples: Option<usize>,
     // State tracking for smart logging
     last_logged_state: bool,
 }
 
 impl ContinuousVadProcessor {
+    /// Processor for live recording: continuous speech is cut every `MAX_SEGMENT_SECONDS`.
     pub fn new(input_sample_rate: u32, redemption_time_ms: u32) -> Result<Self> {
+        Self::with_max_segment(
+            input_sample_rate,
+            redemption_time_ms,
+            Some(MAX_SEGMENT_SECONDS * VAD_SAMPLE_RATE as usize),
+        )
+    }
+
+    /// Processor for batch import/retranscription: no forced cut, so long
+    /// utterances reach the silence-aware splitter whole.
+    pub fn new_for_batch(input_sample_rate: u32, redemption_time_ms: u32) -> Result<Self> {
+        Self::with_max_segment(input_sample_rate, redemption_time_ms, None)
+    }
+
+    fn with_max_segment(
+        input_sample_rate: u32,
+        redemption_time_ms: u32,
+        max_segment_samples: Option<usize>,
+    ) -> Result<Self> {
         crate::ensure_onnx_runtime_available()?;
 
         // Use STRICT settings to prevent silence from reaching Whisper
@@ -101,7 +125,7 @@ impl ContinuousVadProcessor {
             speech_start_sample: 0,
             silero_start_sample: 0,
             cut_sample: 0,
-            max_segment_samples: MAX_SEGMENT_SECONDS * VAD_SAMPLE_RATE as usize,
+            max_segment_samples,
             // Initialize state tracking
             last_logged_state: false,
         })
@@ -349,7 +373,8 @@ impl ContinuousVadProcessor {
 
         self.processed_samples += chunk.len();
 
-        if self.in_speech && self.processed_samples - self.speech_start_sample >= self.max_segment_samples {
+        let segment_samples = self.processed_samples - self.speech_start_sample;
+        if self.in_speech && self.max_segment_samples.is_some_and(|max| segment_samples >= max) {
             self.cut_long_segment();
         } else if !self.in_speech {
             self.trim_idle_audio();
@@ -369,7 +394,7 @@ impl ContinuousVadProcessor {
     }
 
     /// Emit the current utterance up to now as a segment and start over, so
-    /// continuous speech yields segments of at most `max_segment_samples`.
+    /// continuous live speech yields segments of at most `max_segment_samples`.
     ///
     /// Silero keeps an utterance's audio until it ends, so its session is reset
     /// and trimmed (keeping only the pre-speech pad) to bound its buffer too. If
@@ -410,7 +435,7 @@ impl ContinuousVadProcessor {
 
 /// Legacy function for backward compatibility - now uses the optimized approach
 pub fn extract_speech_16k(samples_mono_16k: &[f32]) -> Result<Vec<f32>> {
-    let mut processor = ContinuousVadProcessor::new(16000, 400)?;
+    let mut processor = ContinuousVadProcessor::new_for_batch(16000, 400)?;
 
     // Process all audio
     let mut all_segments = processor.process_audio(samples_mono_16k)?;
@@ -464,7 +489,7 @@ pub fn get_speech_chunks_with_progress<F>(
 where
     F: FnMut(u32, usize) -> bool,
 {
-    let mut processor = ContinuousVadProcessor::new(16000, redemption_time_ms)?;
+    let mut processor = ContinuousVadProcessor::new_for_batch(16000, redemption_time_ms)?;
 
     let total_samples = samples_mono_16k.len();
 
@@ -787,6 +812,22 @@ mod tests {
         assert!(
             max_buffered <= max_samples + VAD_SAMPLE_RATE as usize,
             "silero buffered {max_buffered} samples; its buffer must stay bounded too"
+        );
+    }
+
+    /// Batch VAD (import/retranscription) never force-cuts: the same continuous
+    /// speech comes out as utterances longer than the live cap, left for the
+    /// silence-aware splitter.
+    #[test]
+    fn batch_vad_leaves_long_utterances_for_the_silence_aware_splitter() {
+        let audio = generate_continuous_speech(95);
+        let segments = get_speech_chunks(&audio, 2000).expect("batch VAD failed");
+
+        let max_samples = MAX_SEGMENT_SECONDS * VAD_SAMPLE_RATE as usize;
+        assert!(
+            segments.iter().any(|segment| segment.samples.len() > max_samples + 4_800),
+            "batch segments were cut at the live cap: {:?}",
+            segments.iter().map(|s| s.samples.len()).collect::<Vec<_>>()
         );
     }
 
