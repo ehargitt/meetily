@@ -1,6 +1,7 @@
 use crate::database::repositories::{
     meeting::MeetingsRepository, setting::SettingsRepository, summary::SummaryProcessesRepository,
 };
+use crate::summary::context_budget::{ContextBudget, OLLAMA_FALLBACK_CONTEXT};
 use crate::summary::llm_client::LLMProvider;
 use crate::summary::language_detection::detect_summary_language;
 use crate::summary::metadata::read_detected_summary_language_from_metadata;
@@ -8,6 +9,7 @@ use crate::summary::processor::{
     clean_llm_markdown_detailed, extract_meeting_name_from_markdown, generate_meeting_summary,
     language_name_from_code, require_visible_markdown,
 };
+use crate::summary::summary_engine::models;
 use crate::summary::templates::{self, Template};
 use crate::ollama::metadata::ModelMetadataCache;
 use chrono::{DateTime, Utc};
@@ -65,7 +67,7 @@ struct SummaryCacheSource {
     custom_prompt_fingerprint: String,
     template_id: String,
     template_fingerprint: String,
-    token_threshold: usize,
+    context_budget: Option<ContextBudget>,
     model_provider: String,
     model_name: String,
     ollama_endpoint: Option<String>,
@@ -100,7 +102,7 @@ fn build_summary_cache_source(
     custom_prompt: &str,
     template_id: &str,
     template_fingerprint: &str,
-    token_threshold: usize,
+    context_budget: Option<ContextBudget>,
     model_provider: &str,
     model_name: &str,
     ollama_endpoint: Option<&str>,
@@ -114,7 +116,7 @@ fn build_summary_cache_source(
         custom_prompt_fingerprint: stable_text_fingerprint(custom_prompt),
         template_id: template_id.to_string(),
         template_fingerprint: template_fingerprint.to_string(),
-        token_threshold,
+        context_budget,
         model_provider: model_provider.to_string(),
         model_name: model_name.to_string(),
         ollama_endpoint: ollama_endpoint.map(str::to_string),
@@ -429,51 +431,47 @@ impl SummaryService {
             api_key
         };
 
-        // Dynamically fetch context size based on provider and model
-        let token_threshold = if provider == LLMProvider::Ollama {
-            match METADATA_CACHE.get_or_fetch(&model_name, ollama_endpoint.as_deref()).await {
-                Ok(metadata) => {
-                    // Reserve 300 tokens for prompt overhead
-                    let optimal = metadata.context_size.saturating_sub(300);
-                    info!(
-                        "✓ Using dynamic context for {}: {} tokens (chunk size: {})",
-                        model_name, metadata.context_size, optimal
-                    );
-                    optimal
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to fetch context for {}: {}. Using default 4000",
-                        model_name, e
-                    );
-                    4000  // Fallback to safe default
-                }
+        // The context window the model runs with. Chunking and Ollama's num_ctx both come from it.
+        let context_budget = match provider {
+            LLMProvider::Ollama => {
+                let model_max_context = match METADATA_CACHE
+                    .get_or_fetch(&model_name, ollama_endpoint.as_deref())
+                    .await
+                {
+                    Ok(metadata) => metadata.context_size,
+                    Err(e) => {
+                        warn!(
+                            "Failed to fetch context for {}: {}. Using {} tokens",
+                            model_name, e, OLLAMA_FALLBACK_CONTEXT
+                        );
+                        OLLAMA_FALLBACK_CONTEXT
+                    }
+                };
+                Some(ContextBudget::for_ollama(model_max_context))
             }
-        } else if provider == LLMProvider::BuiltInAI {
-            // Get model's context size from registry
-            use crate::summary::summary_engine::models;
-            let model = models::get_model_by_name(&model_name)
-                .ok_or_else(|| format!("Unknown model: {}", model_name));
-
-            match model {
-                Ok(model_def) => {
-                    // Reserve 300 tokens for prompt overhead
-                    let optimal = model_def.context_size.saturating_sub(300) as usize;
-                    info!(
-                        "✓ Using BuiltInAI context size: {} tokens (chunk size: {})",
-                        model_def.context_size, optimal
-                    );
-                    optimal
+            LLMProvider::BuiltInAI => match models::get_model_by_name(&model_name) {
+                Some(model_def) => Some(ContextBudget::for_builtin(
+                    model_def.context_size,
+                    models::DEFAULT_MAX_TOKENS,
+                )),
+                None => {
+                    let err_msg = format!("Unknown built-in model: {}", model_name);
+                    Self::fail_and_cleanup(&pool, &meeting_id, started_at, &err_msg).await;
+                    return;
                 }
-                Err(e) => {
-                    warn!("{}, using default 2048", e);
-                    1748  // 2048 - 300 for overhead
-                }
-            }
-        } else {
-            // Cloud providers (OpenAI, Claude, Groq, CustomOpenAI) handle large contexts automatically
-            100000  // Effectively unlimited for single-pass processing
+            },
+            // Cloud and custom OpenAI-compatible providers get the whole transcript in one
+            // request: their context sizes are not known here and nothing configures one.
+            _ => None,
         };
+        if let Some(budget) = context_budget {
+            info!(
+                model = %model_name,
+                context_tokens = budget.context_tokens,
+                output_reserve_tokens = budget.output_reserve_tokens,
+                "Using summary context budget"
+            );
+        }
 
         // Get app data directory for BuiltInAI provider
         let app_data_dir = _app.path().app_data_dir().ok();
@@ -506,7 +504,7 @@ impl SummaryService {
             &custom_prompt,
             &template_id,
             &template_fingerprint,
-            token_threshold,
+            context_budget,
             &model_provider,
             &model_name,
             ollama_endpoint.as_deref(),
@@ -553,7 +551,7 @@ impl SummaryService {
             &custom_prompt,
             &template_id,
             &template,
-            token_threshold,
+            context_budget,
             ollama_endpoint.as_deref(),
             custom_openai_endpoint.as_deref(),
             custom_openai_max_tokens,
@@ -792,7 +790,7 @@ mod tests {
             "custom prompt",
             "standard_meeting",
             &template_fingerprint,
-            3700,
+            Some(ContextBudget::for_ollama(8192)),
             "ollama",
             "gemma3:1b",
             Some("http://localhost:11434"),
@@ -900,7 +898,7 @@ mod tests {
                 "custom prompt",
                 "standard_meeting",
                 &template_fingerprint,
-                3700,
+                Some(ContextBudget::for_ollama(8192)),
                 "ollama",
                 "gemma3:1b",
                 Some("http://localhost:11434"),
@@ -914,7 +912,7 @@ mod tests {
                 "changed prompt",
                 "standard_meeting",
                 &template_fingerprint,
-                3700,
+                Some(ContextBudget::for_ollama(8192)),
                 "ollama",
                 "gemma3:1b",
                 Some("http://localhost:11434"),
@@ -928,7 +926,7 @@ mod tests {
                 "custom prompt",
                 "daily_standup",
                 &template_fingerprint,
-                3700,
+                Some(ContextBudget::for_ollama(8192)),
                 "ollama",
                 "gemma3:1b",
                 Some("http://localhost:11434"),
@@ -942,7 +940,7 @@ mod tests {
                 "custom prompt",
                 "standard_meeting",
                 &template_fingerprint,
-                3700,
+                Some(ContextBudget::for_ollama(8192)),
                 "openai",
                 "gemma3:1b",
                 Some("http://localhost:11434"),
@@ -956,7 +954,7 @@ mod tests {
                 "custom prompt",
                 "standard_meeting",
                 &template_fingerprint,
-                3700,
+                Some(ContextBudget::for_ollama(8192)),
                 "ollama",
                 "qwen2.5:3b",
                 Some("http://localhost:11434"),
@@ -970,7 +968,7 @@ mod tests {
                 "custom prompt",
                 "standard_meeting",
                 &template_fingerprint,
-                3700,
+                Some(ContextBudget::for_ollama(8192)),
                 "ollama",
                 "gemma3:1b",
                 Some("http://localhost:11500"),
@@ -984,7 +982,7 @@ mod tests {
                 "custom prompt",
                 "standard_meeting",
                 &template_fingerprint,
-                3700,
+                Some(ContextBudget::for_ollama(8192)),
                 "ollama",
                 "gemma3:1b",
                 Some("http://localhost:11434"),
@@ -1029,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn test_changed_token_threshold_rejects_cache() {
+    fn test_changed_context_budget_rejects_cache() {
         let source = sample_cache_source();
         let raw = build_summary_result_json(
             "# Reunion\n## Points\nBonjour",
@@ -1042,13 +1040,36 @@ mod tests {
         .unwrap()
         .to_string();
 
-        let changed_threshold = SummaryCacheSource {
-            token_threshold: 8192,
+        let changed_budget = SummaryCacheSource {
+            context_budget: Some(ContextBudget::for_ollama(16_384)),
             ..source
         };
 
         assert_eq!(
-            extract_cached_english_markdown(&raw, &changed_threshold, Some("de")).unwrap(),
+            extract_cached_english_markdown(&raw, &changed_budget, Some("de")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn cache_rows_from_before_context_budgets_miss_for_ollama() {
+        // Rows written before budgets carried `token_threshold` (context minus 300) instead.
+        let source = sample_cache_source();
+        let mut raw = build_summary_result_json(
+            "# Reunion\n## Points\nBonjour",
+            "# Meeting\n## Points\nHello",
+            source.clone(),
+            Some("fr"),
+            false,
+            false,
+        )
+        .unwrap();
+        let legacy_source = raw["english_cache"]["source"].as_object_mut().unwrap();
+        legacy_source.remove("context_budget");
+        legacy_source.insert("token_threshold".to_string(), serde_json::json!(7892));
+
+        assert_eq!(
+            extract_cached_english_markdown(&raw.to_string(), &source, Some("de")).unwrap(),
             None
         );
     }
