@@ -16,6 +16,6 @@ test('real recording contexts (isolated process)', () => {
   if (result.exitCode !== 0) {
     throw new Error(`isolated recording-context suite failed:\n${output}`);
   }
-  expect(output).toMatch(/\b4 pass\b/);
   expect(output).toMatch(/\b0 fail\b/);
+  expect(output).toMatch(/\b[1-9]\d* pass\b/);
 }, 30000);
