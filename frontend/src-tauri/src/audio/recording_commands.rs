@@ -197,6 +197,21 @@ struct LingeringDrain {
 
 static LINGERING_DRAIN: Mutex<Option<LingeringDrain>> = Mutex::new(None);
 
+/// When the last successful stop finished, and how many meetings the frontend
+/// had saved by then; its own save of that meeting comes after.
+#[derive(Debug, Clone, Copy)]
+pub struct CompletedStop {
+    pub at: std::time::Instant,
+    pub saved_meetings: u64,
+}
+
+static LAST_COMPLETED_STOP: Mutex<Option<CompletedStop>> = Mutex::new(None);
+
+/// The last stop that completed, for tray Quit to wait on its frontend save.
+pub fn last_completed_stop() -> Option<CompletedStop> {
+    *LAST_COMPLETED_STOP.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Longest the stop waits for queued chunks to be transcribed before saving.
 const TRANSCRIPTION_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
@@ -1041,6 +1056,10 @@ async fn stop_recording_tail<R: Runtime>(app: &AppHandle<R>) -> Result<(), Strin
 
     // Set recording flag to false. STOP_IN_PROGRESS is released when the caller's guard drops.
     info!("🔍 Setting IS_RECORDING to false");
+    *LAST_COMPLETED_STOP.lock().unwrap_or_else(|e| e.into_inner()) = Some(CompletedStop {
+        at: std::time::Instant::now(),
+        saved_meetings: crate::database::repositories::transcript::saved_meeting_count(),
+    });
     IS_RECORDING.store(false, Ordering::SeqCst);
 
     // Step 4.5: Prepare metadata for frontend (NO database save)
