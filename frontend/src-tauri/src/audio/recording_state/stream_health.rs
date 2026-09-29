@@ -307,8 +307,8 @@ impl StreamHealth {
     }
 
     /// True once, for a rebuilt stream that has delivered its first callback
-    /// after an outage that was announced with `audio-stream-degraded`. A
-    /// hot-swap nobody was warned about ends silently.
+    /// after an outage the user was told about (`audio-stream-degraded`, or a
+    /// stream given up on). A hot-swap nobody was warned about ends silently.
     pub fn take_recovered(&self) -> bool {
         let mut inner = self.lock();
         let delivered = self.last_callback_ms.load(Ordering::Relaxed) >= inner.running_since_ms;
