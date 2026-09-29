@@ -109,6 +109,14 @@ impl TranscriptStore {
         tokio::spawn(run_transcript_writer(Arc::downgrade(self), receiver, debounce));
     }
 
+    /// A store writing to `folder`, with a debounce long enough that only explicit flushes write.
+    #[cfg(test)]
+    pub(crate) fn for_test(folder: PathBuf) -> Arc<Self> {
+        let store = Arc::new(Self::new());
+        store.attach_folder(folder, Duration::from_secs(3600));
+        store
+    }
+
     /// Write transcripts.json now (atomic write with temp file). No-op without a folder.
     pub fn write_now(&self) -> Result<()> {
         let Some(folder) = self.folder.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
