@@ -1,7 +1,8 @@
 'use client';
 
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { recordingService } from '@/services/recordingService';
+import { recordingService, type RecordingState as BackendRecordingState } from '@/services/recordingService';
+import { useRecordingHealthNotifications } from '@/hooks/useRecordingHealthNotifications';
 import { toast } from 'sonner';
 
 /**
@@ -24,6 +25,13 @@ export enum RecordingStatus {
   COMPLETED = 'completed',                // Successfully saved
   ERROR = 'error'                         // Error occurred
 }
+
+/** Statuses between a stop starting and its post-processing finishing. */
+export const STOP_FLOW_STATUSES: readonly RecordingStatus[] = [
+  RecordingStatus.STOPPING,
+  RecordingStatus.PROCESSING_TRANSCRIPTS,
+  RecordingStatus.SAVING,
+];
 
 interface RecordingState {
   isRecording: boolean;           // Is a recording session active
@@ -86,7 +94,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
    * Sync recording state with backend
    * Called on mount (fixes refresh desync) and periodically while recording
    */
-  const syncWithBackend = async () => {
+  const syncWithBackend = async (): Promise<BackendRecordingState | null> => {
     try {
       const backendState = await recordingService.getRecordingState();
 
@@ -100,9 +108,11 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
       }));
 
       console.log('[RecordingStateContext] Synced with backend:', backendState);
+      return backendState;
     } catch (error) {
       console.error('[RecordingStateContext] Failed to sync with backend:', error);
       // Don't update state on error - keep current state
+      return null;
     }
   };
 
@@ -134,6 +144,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
    */
   useEffect(() => {
     console.log('[RecordingStateContext] Setting up event listeners');
+    let cancelled = false;
     const unsubscribers: (() => void)[] = [];
 
     const setupListeners = async () => {
@@ -161,17 +172,24 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
         });
         unsubscribers.push(unlistenStarting);
 
+        // Recording stopping — a backend stop from any source (tray, UI,
+        // fatal error) has begun; STOPPING disables Stop/Start everywhere so
+        // a second stop can't be triggered while this one runs.
+        const unlistenStopping = await recordingService.onRecordingStopping(({ source }) => {
+          console.log('[RecordingStateContext] Recording stopping event, source:', source);
+          setState(prev => STOP_FLOW_STATUSES.includes(prev.status)
+            ? prev
+            : { ...prev, status: RecordingStatus.STOPPING, statusMessage: 'Stopping recording...' });
+        });
+        unsubscribers.push(unlistenStopping);
+
         // Recording stopped
         const unlistenStopped = await recordingService.onRecordingStopped((payload) => {
           console.log('[RecordingStateContext] Recording stopped event:', payload);
           setState(prev => {
             // Set status to STOPPING if not already in stop flow
             // This ensures smooth UI transition for tray/keyboard stops
-            const newStatus = [
-              RecordingStatus.STOPPING,
-              RecordingStatus.PROCESSING_TRANSCRIPTS,
-              RecordingStatus.SAVING
-            ].includes(prev.status)
+            const newStatus = STOP_FLOW_STATUSES.includes(prev.status)
               ? prev.status  // Already in stop flow
               : RecordingStatus.STOPPING;  // New stop, transition smoothly
 
@@ -218,10 +236,29 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
       }
     };
 
-    setupListeners();
+    /**
+     * Initial sync on mount - CRITICAL for fixing refresh desync bug.
+     * Runs after the listeners are registered so no transition falls between.
+     * A webview reload mid-recording misses recording-started, so a live
+     * backend session is adopted here: status and polling would otherwise
+     * stay idle.
+     */
+    const syncOnMount = async () => {
+      await setupListeners();
+      console.log('[RecordingStateContext] Initial mount - syncing with backend');
+      const backendState = await syncWithBackend();
+      if (cancelled || !backendState?.is_recording) return;
+      setState(prev => prev.status === RecordingStatus.IDLE
+        ? { ...prev, status: RecordingStatus.RECORDING }
+        : prev);
+      startPolling();
+    };
+
+    syncOnMount();
 
     return () => {
       console.log('[RecordingStateContext] Cleaning up event listeners');
+      cancelled = true;
       unsubscribers.forEach(unsub => unsub());
       stopPolling();
     };
@@ -328,14 +365,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
     };
   }, []);
 
-  /**
-   * Initial sync on mount - CRITICAL for fixing refresh desync bug
-   * If backend is recording but UI state is false, this will correct it
-   */
-  useEffect(() => {
-    console.log('[RecordingStateContext] Initial mount - syncing with backend');
-    syncWithBackend();
-  }, []);
+  useRecordingHealthNotifications(isRecordingRef);
 
   // NEW: Computed helpers from status
   const contextValue = useMemo(() => ({

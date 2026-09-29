@@ -22,6 +22,13 @@ export interface TranscriptionErrorPayload {
   phase: 'startup' | 'active';
 }
 
+export interface TranscriptChunkLossPayload {
+  chunks_queued: number;
+  chunks_completed: number;
+  chunks_lost: number;
+  message: string;
+}
+
 export interface ModelDownloadCompletePayload {
   modelName: string;
 }
@@ -87,6 +94,28 @@ export class TranscriptService {
    */
   async onTranscriptError(callback: (error: string) => void): Promise<UnlistenFn> {
     return listen<string>('transcript-error', (event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for transcription-warning event (a single chunk failed to transcribe)
+   * @param callback - Function to call with the warning message
+   * @returns Promise that resolves to unlisten function
+   */
+  async onTranscriptionWarning(callback: (message: string) => void): Promise<UnlistenFn> {
+    return listen<string>('transcription-warning', (event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for transcript-chunk-loss-detected event (chunks were not transcribed)
+   * @param callback - Function to call with the loss counts
+   * @returns Promise that resolves to unlisten function
+   */
+  async onTranscriptChunkLossDetected(callback: (payload: TranscriptChunkLossPayload) => void): Promise<UnlistenFn> {
+    return listen<TranscriptChunkLossPayload>('transcript-chunk-loss-detected', (event) => {
       callback(event.payload);
     });
   }
