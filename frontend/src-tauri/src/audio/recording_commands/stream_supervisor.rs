@@ -236,8 +236,8 @@ pub(super) async fn rebuild_stream<H: SupervisorHost>(
     fail_stream(host, session, device_type, Some(device.name.clone()), last_error);
 }
 
-/// Give up on a stream until its next periodic retry: tell the user, and
-/// report a capture failure if no stream is left. The session keeps its
+/// Give up on a stream until its next periodic retry: tell the user (once per
+/// outage), and report a capture failure if no stream is left. The session keeps its
 /// recording state so the normal stop/save runs.
 pub(super) fn fail_stream<H: SupervisorHost>(
     host: &H,
@@ -249,12 +249,15 @@ pub(super) fn fail_stream<H: SupervisorHost>(
     error!("[STREAM_REBUILD] Giving up on {:?} stream {:?}: {}", device_type, device_name, reason);
     let health = session.stream_health(device_type);
     health.mark_failed(Instant::now());
-    health.announce_outage();
-    match device_type {
-        DeviceType::System => {
-            session.emit_health_event(StreamHealthEvent::SystemAudioUnavailable { device_name, reason });
+    // Once per outage: a device that keeps opening and dying again must not
+    // repeat the warning on every retry.
+    if health.claim_failure_announcement() {
+        match device_type {
+            DeviceType::System => {
+                session.emit_health_event(StreamHealthEvent::SystemAudioUnavailable { device_name, reason });
+            }
+            DeviceType::Microphone => host.emit_mic_recovery_exhausted(&device_name.unwrap_or_default()),
         }
-        DeviceType::Microphone => host.emit_mic_recovery_exhausted(&device_name.unwrap_or_default()),
     }
     if session.all_streams_down() {
         session.report_capture_failed(
@@ -351,7 +354,7 @@ pub(super) fn frontend_event(event: StreamHealthEvent) -> (&'static str, serde_j
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::recording_state::{AudioError, MAX_SHORT_LIVED_REBUILDS};
+    use crate::audio::recording_state::{AudioError, MAX_SHORT_LIVED_REBUILDS, RECOVERED_AFTER_AUDIO};
     use serde_json::json;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -451,6 +454,13 @@ mod tests {
         (state, events)
     }
 
+    /// The (rebuilt) stream delivers audio long enough to count as recovered.
+    fn deliver_audio(state: &RecordingState, device_type: DeviceType) {
+        state
+            .stream_health(device_type)
+            .on_callback(Instant::now() + RECOVERED_AFTER_AUDIO + Duration::from_millis(500));
+    }
+
     fn kill(state: &RecordingState, device_type: DeviceType) {
         state
             .stream_health(device_type)
@@ -494,7 +504,7 @@ mod tests {
 
         assert_eq!(host.swapped_to(), vec!["monitor", "monitor"]);
         assert_eq!(state.stream_health(DeviceType::System).status(), StreamStatus::Running);
-        state.note_stream_callback(DeviceType::System);
+        deliver_audio(&state, DeviceType::System);
         watchdog_tick(&state, Instant::now());
         assert_eq!(event_names(&events), vec!["audio-stream-degraded", "audio-stream-recovered"]);
     }
@@ -583,7 +593,7 @@ mod tests {
         host.swap_results.lock().unwrap().push_back(Ok(()));
         let ticket = claim_rebuild(&host, &state, &req, later + Duration::from_secs(31)).expect("retry due");
         rebuild_stream(&host, &state, req, ticket).await;
-        state.note_stream_callback(DeviceType::System);
+        deliver_audio(&state, DeviceType::System);
         watchdog_tick(&state, Instant::now());
         assert_eq!(
             event_names(&events),
@@ -654,6 +664,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_mic_that_stalls_after_delivering_audio_keeps_being_rebuilt_on_its_device() {
+        let (state, events) = session(false);
+        let mut host = FakeHost::new(state.clone(), vec![Ok(()); 20]);
+        host.default_input = Some("default".into());
+        for _ in 0..8 {
+            deliver_audio(&state, DeviceType::Microphone);
+            error_burst(&state, DeviceType::Microphone);
+            run(&host, request(DeviceType::Microphone, false)).await;
+        }
+
+        assert_eq!(host.swapped_to(), vec!["USB mic"; 8], "no fallback, no giving up");
+        assert_eq!(state.stream_health(DeviceType::Microphone).status(), StreamStatus::Running);
+        assert!(host.app_events.lock().unwrap().is_empty());
+        assert!(!event_names(&events).contains(&"recording-error"));
+    }
+
+    #[tokio::test]
+    async fn a_system_device_that_keeps_dying_is_announced_once_until_it_recovers() {
+        let (state, events) = session(true);
+        let host = FakeHost::new(state.clone(), vec![Ok(()); 40]);
+        rebuild_until_given_up(&host, DeviceType::System).await;
+        assert_eq!(event_names(&events), vec!["audio-stream-degraded", "system-audio-unavailable"]);
+
+        // Each periodic retry opens the device, which dies again before
+        // delivering real audio, and the stream is given up on again.
+        let req = request(DeviceType::System, false);
+        let mut later = Instant::now();
+        for _ in 0..5 {
+            later += Duration::from_secs(400);
+            let ticket = claim_rebuild(&host, &state, &req, later).expect("retry due");
+            rebuild_stream(&host, &state, req.clone(), ticket).await;
+            watchdog_tick(&state, Instant::now());
+            error_burst(&state, DeviceType::System);
+            let ticket = claim_rebuild(&host, &state, &req, later).expect("dead stream rebuilt");
+            rebuild_stream(&host, &state, req.clone(), ticket).await;
+            assert_eq!(state.stream_health(DeviceType::System).status(), StreamStatus::Failed);
+        }
+        assert_eq!(
+            event_names(&events),
+            vec!["audio-stream-degraded", "system-audio-unavailable"],
+            "failed retries repeat nothing"
+        );
+
+        // A retry that delivers real audio is the recovery.
+        let ticket = claim_rebuild(&host, &state, &req, later + Duration::from_secs(400)).expect("retry due");
+        rebuild_stream(&host, &state, req, ticket).await;
+        deliver_audio(&state, DeviceType::System);
+        watchdog_tick(&state, Instant::now());
+        assert_eq!(
+            event_names(&events),
+            vec!["audio-stream-degraded", "system-audio-unavailable", "audio-stream-recovered"]
+        );
+    }
+
+    #[tokio::test]
     async fn system_audio_missing_at_start_is_retried_and_its_return_announced() {
         let (state, events) = session(false);
         state.report_system_audio_unavailable(None, "no monitor source".into());
@@ -666,7 +731,7 @@ mod tests {
         rebuild_stream(&host, &state, req, ticket).await;
 
         assert_eq!(host.swapped_to(), vec!["monitor"], "the default is looked up again");
-        state.note_stream_callback(DeviceType::System);
+        deliver_audio(&state, DeviceType::System);
         watchdog_tick(&state, Instant::now());
         assert_eq!(event_names(&events), vec!["system-audio-unavailable", "audio-stream-recovered"]);
     }

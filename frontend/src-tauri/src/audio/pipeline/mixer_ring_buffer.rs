@@ -20,7 +20,10 @@
 //! - Clock drift and residual misalignment are corrected in steps of at most
 //!   `CORRECTION_STEP_MS` per chunk: samples are dropped from the stream that
 //!   runs ahead, or the incoming chunk's first sample is repeated in the one
-//!   that lags, so no audible cut and no silence is introduced.
+//!   that lags, so no audible cut and no silence is introduced. A correction
+//!   starts only after the misalignment has stayed beyond the deadband for
+//!   `CORRECTION_PERSIST_MS` and runs until it is within the inner band, so
+//!   an estimate that wobbles (bursty delivery) causes no back-and-forth steps.
 
 use std::collections::VecDeque;
 
@@ -42,11 +45,21 @@ const RESYNC_MS: u32 = 100;
 /// A suspected gap must persist over this much arrival time to be real.
 const GAP_CONFIRM_MS: u32 = 150;
 
-/// Span of arrivals over which each stream's least latency is taken.
-const LAG_WINDOW_MS: u32 = 2_000;
+/// Span of arrivals over which each stream's least latency is taken. Short so
+/// the estimate follows clock drift closely; its wobble is left to the
+/// correction hysteresis below.
+const LAG_WINDOW_MS: u32 = 750;
 
 /// Misalignment between the streams tolerated before correcting it.
 const ALIGNMENT_DEADBAND_MS: u32 = 5;
+
+/// Once correcting, continue until the misalignment is within this.
+const ALIGNMENT_INNER_BAND_MS: u32 = 1;
+
+/// The misalignment must stay beyond the deadband this long before a
+/// correction starts, so an estimate that wobbles (bursty delivery whose
+/// least-late chunk drifts in phase) does not trigger back-and-forth steps.
+const CORRECTION_PERSIST_MS: u32 = 2_000;
 
 /// Most audio removed or held in one correction step (one per chunk).
 const CORRECTION_STEP_MS: u32 = 1;
@@ -75,6 +88,11 @@ struct StreamTimeline {
     /// before a correction stay comparable with those after it.
     corrections: i64,
     pending_gap: Option<PendingGap>,
+    /// Side (+1 hold, −1 drop) and arrival time since the misalignment has
+    /// been beyond the deadband, while not yet correcting.
+    beyond_deadband: Option<(i64, i64)>,
+    /// Correction in progress: +1 holding, −1 dropping, 0 none.
+    correcting: i64,
 }
 
 impl StreamTimeline {
@@ -105,6 +123,8 @@ impl StreamTimeline {
         self.errors.clear();
         self.corrections = 0;
         self.pending_gap = None;
+        self.beyond_deadband = None;
+        self.correcting = 0;
     }
 }
 
@@ -162,6 +182,8 @@ impl AudioMixerRingBuffer {
         let lag_window = self.samples_for_ms(LAG_WINDOW_MS);
         let deadband = self.samples_for_ms(ALIGNMENT_DEADBAND_MS);
         let step = self.samples_for_ms(CORRECTION_STEP_MS).max(1);
+        let inner_band = self.samples_for_ms(ALIGNMENT_INNER_BAND_MS);
+        let persist = self.samples_for_ms(CORRECTION_PERSIST_MS);
 
         let (stream, other) = self.streams_mut(device_type);
         let other_lag = other.is_tracking().then(|| other.lag());
@@ -204,16 +226,40 @@ impl AudioMixerRingBuffer {
         }
         stream.pending_gap = None;
 
-        // Align with the other stream in small steps.
+        // Align with the other stream in small steps, with hysteresis: start
+        // once the misalignment has stayed beyond the deadband (same side) for
+        // `CORRECTION_PERSIST_MS`, stop once it is back inside the inner band.
         let misalignment = other_lag.map_or(0, |other_lag| stream.lag() - other_lag);
-        if misalignment > deadband {
+        let side = if misalignment > deadband {
+            1
+        } else if misalignment < -deadband {
+            -1
+        } else {
+            0
+        };
+        if stream.correcting != 0 {
+            if misalignment.abs() <= inner_band || misalignment.signum() != stream.correcting {
+                stream.correcting = 0;
+            }
+        } else if side == 0 {
+            stream.beyond_deadband = None;
+        } else {
+            let (since_side, since) = *stream.beyond_deadband.get_or_insert((side, arrival_end));
+            if since_side != side {
+                stream.beyond_deadband = Some((side, arrival_end));
+            } else if arrival_end - since >= persist {
+                stream.correcting = side;
+                stream.beyond_deadband = None;
+            }
+        }
+        if stream.correcting > 0 {
             // Placed earlier than captured relative to the other stream: hold.
             let held = misalignment.min(step);
             stream.samples.extend(std::iter::repeat(samples[0]).take(held as usize));
             stream.end = Some(prev_end + held);
             stream.corrections += held;
             Self::place(stream, head, prev_end + held, samples);
-        } else if misalignment < -deadband {
+        } else if stream.correcting < 0 {
             // Placed later than captured: drop from the front of this chunk.
             let dropped = (-misalignment).min(step).min(n);
             stream.corrections -= dropped;
@@ -466,6 +512,36 @@ mod tests {
             (dropped, held)
         }
 
+        /// Correction steps (a drop or a hold) in this stream's output whose
+        /// capture time is at or after `after_ms`.
+        fn correction_events(&self, system: bool, after_ms: f64) -> usize {
+            let stream = if system { &self.sys } else { &self.mic };
+            let values: Vec<f32> = self
+                .pairs
+                .iter()
+                .map(|&(m, s)| if system { s } else { m })
+                .filter(|v| *v != 0.0)
+                .collect();
+            let mut events = 0;
+            let mut in_hold = false;
+            for pair in values.windows(2) {
+                let step = pair[1] - pair[0];
+                let late = stream.wall_ms(pair[1]) >= after_ms;
+                if step == 0.0 {
+                    if !in_hold && late {
+                        events += 1;
+                    }
+                    in_hold = true;
+                } else {
+                    in_hold = false;
+                    if step > 1.0 && late {
+                        events += 1;
+                    }
+                }
+            }
+            events
+        }
+
         /// Samples of this stream's captured audio missing from the output.
         fn lost_samples(&self, system: bool) -> u64 {
             let stream = if system { &self.sys } else { &self.mic };
@@ -568,19 +644,27 @@ mod tests {
     }
 
     #[test]
-    fn bursty_delivery_inserts_no_silence_and_converges() {
-        for burst_ms in [85, 170, 256] {
+    fn bursty_delivery_inserts_no_silence_and_settles() {
+        for burst_ms in [64, 85, 170, 256] {
             let mic = SimStream::new(DeviceType::Microphone, 12).sizes(480, 1_440);
             let mut sys = SimStream::new(DeviceType::System, 13).sizes(1_024, 1_024);
             sys.burst_ms = burst_ms;
-            let mixed = run(mic, sys, 40);
+            let mixed = run(mic, sys, 90);
 
             assert_eq!(mixed.steady_state_padding(), 0, "{burst_ms} ms bursts: silence inserted");
-            // A burst's least-late chunk can still be a partial period late.
-            assert!(mixed.max_offset_ms(15_000.0) <= 15.0,
-                    "{burst_ms} ms bursts: offset {} ms", mixed.max_offset_ms(15_000.0));
+            // Arrival times cannot show where in a burst's period the audio
+            // was captured: the least-late chunk can be up to one period
+            // (1024 samples, 21.3 ms) late, and that bias stays.
+            assert!(mixed.max_offset_ms(20_000.0) <= 21.4,
+                    "{burst_ms} ms bursts: offset {} ms", mixed.max_offset_ms(20_000.0));
             let (dropped, held) = mixed.largest_corrections(true);
             assert!(dropped <= 48 && held <= 48, "{burst_ms} ms bursts: correction of {dropped}/{held} samples at once");
+            // The latency of the least-late chunk wanders with the burst phase;
+            // that must not keep nudging the streams back and forth.
+            for system in [false, true] {
+                assert_eq!(mixed.correction_events(system, 20_000.0), 0,
+                           "{burst_ms} ms bursts: still correcting after settling (system={system})");
+            }
         }
     }
 
@@ -601,7 +685,15 @@ mod tests {
 
     #[test]
     fn clock_drift_is_corrected_in_small_steps_without_silence() {
-        for (mic_clock, sys_clock) in [(1.005, 1.0), (1.0, 0.995), (0.995, 1.0), (1.0, 1.005)] {
+        // 0.5% is ~25x a real device's clock error; 200 ppm is realistic.
+        for (mic_clock, sys_clock, max_offset_ms) in [
+            (1.005, 1.0, 20.0),
+            (1.0, 0.995, 20.0),
+            (0.995, 1.0, 20.0),
+            (1.0, 1.005, 20.0),
+            (1.0002, 1.0, 8.0),
+            (1.0, 0.9998, 8.0),
+        ] {
             let mut mic = SimStream::new(DeviceType::Microphone, 5).sizes(480, 1_440);
             let mut sys = SimStream::new(DeviceType::System, 6).sizes(256, 2_048);
             mic.clock = mic_clock;
@@ -609,7 +701,7 @@ mod tests {
             let mixed = run(mic, sys, 120);
 
             assert_eq!(mixed.steady_state_padding(), 0, "drift {mic_clock}/{sys_clock}: silence inserted");
-            assert!(mixed.max_offset_ms(2_000.0) <= 20.0,
+            assert!(mixed.max_offset_ms(2_000.0) <= max_offset_ms,
                     "drift {mic_clock}/{sys_clock}: offset {} ms", mixed.max_offset_ms(2_000.0));
             for system in [false, true] {
                 let (dropped, held) = mixed.largest_corrections(system);
