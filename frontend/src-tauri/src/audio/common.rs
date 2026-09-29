@@ -17,13 +17,13 @@ pub(crate) async fn acquire_engine_lifecycle_lock() -> OwnedMutexGuard<()> {
 }
 
 /// Unload the transcription engine after a batch job (import or retranscription).
-/// Skips unloading if a live recording is currently in progress, since recording
-/// uses the same global engine instances.
+/// Skips unloading while a recording, its stop, or its background transcription
+/// drain is using the engine, since recording uses the same global engine instances.
 pub(crate) async fn unload_engine_after_batch(use_parakeet: bool) {
     let _engine_lifecycle_guard = acquire_engine_lifecycle_lock().await;
 
-    if crate::audio::recording_commands::is_recording().await {
-        log::info!("Skipping model unload after batch: recording in progress");
+    if crate::audio::recording_commands::transcription_engine_in_use() {
+        log::info!("Skipping model unload after batch: transcription engine in use by a recording");
         return;
     }
 

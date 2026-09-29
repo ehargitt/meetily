@@ -651,6 +651,14 @@ pub async fn api_get_transcript_config<R: Runtime>(
     }
 }
 
+/// Whether saving `provider`/`model` would change the effective transcript config.
+/// No saved row means the `api_get_transcript_config` default is in effect.
+fn changes_transcription_engine(saved: Option<(&str, &str)>, provider: &str, model: &str) -> bool {
+    let (saved_provider, saved_model) =
+        saved.unwrap_or(("parakeet", crate::config::DEFAULT_PARAKEET_MODEL));
+    saved_provider != provider || saved_model != model
+}
+
 #[tauri::command]
 pub async fn api_save_transcript_config<R: Runtime>(
     _app: AppHandle<R>,
@@ -665,6 +673,20 @@ pub async fn api_save_transcript_config<R: Runtime>(
         &provider
     );
     let pool = state.db_manager.pool();
+
+    if crate::audio::recording_commands::transcription_engine_in_use() {
+        let saved = SettingsRepository::get_transcript_config(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        let saved = saved
+            .as_ref()
+            .map(|config| (config.provider.as_str(), config.model.as_str()));
+        if changes_transcription_engine(saved, &provider, &model) {
+            return Err(crate::audio::recording_commands::engine_in_use_error(
+                "change the transcription model or provider",
+            ));
+        }
+    }
 
     if let Err(e) = SettingsRepository::save_transcript_config(pool, &provider, &model).await {
         log_error!("Failed to save transcript config: {}", e);
@@ -1392,5 +1414,26 @@ pub async fn api_test_custom_openai_connection<R: Runtime>(
                 Err(format!("Connection failed: {}", e))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcript_config_change_compares_provider_and_model() {
+        let saved = Some(("localWhisper", "large-v3"));
+        assert!(!changes_transcription_engine(saved, "localWhisper", "large-v3"));
+        assert!(changes_transcription_engine(saved, "localWhisper", "base"));
+        assert!(changes_transcription_engine(saved, "parakeet", "large-v3"));
+    }
+
+    #[test]
+    fn transcript_config_change_without_saved_row_compares_the_default() {
+        let default_model = crate::config::DEFAULT_PARAKEET_MODEL;
+        assert!(!changes_transcription_engine(None, "parakeet", default_model));
+        assert!(changes_transcription_engine(None, "localWhisper", default_model));
+        assert!(changes_transcription_engine(None, "parakeet", "parakeet-other"));
     }
 }
