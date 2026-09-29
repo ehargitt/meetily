@@ -260,9 +260,14 @@ impl From<std::io::Error> for ParakeetEngineError {
     }
 }
 
+/// A loaded model, shared so inference can run on a blocking thread without
+/// holding `current_model`. ONNX sessions need `&mut` to run, so the inner
+/// mutex serializes inference on one model.
+type SharedModel = Arc<std::sync::Mutex<ParakeetModel>>;
+
 pub struct ParakeetEngine {
     models_dir: PathBuf,
-    current_model: Arc<RwLock<Option<ParakeetModel>>>,
+    current_model: Arc<RwLock<Option<SharedModel>>>,
     current_model_name: Arc<RwLock<Option<String>>>,
     model_lifecycle_lock: Mutex<()>,
     pub(crate) available_models: Arc<RwLock<HashMap<String, ModelInfo>>>,
@@ -485,7 +490,7 @@ impl ParakeetEngine {
                     anyhow!("Failed to load Parakeet model {}: {}", model_name, error)
                 })?;
 
-                *self.current_model.write().await = Some(model);
+                *self.current_model.write().await = Some(Arc::new(std::sync::Mutex::new(model)));
                 *self.current_model_name.write().await = Some(model_name.to_string());
 
                 log::info!(
@@ -540,10 +545,16 @@ impl ParakeetEngine {
     }
 
     /// Transcribe audio samples using the loaded Parakeet model
+    ///
+    /// Inference takes seconds of CPU/GPU time, so it runs on a blocking thread.
+    /// An unload during inference takes effect for later calls; the running
+    /// call keeps its model alive until it returns.
     pub async fn transcribe_audio(&self, audio_data: Vec<f32>) -> Result<String> {
-        let mut model_guard = self.current_model.write().await;
-        let model = model_guard
-            .as_mut()
+        let model = self
+            .current_model
+            .read()
+            .await
+            .clone()
             .ok_or_else(|| anyhow!("No Parakeet model loaded. Please load a model first."))?;
 
         let duration_seconds = audio_data.len() as f64 / 16000.0; // Assuming 16kHz
@@ -553,10 +564,15 @@ impl ParakeetEngine {
             duration_seconds
         );
 
-        // Transcribe using Parakeet model
-        let result = model
-            .transcribe_samples(audio_data)
-            .map_err(|e| anyhow!("Parakeet transcription failed: {}", e))?;
+        let result = tokio::task::spawn_blocking(move || {
+            model
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .transcribe_samples(audio_data)
+        })
+        .await
+        .map_err(|e| anyhow!("Parakeet inference task failed: {}", e))?
+        .map_err(|e| anyhow!("Parakeet transcription failed: {}", e))?;
 
         log::debug!("Parakeet transcription result: '{}'", result.text);
 
