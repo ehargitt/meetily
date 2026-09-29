@@ -105,8 +105,9 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         setMeetings(transformedMeetings);
         Analytics.trackBackendConnection(true);
       } catch (error) {
+        // Keep the list already shown: a transient failure must not make
+        // every meeting vanish from the sidebar.
         console.error('Error fetching meetings:', error);
-        setMeetings([]);
         Analytics.trackBackendConnection(false, error instanceof Error ? error.message : 'Unknown error');
       }
     }
