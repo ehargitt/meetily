@@ -8,7 +8,7 @@ use super::batch_processor::AudioMetricsBatcher;
 use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
 use super::devices::AudioDevice;
-use super::recording_state::{AudioChunk, AudioError, RecordingState, DeviceType};
+use super::recording_state::{AudioChunk, AudioError, ChunkSendError, RecordingState, DeviceType};
 use super::audio_processing::{audio_to_mono, LoudnessNormalizer, NoiseSuppressionProcessor, HighPassFilter};
 use super::vad::{ContinuousVadProcessor};
 
@@ -510,26 +510,12 @@ impl AudioCapture {
         // Individual raw streams go only to the transcription pipeline below
 
         // Send to processing pipeline for transcription
-        if let Err(e) = self.state.send_audio_chunk(audio_chunk) {
-            // Check if this is the "pipeline not ready" error
-            if e.to_string().contains("Audio pipeline not ready") {
-                // This is expected during initialization, just log it as debug
-                debug!("Audio pipeline not ready yet, skipping chunk {}", chunk_id);
-                return;
-            }
-
-            warn!("Failed to send audio chunk: {}", e);
-            // More specific error handling based on failure reason
-            let error = if e.to_string().contains("channel closed") {
-                AudioError::ChannelClosed
-            } else if e.to_string().contains("full") {
-                AudioError::BufferOverflow
-            } else {
-                AudioError::ProcessingFailed
-            };
-            self.state.report_error(error);
-        } else {
-            debug!("Sent audio chunk {} ({} samples)", chunk_id, data.len());
+        match self.state.send_audio_chunk(audio_chunk) {
+            Ok(()) => debug!("Sent audio chunk {} ({} samples)", chunk_id, data.len()),
+            // Expected while the pipeline starts or after stop detached it
+            Err(ChunkSendError::NotReady) => debug!("Audio pipeline not ready yet, skipping chunk {}", chunk_id),
+            // Logged with a rate limit and reported to the UI once
+            Err(ChunkSendError::PipelineClosed) => self.state.report_pipeline_closed(),
         }
     }
 
@@ -994,6 +980,29 @@ impl Default for AudioPipelineManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dead_pipeline_is_reported_once_without_stopping_capture() {
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        state.set_health_callback(move |event| sink.lock().unwrap().push(event));
+        let (sender, receiver) = mpsc::unbounded_channel();
+        state.set_audio_sender(sender);
+        drop(receiver); // the pipeline task died
+
+        let device = Arc::new(AudioDevice::new("mic".into(), super::super::devices::DeviceType::Input));
+        let capture = AudioCapture::new(device, state.clone(), 48_000, 1, DeviceType::System, None);
+        for _ in 0..100 {
+            capture.process_audio_data(&[0.0; 480]);
+        }
+
+        assert!(state.is_recording());
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "one recording-error, not one per buffer");
+        assert!(matches!(events[0], super::super::recording_state::StreamHealthEvent::CaptureFailed { .. }));
+    }
 
     #[test]
     fn test_live_vad_redemption_matches_pro_policy() {
