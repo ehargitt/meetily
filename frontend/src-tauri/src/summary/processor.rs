@@ -114,6 +114,25 @@ impl LlmCall<'_> {
         .await
     }
 
+    /// Like [`Self::complete`], but a completion cut off at the output limit is an error: the
+    /// combine, final-report, translation and normalization outputs are saved or built on as
+    /// they are, so a cut one must not pass as complete. (A cut chunk summary only loses detail
+    /// of its chunk and is kept.)
+    async fn complete_whole(
+        &self,
+        stage: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<LlmCompletion, String> {
+        let completion = self.complete(system_prompt, user_prompt).await?;
+        if completion.truncated {
+            return Err(format!(
+                "{stage} was cut off at the model's output limit; try a model with a larger context window or a shorter template"
+            ));
+        }
+        Ok(completion)
+    }
+
     fn is_cancelled(&self) -> bool {
         self.cancellation_token
             .is_some_and(CancellationToken::is_cancelled)
@@ -496,7 +515,9 @@ async fn combine_chunk_summaries(
             }
             let prompt =
                 build_combine_summary_user_prompt(&summaries[group].join(SUMMARY_SEPARATOR));
-            let completion = llm.complete(COMBINE_SYSTEM_PROMPT, &prompt).await?;
+            let completion = llm
+                .complete_whole("Combined summary", COMBINE_SYSTEM_PROMPT, &prompt)
+                .await?;
             let cleaned = clean_llm_markdown_detailed(&completion.content);
             *reasoning_stripped |= completion.reasoning_stripped || cleaned.reasoning_stripped;
             require_visible_markdown("Combined summary", &cleaned)?;
@@ -546,9 +567,10 @@ pub(crate) struct GeneratedMeetingSummary {
     pub normalization_fallback: bool,
 }
 
-/// Generates the meeting summary. With a `context_budget` (Ollama and BuiltInAI), a transcript
-/// that does not fit one request next to the prompt and output reserve is summarized in chunks
-/// and the chunk summaries are combined; without one (cloud providers) it goes in one request.
+/// Generates the meeting summary. With a `context_budget` (Ollama, BuiltInAI, and OpenRouter
+/// when its catalogue lists the model; see `SummaryService::select_context_budget`), a
+/// transcript that does not fit one request next to the prompt and output reserve is summarized
+/// in chunks and the chunk summaries are combined; without one it goes in one request.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn generate_meeting_summary(
     client: &Client,
@@ -689,7 +711,9 @@ pub(crate) async fn generate_meeting_summary(
 
             info!("Generating final markdown report with template: {}", template_id);
             let final_user_prompt = build_final_report_user_prompt(&content_to_summarize, custom_prompt);
-            let completion = llm.complete(&final_system_prompt, &final_user_prompt).await?;
+            let completion = llm
+                .complete_whole("Final summary", &final_system_prompt, &final_user_prompt)
+                .await?;
             let cleaned = clean_llm_markdown_detailed(&completion.content);
             stage_reasoning_stripped |= completion.reasoning_stripped || cleaned.reasoning_stripped;
             require_visible_markdown("Final summary", &cleaned)?;
@@ -736,8 +760,10 @@ async fn run_markdown_transform(
     if llm.is_cancelled() {
         return Err("Summary generation was cancelled".to_string());
     }
+    // A cut-off normalization falls back to the intact pass-1 markdown; a cut-off translation
+    // fails the summary.
     let completion = llm
-        .complete(system_prompt, user_prompt)
+        .complete_whole(failure_label, system_prompt, user_prompt)
         .await
         .map_err(|error| format!("{failure_label} failed: {error}"))?;
     let mut cleaned = clean_llm_markdown_detailed(&completion.content);
@@ -893,12 +919,22 @@ mod tests {
         }
     }
 
-    /// Runs a summary of `transcript` against a fake Ollama server whose every reply is
-    /// `reply_words` words long, returning the result and every request body it received.
+    /// An Ollama `/api/chat` reply of `words` words that finished for `done_reason`.
+    fn ollama_reply(words: usize, done_reason: &str) -> serde_json::Value {
+        serde_json::json!({
+            "message": {"role": "assistant", "content": format!("# Title\n## Summary\n{}", "word ".repeat(words))},
+            "done": true,
+            "done_reason": done_reason
+        })
+    }
+
+    /// Runs a summary of `transcript` against a fake Ollama server that answers each request
+    /// body with `reply(body)`, returning the result and every request body it received.
     async fn summarize_with_fake_ollama(
         budget: ContextBudget,
         transcript: &str,
-        reply_words: usize,
+        summary_language: Option<&str>,
+        reply: impl Fn(&serde_json::Value) -> serde_json::Value + Send + 'static,
     ) -> (Result<GeneratedMeetingSummary, String>, Vec<serde_json::Value>) {
         use crate::summary::llm_client::test_http::{read_http_request, request_json, write_json_response};
         use std::sync::{Arc, Mutex};
@@ -907,17 +943,13 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
         let recorded = bodies.clone();
-        let reply = serde_json::json!({
-            "message": {"role": "assistant", "content": format!("# Title\n## Summary\n{}", "word ".repeat(reply_words))},
-            "done": true
-        })
-        .to_string();
         let server = tokio::spawn(async move {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let request = read_http_request(&mut stream).await;
-                recorded.lock().unwrap().push(request_json(&request));
-                write_json_response(&mut stream, reply.as_bytes()).await;
+                let body = request_json(&read_http_request(&mut stream).await);
+                let answer = reply(&body).to_string();
+                recorded.lock().unwrap().push(body);
+                write_json_response(&mut stream, answer.as_bytes()).await;
             }
         });
 
@@ -939,8 +971,8 @@ mod tests {
             None,
             None,
             None,
-            Some("en"),
-            Some("en"),
+            summary_language,
+            summary_language,
             None,
         )
         .await;
@@ -970,7 +1002,7 @@ mod tests {
         assert!(rough_token_count(&transcript) > 3 * budget.context_tokens);
 
         // Every reply is ~1500 tokens, so chunk summaries need more than one combine round.
-        let (result, bodies) = summarize_with_fake_ollama(budget, &transcript, 850).await;
+        let (result, bodies) = summarize_with_fake_ollama(budget, &transcript, Some("en"), |_| ollama_reply(850, "stop")).await;
 
         let generated = result.unwrap();
         assert!(generated.successful_chunk_count > 1);
@@ -978,21 +1010,63 @@ mod tests {
         assert!(combine_requests > 1, "expected several combine requests, got {combine_requests}");
         for body in &bodies {
             assert_eq!(body["options"]["num_ctx"], budget.context_tokens);
-            assert_eq!(body["options"]["num_predict"], budget.output_reserve_tokens);
             let prompt_tokens = rough_token_count(body["messages"][0]["content"].as_str().unwrap())
                 + rough_token_count(body["messages"][1]["content"].as_str().unwrap());
+            let num_predict = body["options"]["num_predict"].as_u64().unwrap() as usize;
+            assert_eq!(num_predict, budget.output_room(prompt_tokens));
+            assert!(num_predict >= budget.output_reserve_tokens);
             assert!(
-                prompt_tokens + budget.output_reserve_tokens <= budget.context_tokens,
-                "{prompt_tokens} prompt tokens overflow the window"
+                prompt_tokens + num_predict <= budget.context_tokens,
+                "{prompt_tokens} prompt + {num_predict} output tokens overflow the window"
             );
         }
+        // The final report's prompt is small, so it gets far more room than the chunk reserve.
+        let final_request = bodies.last().unwrap();
+        assert!(final_request["options"]["num_predict"].as_u64().unwrap() as usize > budget.output_reserve_tokens + 1000);
+    }
+
+    fn is_final_report(body: &serde_json::Value) -> bool {
+        body["messages"][1]["content"].as_str().unwrap().starts_with("<transcript_chunks>")
+    }
+
+    #[tokio::test]
+    async fn a_final_report_cut_off_at_the_output_limit_is_not_saved() {
+        let (result, _) = summarize_with_fake_ollama(
+            ContextBudget::for_ollama(8192),
+            "[00:01] Alice: ship on friday\n",
+            Some("en"),
+            |body| ollama_reply(50, if is_final_report(body) { "length" } else { "stop" }),
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert!(error.contains("Final summary was cut off"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_normalization_keeps_the_intact_english_summary() {
+        let (result, bodies) = summarize_with_fake_ollama(
+            ContextBudget::for_ollama(8192),
+            "[00:01] Alice: ship on friday\n",
+            None,
+            |body| {
+                let normalizing = body["messages"][0]["content"] == english_normalization_system_prompt();
+                ollama_reply(if normalizing { 3 } else { 40 }, if normalizing { "length" } else { "stop" })
+            },
+        )
+        .await;
+
+        assert_eq!(bodies.len(), 2, "final report, then normalization");
+        let generated = result.unwrap();
+        assert!(generated.normalization_fallback);
+        assert_eq!(generated.english_markdown, format!("# Title\n## Summary\n{}", "word ".repeat(40)).trim());
     }
 
     #[tokio::test]
     async fn summaries_too_large_to_pair_are_combined_two_at_a_time() {
         // A 4k window leaves ~2.4k content tokens; ~1.4k-token replies never fit two together.
         let budget = ContextBudget::for_ollama(4096);
-        let (result, bodies) = summarize_with_fake_ollama(budget, &long_transcript(400), 800).await;
+        let (result, bodies) = summarize_with_fake_ollama(budget, &long_transcript(400), Some("en"), |_| ollama_reply(800, "stop")).await;
 
         result.unwrap();
         let prompts = combine_prompts(&bodies);
