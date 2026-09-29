@@ -199,6 +199,7 @@ futures-channel = "0.3.31"
 #   --features openblas (OpenBLAS optimization, requires BLAS_INCLUDE_DIRS)
 [target.'cfg(target_os = "linux")'.dependencies]
 whisper-rs = { version = "0.13.2", features = ["raw-api"] }
+alsa = "0.9"
 futures-channel = "0.3.31"
 
 [dev-dependencies]

@@ -2,43 +2,48 @@ use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use log::error;
 
-use super::configuration::{AudioDevice, DeviceType};
+use super::configuration::AudioDevice;
+#[cfg(not(target_os = "linux"))]
+use super::configuration::DeviceType;
 use super::platform;
 
 /// List all available audio devices on the system
 pub async fn list_audio_devices() -> Result<Vec<AudioDevice>> {
     let host = cpal::default_host();
 
-    // Platform-specific device enumeration
-    let mut devices = {
-        #[cfg(target_os = "windows")]
-        {
-            platform::configure_windows_audio(&host)?
-        }
+    // cpal's ALSA enumeration opens every PCM, so Linux lists devices from
+    // ALSA name hints alone (see platform::linux).
+    #[cfg(target_os = "linux")]
+    return platform::configure_linux_audio(&host);
 
-        #[cfg(target_os = "linux")]
-        {
-            platform::configure_linux_audio(&host)?
-        }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Platform-specific device enumeration
+        let mut devices = {
+            #[cfg(target_os = "windows")]
+            {
+                platform::configure_windows_audio(&host)?
+            }
 
-        #[cfg(target_os = "macos")]
-        {
-            platform::configure_macos_audio(&host)?
-        }
-    };
+            #[cfg(target_os = "macos")]
+            {
+                platform::configure_macos_audio(&host)?
+            }
+        };
 
-    // Add any additional devices from the default host
-    if let Ok(other_devices) = host.devices() {
-        for device in other_devices {
-            if let Ok(name) = device.name() {
-                if !devices.iter().any(|d| d.name == name) {
-                    devices.push(AudioDevice::new(name, DeviceType::Output));
+        // Add any additional devices from the default host
+        if let Ok(other_devices) = host.devices() {
+            for device in other_devices {
+                if let Ok(name) = device.name() {
+                    if !devices.iter().any(|d| d.name == name) {
+                        devices.push(AudioDevice::new(name, DeviceType::Output));
+                    }
                 }
             }
         }
-    }
 
-    Ok(devices)
+        Ok(devices)
+    }
 }
 
 /// Trigger audio permission request on platforms that require it
