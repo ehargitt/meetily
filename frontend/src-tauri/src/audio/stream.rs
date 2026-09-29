@@ -473,7 +473,9 @@ impl AudioStreamManager {
         }
 
         // Start system audio stream. If it cannot start, record mic-only and
-        // say so, but only once start can no longer fail.
+        // say so once the streams have started. The start can still fail after
+        // this (e.g. the auto-save meeting-folder check in activate_recording),
+        // in which case the user also sees the start error.
         let system_unavailable = match system_audio {
             Ok(sys_device) => {
                 info!("🔊 Creating system audio stream: {} (backend: {:?})", sys_device.name, backend);
