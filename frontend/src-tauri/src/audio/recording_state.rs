@@ -363,7 +363,15 @@ impl RecordingState {
 
     /// Mark running streams that have stopped delivering callbacks as dead.
     /// Returns the stalled streams; the caller rebuilds them.
+    ///
+    /// Linux only: the stall is cpal's ALSA overrun bug. On macOS a Bluetooth
+    /// input can legitimately deliver nothing for a while after start (see the
+    /// audio wake in recording_manager.rs), and rebuilding it there would
+    /// change behaviour this fix is not about.
     pub fn detect_stalls(&self, now: Instant) -> Vec<DeviceType> {
+        if !cfg!(target_os = "linux") {
+            return Vec::new();
+        }
         let active = self.is_active();
         [DeviceType::Microphone, DeviceType::System]
             .into_iter()
