@@ -36,6 +36,11 @@ function showSpeakerModelsHintOnce() {
   });
 }
 
+// Module scope, not per hook instance: the home page and
+// RecordingPostProcessingProvider each mount this hook, and a UI stop and a
+// tray stop must not both run the post-stop save.
+let stopInProgress = false;
+
 interface UseRecordingStopReturn {
   handleRecordingStop: (callApi: boolean) => Promise<void>;
   isStopping: boolean;
@@ -90,20 +95,18 @@ export function useRecordingStop(
 
   const router = useRouter();
 
-  // Guard to prevent duplicate/concurrent stop calls (e.g., from UI and tray simultaneously)
-  const stopInProgressRef = useRef(false);
-
   // Promise to track recording-stopped event data (fixes race condition with recording-stop-complete)
   const recordingStoppedDataRef = useRef<Promise<void> | null>(null);
 
   // Set up recording-stopped listener for meeting navigation
   useEffect(() => {
+    let cancelled = false;
     let unlistenFn: (() => void) | undefined;
 
     const setupRecordingStoppedListener = async () => {
       try {
         console.log('Setting up recording-stopped listener for navigation...');
-        unlistenFn = await listen<{
+        const fn = await listen<{
           message: string;
           folder_path?: string;
           meeting_name?: string;
@@ -122,6 +125,8 @@ export function useRecordingStop(
           })();
 
         });
+        if (cancelled) { fn(); return; }
+        unlistenFn = fn;
         console.log('Recording stopped listener setup complete');
       } catch (error) {
         console.error('Failed to setup recording stopped listener:', error);
@@ -132,6 +137,7 @@ export function useRecordingStop(
 
     return () => {
       console.log('Cleaning up recording stopped listener...');
+      cancelled = true;
       if (unlistenFn) {
         unlistenFn();
       }
@@ -145,10 +151,11 @@ export function useRecordingStop(
     }
 
     // Guard: prevent duplicate/concurrent stop calls
-    if (stopInProgressRef.current) {
+    if (stopInProgress) {
+      console.log('handleRecordingStop ignored - another stop is already processing');
       return;
     }
-    stopInProgressRef.current = true;
+    stopInProgress = true;
 
     // Set status to STOPPING immediately
     setStatus(RecordingStatus.STOPPING);
@@ -174,6 +181,7 @@ export function useRecordingStop(
       const POLL_INTERVAL = 500; // Check every 500ms
       let elapsedTime = 0;
       let transcriptionComplete = false;
+      let statusCheckFailed = false;
 
       // Listen for transcription-complete event
       const unlistenComplete = await listen('transcription-complete', () => {
@@ -211,7 +219,8 @@ export function useRecordingStop(
           await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
           elapsedTime += POLL_INTERVAL;
         } catch (error) {
-          console.error('Error checking transcription status:', error);
+          console.error('Error checking transcription status - saving the transcript received so far:', error);
+          statusCheckFailed = true;
           break;
         }
       }
@@ -220,13 +229,13 @@ export function useRecordingStop(
       console.log('🧹 CLEANUP: Cleaning up transcription-complete listener');
       unlistenComplete();
 
-      if (!transcriptionComplete && elapsedTime >= MAX_WAIT_TIME) {
-        console.warn('⏰ Transcription wait timeout reached after', elapsedTime, 'ms');
-      } else {
+      if (transcriptionComplete) {
         console.log('✅ Transcription completed after', elapsedTime, 'ms');
         // Wait longer for any late transcript segments (increased from 1s to 4s)
         console.log('⏳ Waiting for late transcript segments...');
         await new Promise(resolve => setTimeout(resolve, 4000));
+      } else if (!statusCheckFailed) {
+        console.warn('⏰ Transcription wait timeout reached after', elapsedTime, 'ms');
       }
 
       // Final buffer flush: process ALL remaining transcripts regardless of timing
@@ -254,7 +263,15 @@ export function useRecordingStop(
       // Save to SQLite
       // NOTE: enabled to save COMPLETE transcripts after frontend receives all updates
       // This ensures user sees all transcripts streaming in before database save
-      if (isCallApi && transcriptionComplete == true) {
+      // An unfinished or unknown transcription state still saves: the audio
+      // and every segment received so far must not be dropped.
+      if (isCallApi) {
+        if (!transcriptionComplete) {
+          toast.warning('Saving before transcription finished', {
+            description: 'Segments still being transcribed may be missing from this meeting.',
+            duration: 10000,
+          });
+        }
 
         setStatus(RecordingStatus.SAVING, 'Saving meeting to database...');
 
@@ -453,7 +470,7 @@ export function useRecordingStop(
       setIsRecordingDisabled(false);
     } finally {
       // Always reset the guard flag when done
-      stopInProgressRef.current = false;
+      stopInProgress = false;
     }
   }, [
     setIsRecording,
