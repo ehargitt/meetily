@@ -1,8 +1,17 @@
 use crate::api::{TranscriptSearchResult, TranscriptSegment};
 use chrono::Utc;
 use sqlx::{Connection, Error as SqlxError, SqlitePool};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{error, info};
 use uuid::Uuid;
+
+static MEETINGS_SAVED: AtomicU64 = AtomicU64::new(0);
+
+/// Meetings saved with `save_transcript` since launch. Tray Quit watches it to
+/// know when the frontend has stored the recording it just stopped.
+pub fn saved_meeting_count() -> u64 {
+    MEETINGS_SAVED.load(Ordering::SeqCst)
+}
 
 pub struct TranscriptsRepository;
 
@@ -78,6 +87,7 @@ impl TranscriptsRepository {
 
         // Commit the transaction
         transaction.commit().await?;
+        MEETINGS_SAVED.fetch_add(1, Ordering::SeqCst);
 
         Ok(meeting_id)
     }
