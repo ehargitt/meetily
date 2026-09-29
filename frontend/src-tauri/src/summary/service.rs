@@ -12,6 +12,7 @@ use crate::summary::processor::{
 use crate::summary::summary_engine::models;
 use crate::summary::templates::{self, Template};
 use crate::ollama::metadata::ModelMetadataCache;
+use crate::openrouter;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -432,37 +433,19 @@ impl SummaryService {
         };
 
         // The context window the model runs with. Chunking and Ollama's num_ctx both come from it.
-        let context_budget = match provider {
-            LLMProvider::Ollama => {
-                let model_max_context = match METADATA_CACHE
-                    .get_or_fetch(&model_name, ollama_endpoint.as_deref())
-                    .await
-                {
-                    Ok(metadata) => metadata.context_size,
-                    Err(e) => {
-                        warn!(
-                            "Failed to fetch context for {}: {}. Using {} tokens",
-                            model_name, e, OLLAMA_FALLBACK_CONTEXT
-                        );
-                        OLLAMA_FALLBACK_CONTEXT
-                    }
-                };
-                Some(ContextBudget::for_ollama(model_max_context))
+        let context_budget = match Self::select_context_budget(
+            &provider,
+            &model_name,
+            ollama_endpoint.as_deref(),
+            openrouter::MODELS_URL,
+        )
+        .await
+        {
+            Ok(budget) => budget,
+            Err(err_msg) => {
+                Self::fail_and_cleanup(&pool, &meeting_id, started_at, &err_msg).await;
+                return;
             }
-            LLMProvider::BuiltInAI => match models::get_model_by_name(&model_name) {
-                Some(model_def) => Some(ContextBudget::for_builtin(
-                    model_def.context_size,
-                    models::DEFAULT_MAX_TOKENS,
-                )),
-                None => {
-                    let err_msg = format!("Unknown built-in model: {}", model_name);
-                    Self::fail_and_cleanup(&pool, &meeting_id, started_at, &err_msg).await;
-                    return;
-                }
-            },
-            // Cloud and custom OpenAI-compatible providers get the whole transcript in one
-            // request: their context sizes are not known here and nothing configures one.
-            _ => None,
         };
         if let Some(budget) = context_budget {
             info!(
@@ -641,6 +624,70 @@ impl SummaryService {
             }
         }
         Self::cleanup_cancellation_token(&meeting_id, started_at);
+    }
+
+    /// The context budget chunking should respect for `provider`/`model_name`, or `None` to
+    /// send the whole transcript in one request. `Err` only for an unknown built-in model.
+    ///
+    /// OpenRouter windows come from its catalogue at `openrouter_models_url`; when that cannot
+    /// be read the summary runs single-pass as before. OpenAI, Claude, Groq and custom
+    /// OpenAI-compatible servers stay single-pass: nothing in the app reports or configures
+    /// their context size (`CustomOpenAIConfig` has no such field).
+    async fn select_context_budget(
+        provider: &LLMProvider,
+        model_name: &str,
+        ollama_endpoint: Option<&str>,
+        openrouter_models_url: &str,
+    ) -> Result<Option<ContextBudget>, String> {
+        match provider {
+            LLMProvider::Ollama => {
+                let model_max_context =
+                    match METADATA_CACHE.get_or_fetch(model_name, ollama_endpoint).await {
+                        Ok(metadata) => metadata.context_size,
+                        Err(e) => {
+                            warn!(
+                                "Failed to fetch context for {}: {}. Using {} tokens",
+                                model_name, e, OLLAMA_FALLBACK_CONTEXT
+                            );
+                            OLLAMA_FALLBACK_CONTEXT
+                        }
+                    };
+                Ok(Some(ContextBudget::for_ollama(model_max_context)))
+            }
+            LLMProvider::BuiltInAI => models::get_model_by_name(model_name)
+                .map(|model_def| {
+                    Some(ContextBudget::for_builtin(
+                        model_def.context_size,
+                        models::DEFAULT_MAX_TOKENS,
+                    ))
+                })
+                .ok_or_else(|| format!("Unknown built-in model: {}", model_name)),
+            LLMProvider::OpenRouter => {
+                let client = reqwest::Client::new();
+                match openrouter::fetch_context_length(&client, openrouter_models_url, model_name)
+                    .await
+                {
+                    Ok(Some(context_length)) => {
+                        Ok(Some(ContextBudget::for_hosted_model(context_length as usize)))
+                    }
+                    Ok(None) => {
+                        warn!(
+                            "OpenRouter lists no context length for {}; summarizing in one request",
+                            model_name
+                        );
+                        Ok(None)
+                    }
+                    Err(e) => {
+                        warn!("{}; summarizing {} in one request", e, model_name);
+                        Ok(None)
+                    }
+                }
+            }
+            LLMProvider::OpenAI
+            | LLMProvider::Claude
+            | LLMProvider::Groq
+            | LLMProvider::CustomOpenAI => Ok(None),
+        }
     }
 
     /// Updates the summary process status to failed with error message
@@ -1127,5 +1174,67 @@ mod tests {
     fn test_extract_cached_english_from_malformed_json_errors() {
         let raw = r#"{ not valid json"#;
         assert!(extract_cached_english_markdown(raw, &sample_cache_source(), Some("de")).is_err());
+    }
+
+    #[tokio::test]
+    async fn openrouter_budget_comes_from_the_catalogue_context_length() {
+        use crate::summary::llm_client::test_http::{read_http_request, write_json_response};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/api/v1/models", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request(&mut stream).await;
+            let body = br#"{"data":[{"id":"mistralai/mistral-7b-instruct","context_length":32768,"top_provider":{"context_length":8192}}]}"#;
+            write_json_response(&mut stream, body).await;
+        });
+
+        let budget = SummaryService::select_context_budget(
+            &LLMProvider::OpenRouter,
+            "mistralai/mistral-7b-instruct",
+            None,
+            &url,
+        )
+        .await;
+        server.await.unwrap();
+
+        assert_eq!(budget, Ok(Some(ContextBudget::for_hosted_model(8192))));
+    }
+
+    #[tokio::test]
+    async fn openrouter_without_a_catalogue_and_other_cloud_providers_stay_single_pass() {
+        // Port 9 (discard) on localhost refuses the connection immediately.
+        let unreachable = "http://127.0.0.1:9/api/v1/models";
+        assert_eq!(
+            SummaryService::select_context_budget(&LLMProvider::OpenRouter, "any/model", None, unreachable)
+                .await,
+            Ok(None)
+        );
+        for provider in [
+            LLMProvider::OpenAI,
+            LLMProvider::Claude,
+            LLMProvider::Groq,
+            LLMProvider::CustomOpenAI,
+        ] {
+            assert_eq!(
+                SummaryService::select_context_budget(&provider, "model", None, unreachable).await,
+                Ok(None)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn builtin_budget_comes_from_the_model_registry() {
+        let unused = "http://127.0.0.1:9/";
+        assert_eq!(
+            SummaryService::select_context_budget(&LLMProvider::BuiltInAI, "qwen3.5:4b", None, unused)
+                .await,
+            Ok(Some(ContextBudget::for_builtin(32_768, models::DEFAULT_MAX_TOKENS)))
+        );
+        assert!(
+            SummaryService::select_context_budget(&LLMProvider::BuiltInAI, "nope", None, unused)
+                .await
+                .is_err()
+        );
     }
 }

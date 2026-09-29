@@ -652,7 +652,7 @@ pub(crate) mod test_http {
                     name.eq_ignore_ascii_case("content-length")
                         .then(|| value.trim().parse::<usize>().unwrap())
                 })
-                .expect("request should have Content-Length");
+                .unwrap_or(0); // bodiless requests such as GET
             if request.len() >= headers_end + content_length {
                 return request;
             }

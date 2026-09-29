@@ -23,8 +23,8 @@ const NON_ASCII_UNITS_PER_BYTE: usize = 8;
 pub const OLLAMA_MAX_NUM_CTX: usize = 16_384;
 /// Context assumed when Ollama's model metadata cannot be read.
 pub const OLLAMA_FALLBACK_CONTEXT: usize = 4096;
-/// Completion room kept free on Ollama, whose output may grow until the window is full.
-const OLLAMA_OUTPUT_RESERVE: usize = 4096;
+/// Completion room kept free in Ollama and hosted-model windows (a quarter of small windows).
+const OUTPUT_RESERVE: usize = 4096;
 /// Chat-template role markers that the prompt estimate does not see.
 const CHAT_TEMPLATE_SLACK: usize = 64;
 /// Smallest transcript slice worth a request, even when the instructions crowd a tiny window.
@@ -60,10 +60,15 @@ impl ContextBudget {
     /// Budget for an Ollama model whose trained maximum is `model_max_context`, capped at
     /// [`OLLAMA_MAX_NUM_CTX`]. Small windows reserve a quarter for output instead of 4096.
     pub fn for_ollama(model_max_context: usize) -> Self {
-        let context_tokens = model_max_context.min(OLLAMA_MAX_NUM_CTX);
+        Self::for_hosted_model(model_max_context.min(OLLAMA_MAX_NUM_CTX))
+    }
+
+    /// Budget for a hosted model (e.g. on OpenRouter) whose window is `context_tokens`. No cap:
+    /// the provider, not this machine, holds the KV cache.
+    pub fn for_hosted_model(context_tokens: usize) -> Self {
         Self {
             context_tokens,
-            output_reserve_tokens: OLLAMA_OUTPUT_RESERVE.min(context_tokens / 4),
+            output_reserve_tokens: OUTPUT_RESERVE.min(context_tokens / 4),
         }
     }
 
@@ -123,6 +128,14 @@ mod tests {
         let small = ContextBudget::for_ollama(4096);
         assert_eq!(small.context_tokens, 4096);
         assert_eq!(small.output_reserve_tokens, 1024);
+    }
+
+    #[test]
+    fn hosted_model_context_is_not_capped() {
+        let budget = ContextBudget::for_hosted_model(200_000);
+        assert_eq!(budget.context_tokens, 200_000);
+        assert_eq!(budget.output_reserve_tokens, 4096);
+        assert_eq!(ContextBudget::for_hosted_model(8192).output_reserve_tokens, 2048);
     }
 
     #[test]
