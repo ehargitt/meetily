@@ -486,12 +486,11 @@ impl RecordingSaver {
                 }
                 Err(e) => {
                     error!("❌ Failed to finalize incremental saver: {}", e);
-                    let checkpoints = self.meeting_folder.as_ref()
-                        .map(|folder| folder.join(".checkpoints").display().to_string())
-                        .unwrap_or_else(|| "the meeting folder's .checkpoints folder".to_string());
-                    let message = format!(
-                        "The meeting audio could not be finalized ({}), so the meeting has no audio file. The recorded audio is kept as WAV files in {}.",
-                        e, checkpoints
+                    let message = finalize_failure_message(
+                        &e.to_string(),
+                        saver.get_checkpoint_count(),
+                        saver.has_unsaved_audio(),
+                        self.meeting_folder.as_deref(),
                     );
                     if let Err(emit_error) = app.emit("recording-save-error", serde_json::json!({ "message": message })) {
                         warn!("Failed to emit recording-save-error: {}", emit_error);
@@ -575,6 +574,30 @@ impl RecordingSaver {
     pub fn get_meeting_name(&self) -> Option<String> {
         self.meeting_name.clone()
     }
+}
+
+/// User message for a failed finalize. It points at the WAV checkpoints only
+/// when some were written.
+fn finalize_failure_message(
+    error: &str,
+    checkpoints_written: u32,
+    has_unsaved_audio: bool,
+    meeting_folder: Option<&std::path::Path>,
+) -> String {
+    if checkpoints_written == 0 {
+        return if has_unsaved_audio {
+            format!("The meeting audio could not be written to disk ({}), so the meeting has no audio file.", error)
+        } else {
+            format!("No audio was captured for this meeting, so it has no audio file ({}).", error)
+        };
+    }
+    let checkpoints = meeting_folder
+        .map(|folder| folder.join(".checkpoints").display().to_string())
+        .unwrap_or_else(|| "the meeting folder's .checkpoints folder".to_string());
+    format!(
+        "The meeting audio could not be finalized ({}), so the meeting has no audio file. The recorded audio is kept as WAV files in {}.",
+        error, checkpoints
+    )
 }
 
 impl Default for RecordingSaver {
@@ -669,6 +692,21 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("transcripts.json never reached {expected} segments");
+    }
+
+    #[test]
+    fn finalize_failure_mentions_checkpoints_only_when_some_exist() {
+        let folder = std::path::Path::new("/meetings/Standup");
+        let none = finalize_failure_message("No audio checkpoints to merge", 0, false, Some(folder));
+        assert!(none.starts_with("No audio was captured"));
+        assert!(!none.contains(".checkpoints"));
+
+        let unwritten = finalize_failure_message("disk full", 0, true, Some(folder));
+        assert!(unwritten.contains("could not be written to disk"));
+        assert!(!unwritten.contains(".checkpoints"));
+
+        let some = finalize_failure_message("FFmpeg failed", 3, true, Some(folder));
+        assert!(some.contains("/meetings/Standup/.checkpoints"));
     }
 
     #[test]
