@@ -24,6 +24,22 @@ static SEQUENCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Identifies one recording's transcription task; stamped on its transcript updates.
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Issue the next transcription session id. Called before the task that
+/// stamps it is spawned, so `last_issued_session_id` already covers it by the
+/// time any of its updates are emitted.
+pub(crate) fn allocate_session_id() -> u64 {
+    NEXT_SESSION_ID.fetch_add(1, Ordering::SeqCst)
+}
+
+/// The highest transcription session id issued in this app process, if any.
+/// A reloaded webview uses it to reject updates from earlier sessions.
+pub fn last_issued_session_id() -> Option<u64> {
+    match NEXT_SESSION_ID.load(Ordering::SeqCst) {
+        1 => None,
+        next => Some(next - 1),
+    }
+}
+
 // Speech detection flag - reset per recording session
 static SPEECH_DETECTED_EMITTED: AtomicBool = AtomicBool::new(false);
 
@@ -272,7 +288,7 @@ pub fn start_transcription_task<R: Runtime>(
     let task_progress = Arc::clone(&progress);
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
-    let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::SeqCst);
+    let session_id = allocate_session_id();
 
     let handle = tokio::spawn(async move {
         let _finished = FinishedOnDrop(Arc::clone(&task_progress));
@@ -641,6 +657,15 @@ mod tests {
     use crate::audio::recording_state::DeviceType;
     use crate::audio::transcription::provider::{TranscriptResult, TranscriptionProvider};
     use async_trait::async_trait;
+
+    #[test]
+    fn the_last_issued_session_id_covers_every_allocated_session() {
+        let first = allocate_session_id();
+        let second = allocate_session_id();
+        assert!(second > first);
+        // Other tests may allocate concurrently, so the latest id is at least ours.
+        assert!(last_issued_session_id().is_some_and(|last| last >= second));
+    }
 
     #[test]
     fn keeps_short_acknowledgements() {

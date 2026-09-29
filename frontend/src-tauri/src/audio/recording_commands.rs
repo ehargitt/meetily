@@ -210,21 +210,40 @@ fn stop_time_bound_for(recorded_seconds: u64) -> std::time::Duration {
     TRANSCRIPTION_DRAIN_TIMEOUT + save_timeout_for(recorded_seconds) + MARGIN
 }
 
-/// Length of the recording being stopped, captured when its stop began
-/// (the recording clock is cleared once the streams stop).
+/// Length of the recording being stopped, set (under the `RECORDING_MANAGER`
+/// lock) in the same step that takes its manager, since the recording clock
+/// is cleared once the streams stop. Cleared when that stop returns.
 static STOPPING_RECORDED_SECONDS: Mutex<Option<u64>> = Mutex::new(None);
 
 /// How long a stop of the current recording can take, whether it is still
 /// live or already stopping. Tray Quit waits this long.
 pub fn current_stop_time_bound() -> std::time::Duration {
-    let live = RECORDING_MANAGER
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    // Both read under the manager lock, so a stop taking the manager is seen
+    // either before (live length) or after (its recorded length), never between.
+    let manager = RECORDING_MANAGER.lock().unwrap_or_else(|e| e.into_inner());
+    let live = manager.as_ref().and_then(|manager| manager.get_recording_duration());
+    let stopping = *STOPPING_RECORDED_SECONDS.lock().unwrap_or_else(|e| e.into_inner());
+    drop(manager);
+    stop_time_bound_for(recorded_seconds_for_bound(live, stopping))
+}
+
+/// Length to bound a stop by: the live recording's, else the stopping one's.
+fn recorded_seconds_for_bound(live: Option<f64>, stopping: Option<u64>) -> u64 {
+    live.map(|seconds| seconds as u64).or(stopping).unwrap_or(0)
+}
+
+/// Take the live manager and record its length for `current_stop_time_bound`
+/// in one step under the manager lock.
+fn take_manager_for_stop() -> (Option<RecordingManager>, u64) {
+    let mut manager_slot = RECORDING_MANAGER.lock().unwrap_or_else(|e| e.into_inner());
+    let taken = manager_slot.take();
+    // Read before the streams stop: stopping clears the recording clock.
+    let recorded_seconds = taken
         .as_ref()
         .and_then(|manager| manager.get_recording_duration())
-        .map(|seconds| seconds as u64);
-    let stopping = *STOPPING_RECORDED_SECONDS.lock().unwrap_or_else(|e| e.into_inner());
-    stop_time_bound_for(live.or(stopping).unwrap_or(0))
+        .map_or(0, |seconds| seconds as u64);
+    *STOPPING_RECORDED_SECONDS.lock().unwrap_or_else(|e| e.into_inner()) = Some(recorded_seconds);
+    (taken, recorded_seconds)
 }
 
 /// When the last successful stop finished, and how many meetings the frontend
@@ -936,6 +955,8 @@ pub async fn stop_recording<R: Runtime>(
     crate::tray::set_tray_state(&app, crate::tray::RecordingState::Stopping);
 
     let result = stop_recording_tail(&app).await;
+    // The stop is over: a failed stop restored the live manager, a finished one left none.
+    *STOPPING_RECORDED_SECONDS.lock().unwrap_or_else(|e| e.into_inner()) = None;
     if let Err(ref message) = result {
         error!("❌ Stop failed: {}", message);
         if let Err(e) = app.emit("recording-stop-failed", serde_json::json!({ "message": message })) {
@@ -959,13 +980,7 @@ async fn stop_recording_tail<R: Runtime>(app: &AppHandle<R>) -> Result<(), Strin
     );
 
     // Step 1: Stop audio capture immediately (no more new chunks)
-    let taken_manager = RECORDING_MANAGER.lock().unwrap().take();
-    // Read before the streams stop: stopping clears the recording clock.
-    let recorded_seconds = taken_manager
-        .as_ref()
-        .and_then(|manager| manager.get_recording_duration())
-        .map_or(0, |seconds| seconds as u64);
-    *STOPPING_RECORDED_SECONDS.lock().unwrap() = Some(recorded_seconds);
+    let (taken_manager, recorded_seconds) = take_manager_for_stop();
     let manager_for_cleanup = match taken_manager {
         Some(mut manager) => {
             // Use FORCE FLUSH to immediately process all accumulated audio - eliminates 30s delay!
@@ -1580,6 +1595,8 @@ pub async fn is_recording_paused() -> bool {
 #[tauri::command]
 pub async fn get_recording_state() -> serde_json::Value {
     let is_recording = IS_RECORDING.load(Ordering::SeqCst);
+    // Lets a reloaded frontend reject transcript-updates from earlier sessions.
+    let last_session_id = transcription::last_issued_session_id();
     let manager_guard = RECORDING_MANAGER.lock().unwrap();
 
     if let Some(manager) = manager_guard.as_ref() {
@@ -1590,7 +1607,8 @@ pub async fn get_recording_state() -> serde_json::Value {
             "recording_duration": manager.get_recording_duration(),
             "active_duration": manager.get_active_recording_duration(),
             "total_pause_duration": manager.get_total_pause_duration(),
-            "current_pause_duration": manager.get_current_pause_duration()
+            "current_pause_duration": manager.get_current_pause_duration(),
+            "last_session_id": last_session_id
         })
     } else {
         serde_json::json!({
@@ -1600,7 +1618,8 @@ pub async fn get_recording_state() -> serde_json::Value {
             "recording_duration": null,
             "active_duration": null,
             "total_pause_duration": 0.0,
-            "current_pause_duration": null
+            "current_pause_duration": null,
+            "last_session_id": last_session_id
         })
     }
 }
@@ -2303,11 +2322,26 @@ mod tests {
         assert!(LINGERING_DRAIN.lock().unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn recording_state_reports_the_last_issued_transcription_session() {
+        let task = transcription::worker::allocate_session_id();
+        let state = get_recording_state().await;
+        let reported = state["last_session_id"].as_u64().expect("a session was issued");
+        assert!(reported >= task, "reported {reported}, issued {task}");
+    }
+
     #[test]
     fn save_timeout_grows_with_the_recording_it_encodes() {
         assert_eq!(save_timeout_for(0).as_secs(), 300);
         assert_eq!(save_timeout_for(2 * 3600).as_secs(), 300 + 1800);
         assert_eq!(stop_time_bound_for(2 * 3600).as_secs(), 600 + 300 + 1800 + 120);
+    }
+
+    #[test]
+    fn the_stop_bound_uses_the_live_recording_else_the_one_being_stopped() {
+        assert_eq!(recorded_seconds_for_bound(Some(90.7), Some(3600)), 90);
+        assert_eq!(recorded_seconds_for_bound(None, Some(3600)), 3600);
+        assert_eq!(recorded_seconds_for_bound(None, None), 0);
     }
 
     fn update_payload(session_id: u64, sequence_id: u64) -> String {
