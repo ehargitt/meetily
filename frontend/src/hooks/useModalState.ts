@@ -135,7 +135,11 @@ export function useModalState(transcriptModelConfig?: TranscriptModelProps): Use
         console.log('Setting up transcription-error listener...');
         unlistenFn = await listen<TranscriptionErrorPayload>('transcription-error', (event) => {
           console.log('Transcription error received:', event.payload);
-          const { userMessage, actionable } = event.payload;
+          const { userMessage, actionable, phase } = event.payload;
+
+          // Mid-recording errors are toasted app-wide by RecordingStateProvider;
+          // the model selector can't help while a recording holds the model.
+          if (phase === 'active') return;
 
           if (actionable) {
             // This is a model-related error that requires user action
@@ -166,11 +170,12 @@ export function useModalState(transcriptModelConfig?: TranscriptModelProps): Use
 
   // Listen for model download completion to auto-close modal
   useEffect(() => {
-    const setupDownloadListeners = async () => {
-      const unlisteners: (() => void)[] = [];
+    let cancelled = false;
+    let unlistenWhisper: (() => void) | undefined;
 
+    const setupDownloadListeners = async () => {
       // Listen for Whisper model download complete
-      const unlistenWhisper = await listen<{ modelName: string }>('model-download-complete', (event) => {
+      const fn = await listen<{ modelName: string }>('model-download-complete', (event) => {
         const { modelName } = event.payload;
         console.log('[useModalState] Whisper model download complete:', modelName);
 
@@ -180,14 +185,17 @@ export function useModalState(transcriptModelConfig?: TranscriptModelProps): Use
           setTimeout(() => hideModal('modelSelector'), 1500);
         }
       });
-      unlisteners.push(unlistenWhisper);
-
-      return () => {
-        unlisteners.forEach(unsub => unsub());
-      };
+      if (cancelled) { fn(); return; }
+      unlistenWhisper = fn;
     };
 
-    setupDownloadListeners();
+    setupDownloadListeners().catch(error =>
+      console.error('[useModalState] Failed to set up model download listener:', error));
+
+    return () => {
+      cancelled = true;
+      unlistenWhisper?.();
+    };
   }, [transcriptModelConfig, hideModal]);
 
   return {
