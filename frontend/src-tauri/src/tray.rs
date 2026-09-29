@@ -135,14 +135,14 @@ fn stop_recording_handler<R: Runtime>(app: &AppHandle<R>) {
 
 /// Stop the recording from the tray and hand post-processing (SQLite save,
 /// navigation, analytics) to the frontend via `recording-stop-complete`.
-async fn stop_from_tray<R: Runtime>(app: &AppHandle<R>) {
+async fn stop_from_tray<R: Runtime>(app: &AppHandle<R>) -> TrayStop {
     // Generate save path (same as RecordingControls.tsx)
     let data_dir = match app.path().app_data_dir() {
         Ok(dir) => dir,
         Err(e) => {
             log::error!("Failed to get app data dir: {}", e);
             update_tray_menu_async(app).await;
-            return;
+            return TrayStop::Failed;
         }
     };
 
@@ -166,25 +166,73 @@ async fn stop_from_tray<R: Runtime>(app: &AppHandle<R>) {
             if let Err(e) = app.emit("recording-stop-complete", true) {
                 log::error!("Tray: Failed to emit recording-stop-complete event: {}", e);
             }
+            TrayStop::Stopped
         }
         // The stop already running updates the tray and the frontend when it finishes.
         Err(e) if e == STOP_IN_PROGRESS_ERROR => {
             log::info!("Tray: a stop is already in progress; ignoring this one");
+            TrayStop::AlreadyStopping
         }
         Err(e) => {
             log::error!("Tray: Failed to stop recording: {}", e);
             // Revert tray state on error
             update_tray_menu_async(app).await;
+            TrayStop::Failed
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayStop {
+    Stopped,
+    AlreadyStopping,
+    /// The recording is still live.
+    Failed,
+}
+
+/// Stop the recording for Quit, or wait for the stop already running.
+/// Returns false if the recording is still live because a stop failed.
+async fn stop_for_quit<R: Runtime>(app: &AppHandle<R>) -> bool {
+    if stop_from_tray(app).await == TrayStop::Failed {
+        return false;
+    }
+    loop {
+        if !crate::audio::recording_commands::is_recording().await {
+            return true;
+        }
+        // Still recording with no stop running: the stop that was running failed.
+        if !crate::audio::recording_commands::is_stopping() {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Wait until the frontend has saved a meeting since the save count was
+/// `saves_before`, or `timeout` passes.
+async fn wait_for_frontend_save(saves_before: u64, timeout: Duration) {
+    let saved = tokio::time::timeout(timeout, async {
+        while crate::database::repositories::transcript::saved_meeting_count() == saves_before {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await;
+    if saved.is_err() {
+        log::warn!(
+            "Tray: the stopped meeting was not saved to the database within {}s; exiting anyway",
+            timeout.as_secs()
+        );
     }
 }
 
 /// Quit from the tray. During a recording, stop and save it first (the same
 /// path as tray Stop), wait for the frontend to store the meeting, then exit;
-/// each wait is bounded. A second Quit during that exits immediately.
+/// each wait is bounded. A meeting stopped moments before Quit also gets its
+/// frontend save waited for. If the stop fails the recording is still live, so
+/// the app stays open. A second Quit while any of this runs exits immediately.
 fn quit_handler<R: Runtime>(app: &AppHandle<R>) {
     if QUIT_REQUESTED.swap(true, Ordering::SeqCst) {
-        log::warn!("Tray: Quit clicked again while the recording is being saved; exiting now");
+        log::warn!("Tray: Quit clicked again; exiting now");
         app.exit(0);
         return;
     }
@@ -196,34 +244,25 @@ fn quit_handler<R: Runtime>(app: &AppHandle<R>) {
             set_tray_state(&app, RecordingState::Stopping);
             let saves_before = crate::database::repositories::transcript::saved_meeting_count();
 
-            let stopped = tokio::time::timeout(QUIT_STOP_TIMEOUT, async {
-                stop_from_tray(&app).await;
-                // Also covers a stop that was already running when Quit was clicked.
-                while crate::audio::recording_commands::is_recording().await {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                }
-            })
-            .await;
-
-            match stopped {
-                Ok(()) => {
-                    let saved = tokio::time::timeout(QUIT_SAVE_TIMEOUT, async {
-                        while crate::database::repositories::transcript::saved_meeting_count() == saves_before {
-                            tokio::time::sleep(Duration::from_millis(250)).await;
-                        }
-                    })
-                    .await;
-                    if saved.is_err() {
-                        log::warn!(
-                            "Tray: the meeting was not saved to the database within {}s; exiting (its folder can be recovered on next launch)",
-                            QUIT_SAVE_TIMEOUT.as_secs()
-                        );
-                    }
+            match tokio::time::timeout(QUIT_STOP_TIMEOUT, stop_for_quit(&app)).await {
+                Ok(true) => wait_for_frontend_save(saves_before, QUIT_SAVE_TIMEOUT).await,
+                Ok(false) => {
+                    log::error!(
+                        "Tray: the recording could not be stopped, so Meetily stays open and keeps recording; Quit again to exit anyway"
+                    );
+                    update_tray_menu_async(&app).await;
+                    return;
                 }
                 Err(_) => log::error!(
                     "Tray: stopping the recording took over {}s; exiting anyway",
                     QUIT_STOP_TIMEOUT.as_secs()
                 ),
+            }
+        } else if let Some(stop) = crate::audio::recording_commands::last_completed_stop() {
+            // A meeting stopped just before Quit may still be in the frontend's save flow.
+            if let Some(remaining) = QUIT_SAVE_TIMEOUT.checked_sub(stop.at.elapsed()) {
+                log::info!("Tray: Quit right after a stop; waiting for the meeting to be saved");
+                wait_for_frontend_save(stop.saved_meetings, remaining).await;
             }
         }
         app.exit(0);

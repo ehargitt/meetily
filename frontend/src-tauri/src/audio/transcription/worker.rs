@@ -13,12 +13,16 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Runtime};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 /// Serial processing keeps transcripts in chronological order.
 pub const TRANSCRIPTION_WORKERS: usize = 1;
 
 // Sequence counter for transcript updates
 static SEQUENCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Identifies one recording's transcription task; stamped on its transcript updates.
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 // Speech detection flag - reset per recording session
 static SPEECH_DETECTED_EMITTED: AtomicBool = AtomicBool::new(false);
@@ -48,6 +52,10 @@ pub struct TranscriptUpdate {
     pub audio_start_time: f64, // Seconds from recording start (e.g., 125.3)
     pub audio_end_time: f64,   // Seconds from recording start (e.g., 128.6)
     pub duration: f64,          // Segment duration in seconds (e.g., 3.3)
+    /// The transcription session (one per recording) that produced this update,
+    /// so a listener can ignore a previous recording's late output.
+    #[serde(default)]
+    pub session_id: u64,
 }
 
 // NOTE: get_transcript_history and get_recording_meeting_name functions
@@ -186,6 +194,10 @@ impl Drop for FinishedOnDrop {
 pub struct TranscriptionTask {
     pub handle: JoinHandle<()>,
     pub progress: Arc<TranscriptionProgress>,
+    /// Stops the dispatcher and the worker, including results of an in-flight
+    /// chunk. Aborting `handle` alone would detach the worker, not stop it.
+    pub cancel: CancellationToken,
+    pub session_id: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,6 +270,9 @@ pub fn start_transcription_task<R: Runtime>(
 ) -> TranscriptionTask {
     let progress = Arc::new(TranscriptionProgress::new());
     let task_progress = Arc::clone(&progress);
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::SeqCst);
 
     let handle = tokio::spawn(async move {
         let _finished = FinishedOnDrop(Arc::clone(&task_progress));
@@ -273,10 +288,19 @@ pub fn start_transcription_task<R: Runtime>(
             }
         };
 
-        run_transcription(engine, transcription_receiver, app, task_progress, failures).await;
+        let session = WorkerSession { failures, cancel: task_cancel, session_id };
+        run_transcription(engine, transcription_receiver, app, task_progress, session).await;
     });
 
-    TranscriptionTask { handle, progress }
+    TranscriptionTask { handle, progress, cancel, session_id }
+}
+
+/// Per-recording state shared by the dispatcher and the worker.
+#[derive(Clone)]
+struct WorkerSession {
+    failures: Arc<ActiveFailureLatch>,
+    cancel: CancellationToken,
+    session_id: u64,
 }
 
 /// Dispatch chunks from the pipeline to the worker until the pipeline closes the channel.
@@ -285,8 +309,9 @@ async fn run_transcription<E: TranscriptionEvents>(
     mut receiver: mpsc::UnboundedReceiver<AudioChunk>,
     events: E,
     progress: Arc<TranscriptionProgress>,
-    failures: Arc<ActiveFailureLatch>,
+    session: WorkerSession,
 ) {
+    let failures = Arc::clone(&session.failures);
     let mut worker = engine.map(|engine| {
         let kind = match &engine {
             TranscriptionEngine::Whisper(_) => EngineKind::Whisper,
@@ -300,12 +325,21 @@ async fn run_transcription<E: TranscriptionEvents>(
             work_receiver,
             events.clone(),
             Arc::clone(&progress),
-            Arc::clone(&failures),
+            session.clone(),
         ));
         (work_sender, handle)
     });
 
-    while let Some(chunk) = receiver.recv().await {
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = session.cancel.cancelled() => {
+                info!("Transcription session {} cancelled", session.session_id);
+                return;
+            }
+            chunk = receiver.recv() => chunk,
+        };
+        let Some(chunk) = chunk else { break };
         progress.queued.fetch_add(1, Ordering::SeqCst);
         progress.touch();
 
@@ -324,6 +358,9 @@ async fn run_transcription<E: TranscriptionEvents>(
     // Input finished: let the worker drain its queue, then account for anything it never handled.
     if let Some((work_sender, handle)) = worker {
         drop(work_sender);
+        if session.cancel.is_cancelled() {
+            return;
+        }
         if let Err(e) = handle.await {
             failures.report(&events, ActiveFailure::WorkerStopped, &format!("Transcription worker failed: {}", e));
         }
@@ -352,7 +389,7 @@ async fn run_worker<E: TranscriptionEvents>(
     mut work_receiver: mpsc::UnboundedReceiver<AudioChunk>,
     events: E,
     progress: Arc<TranscriptionProgress>,
-    failures: Arc<ActiveFailureLatch>,
+    session: WorkerSession,
 ) {
     let engine_name = engine.provider_name().to_string();
     if engine.is_model_loaded().await {
@@ -365,9 +402,18 @@ async fn run_worker<E: TranscriptionEvents>(
         warn!("⚠️ Worker: {} model not loaded - chunks will be skipped", engine_name);
     }
 
-    while let Some(chunk) = work_receiver.recv().await {
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = session.cancel.cancelled() => break,
+            chunk = work_receiver.recv() => chunk,
+        };
+        let Some(chunk) = chunk else { break };
         progress.busy.store(true, Ordering::SeqCst);
-        let outcome = process_chunk(&engine, chunk, &events, &failures).await;
+        let outcome = process_chunk(&engine, chunk, &events, &session).await;
+        if session.cancel.is_cancelled() {
+            break;
+        }
         progress.record(outcome);
 
         let snapshot = progress.snapshot();
@@ -397,8 +443,9 @@ async fn process_chunk<E: TranscriptionEvents>(
     engine: &TranscriptionEngine,
     chunk: AudioChunk,
     events: &E,
-    failures: &ActiveFailureLatch,
+    session: &WorkerSession,
 ) -> ChunkOutcome {
+    let failures = &session.failures;
     if !engine.is_model_loaded().await {
         failures.report(events, ActiveFailure::ModelUnavailable, "No transcription model is loaded");
         return ChunkOutcome::Skipped;
@@ -408,7 +455,12 @@ async fn process_chunk<E: TranscriptionEvents>(
     let chunk_timestamp = chunk.timestamp;
     let chunk_duration = chunk.data.len() as f64 / chunk.sample_rate as f64;
 
-    let (transcript, confidence_opt, is_partial) = match transcribe_chunk_with_provider(engine, chunk).await {
+    let result = transcribe_chunk_with_provider(engine, chunk).await;
+    // A cancelled session's in-flight result belongs to a meeting that was already saved.
+    if session.cancel.is_cancelled() {
+        return ChunkOutcome::Skipped;
+    }
+    let (transcript, confidence_opt, is_partial) = match result {
         Ok(result) => result,
         // Expected for very short chunks: there was nothing to transcribe.
         Err(e @ TranscriptionError::AudioTooShort { .. }) => {
@@ -458,6 +510,7 @@ async fn process_chunk<E: TranscriptionEvents>(
         audio_start_time: chunk_timestamp, // Already in seconds from recording start
         audio_end_time: chunk_timestamp + chunk_duration,
         duration: chunk_duration,
+        session_id: session.session_id,
     };
     match serde_json::to_value(&update) {
         Ok(payload) => events.emit_json("transcript-update", payload),
@@ -632,6 +685,15 @@ mod tests {
     struct ScriptedProvider {
         calls: AtomicU64,
         unload_after: u64,
+        delay: Duration,
+    }
+
+    fn test_session() -> WorkerSession {
+        WorkerSession {
+            failures: Arc::new(ActiveFailureLatch::default()),
+            cancel: CancellationToken::new(),
+            session_id: 42,
+        }
     }
 
     #[async_trait]
@@ -642,6 +704,7 @@ mod tests {
             _language: Option<String>,
         ) -> Result<TranscriptResult, TranscriptionError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
             match audio[0] {
                 x if x == ENGINE_ERROR => Err(TranscriptionError::EngineFailed("decoder error".into())),
                 x if x == PANIC => panic!("engine crashed"),
@@ -680,6 +743,7 @@ mod tests {
         let engine = TranscriptionEngine::Provider(Arc::new(ScriptedProvider {
             calls: AtomicU64::new(0),
             unload_after,
+            delay: Duration::ZERO,
         }));
         let (sender, receiver) = mpsc::unbounded_channel();
         for (id, marker) in markers.iter().enumerate() {
@@ -696,7 +760,7 @@ mod tests {
                 receiver,
                 events.clone(),
                 Arc::clone(&progress),
-                Arc::new(ActiveFailureLatch::default()),
+                test_session(),
             ),
         )
         .await
@@ -744,6 +808,7 @@ mod tests {
         let engine = TranscriptionEngine::Provider(Arc::new(ScriptedProvider {
             calls: AtomicU64::new(0),
             unload_after: u64::MAX,
+            delay: Duration::ZERO,
         }));
         let (sender, receiver) = mpsc::unbounded_channel();
         let events = RecordedEvents::default();
@@ -753,7 +818,7 @@ mod tests {
             receiver,
             events.clone(),
             Arc::clone(&progress),
-            Arc::new(ActiveFailureLatch::default()),
+            test_session(),
         ));
 
         sender.send(chunk(PANIC, 0)).unwrap();
@@ -768,5 +833,48 @@ mod tests {
         assert_eq!(snapshot.completed, 0);
         assert_eq!(snapshot.skipped, 3);
         assert_eq!(events.named("transcription-error").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_session_stops_its_worker_and_its_output() {
+        let engine = TranscriptionEngine::Provider(Arc::new(ScriptedProvider {
+            calls: AtomicU64::new(0),
+            unload_after: u64::MAX,
+            delay: Duration::from_millis(50),
+        }));
+        let (sender, receiver) = mpsc::unbounded_channel();
+        for id in 0..20 {
+            sender.send(chunk(SPEECH, id)).unwrap();
+        }
+        let events = RecordedEvents::default();
+        let session = test_session();
+        let cancel = session.cancel.clone();
+        let task = tokio::spawn(run_transcription(
+            Some(engine),
+            receiver,
+            events.clone(),
+            Arc::new(TranscriptionProgress::new()),
+            session,
+        ));
+
+        while events.named("transcript-update").len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        cancel.cancel();
+        task.abort(); // what abandoning a lingering drain does to the outer task
+        let at_cancel = events.named("transcript-update").len();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        assert!(at_cancel < 20);
+        assert_eq!(
+            events.named("transcript-update").len(),
+            at_cancel,
+            "a cancelled session must not emit more transcripts"
+        );
+        assert!(events
+            .named("transcript-update")
+            .iter()
+            .all(|update| update["session_id"] == 42));
+        drop(sender);
     }
 }
