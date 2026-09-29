@@ -196,7 +196,7 @@ pub async fn load_model(&self, model_name: &str) -> Result<()> {
 
 **Ring Buffer Mixing** (pipeline.rs):
 - Mic and system audio arrive asynchronously at different rates
-- Ring buffer accumulates samples until both streams have aligned windows (50ms)
+- Ring buffer accumulates samples and mixes a 600ms window only when both streams hold a full window; a stream is padded with silence only when it is starved (nothing delivered for >200ms while the other stream captured audio — i.e. stalled, dead, or absent)
 - Professional mixing applies RMS-based ducking to prevent system audio from drowning out microphone
 - Uses `VecDeque` for efficient windowed processing
 
