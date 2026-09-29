@@ -547,26 +547,24 @@ fn resolve_mic_or_default<R: Runtime>(
 }
 
 /// System-audio analog of `resolve_mic_or_default`: `Some(name)` -> parse it,
-/// falling back to the default output if unparseable; `None` ("Default System
-/// Audio" in the UI) -> default output. Returns `None` only when no output
-/// device exists — system audio is optional, mic-only recording proceeds.
+/// falling back to `default_lookup` (the default output) if unparseable;
+/// `None` ("Default System Audio" in the UI) -> the default. `Err` carries the
+/// reason no device resolved (e.g. Linux with no monitor source configured);
+/// the recording then runs mic-only and the stream manager reports it as
+/// `system-audio-unavailable` once the recording has started.
 ///
 /// ponytail: no cpal enumeration check (unlike the mic helper) — Linux system
 /// devices are Pulse/ALSA monitor *inputs* tagged Output, so output_devices()
 /// would false-negative them. stream.rs still hard-fails on a missing device.
-///
-/// When nothing resolves (e.g. Linux with no monitor source configured) the
-/// user is told with `system-audio-unavailable` that participants' audio will
-/// not be recorded.
-fn resolve_system_or_default<R: Runtime>(
-    app: &AppHandle<R>,
+fn resolve_system_device(
     requested_name: Option<&str>,
-) -> Option<Arc<super::AudioDevice>> {
+    default_lookup: impl FnOnce() -> anyhow::Result<super::AudioDevice>,
+) -> Result<Arc<super::AudioDevice>, String> {
     if let Some(name) = requested_name {
         match parse_audio_device(name) {
             Ok(device) => {
                 info!("✅ Using requested system audio: '{}'", device.name);
-                return Some(Arc::new(device));
+                return Ok(Arc::new(device));
             }
             Err(e) => warn!(
                 "⚠️ Requested system audio '{}' not available: {} — falling back to system default",
@@ -575,22 +573,45 @@ fn resolve_system_or_default<R: Runtime>(
         }
     }
 
-    match default_output_device() {
+    match default_lookup() {
         Ok(device) => {
             info!("✅ Using default system audio: '{}'", device.name);
-            Some(Arc::new(device))
+            Ok(Arc::new(device))
         }
         Err(e) => {
             warn!("⚠️ No system audio available: {} — recording will continue with microphone only", e);
-            emit_stream_health_event(
-                app,
-                StreamHealthEvent::SystemAudioUnavailable {
-                    device_name: None,
-                    reason: format!("No system audio device found: {}", e),
-                },
-            );
-            None
+            Err(format!("No system audio device found: {}", e))
         }
+    }
+}
+
+#[cfg(test)]
+mod system_device_resolution_tests {
+    use super::*;
+
+    fn named(name: &str) -> super::super::AudioDevice {
+        super::super::AudioDevice::new(name.to_string(), super::super::DeviceType::Output)
+    }
+
+    #[test]
+    fn a_requested_device_is_used_without_consulting_the_default() {
+        let resolved = resolve_system_device(Some("monitor (output)"), || panic!("default not needed"));
+        assert_eq!(resolved.unwrap().name, "monitor");
+    }
+
+    #[test]
+    fn an_unusable_request_falls_back_to_the_default() {
+        let resolved = resolve_system_device(Some("no type suffix"), || Ok(named("default monitor")));
+        assert_eq!(resolved.unwrap().name, "default monitor");
+    }
+
+    #[test]
+    fn no_device_yields_the_reason_for_the_user() {
+        let resolved = resolve_system_device(None, || Err(anyhow::anyhow!("No system-audio monitor source is configured in ALSA")));
+        assert_eq!(
+            resolved.unwrap_err(),
+            "No system audio device found: No system-audio monitor source is configured in ALSA"
+        );
     }
 }
 
@@ -695,10 +716,10 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     #[cfg(not(target_os = "macos"))]
     let microphone_device = resolve_mic_or_default(&app, preferred_mic_name.as_deref());
 
-    let system_device = resolve_system_or_default(&app, preferred_system_name.as_deref());
+    let system_device = resolve_system_device(preferred_system_name.as_deref(), default_output_device);
 
     #[cfg(target_os = "macos")]
-    prepare_audio_for_recording(system_device.as_deref()).await?;
+    prepare_audio_for_recording(system_device.as_deref().ok()).await?;
 
     #[cfg(target_os = "macos")]
     let microphone_device = resolve_mic_or_default(&app, preferred_mic_name.as_deref());
@@ -811,10 +832,10 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     #[cfg(not(target_os = "macos"))]
     let mic_device = resolve_mic_or_default(&app, mic_device_name.as_deref());
 
-    let system_device = resolve_system_or_default(&app, system_device_name.as_deref());
+    let system_device = resolve_system_device(system_device_name.as_deref(), default_output_device);
 
     #[cfg(target_os = "macos")]
-    prepare_audio_for_recording(system_device.as_deref()).await?;
+    prepare_audio_for_recording(system_device.as_deref().ok()).await?;
 
     #[cfg(target_os = "macos")]
     let mic_device = resolve_mic_or_default(&app, mic_device_name.as_deref());
@@ -1818,6 +1839,10 @@ impl<R: Runtime> SupervisorHost for AppSupervisorHost<R> {
 
     fn default_input_name(&self) -> Option<String> {
         default_input_device().ok().map(|d| d.name)
+    }
+
+    fn default_system_device(&self) -> Option<Arc<super::AudioDevice>> {
+        default_output_device().ok().map(Arc::new)
     }
 
     fn emit_mic_switched(&self, device_name: &str) {

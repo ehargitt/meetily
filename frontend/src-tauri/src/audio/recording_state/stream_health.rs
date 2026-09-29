@@ -26,9 +26,18 @@ pub const STALL_TIMEOUT: Duration = Duration::from_secs(3);
 pub const DEGRADED_EVENT_INTERVAL: Duration = Duration::from_secs(10);
 /// Stream-error log lines are summarised at most once per interval.
 const ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
-/// A stream whose rebuild failed is retried this often for the rest of the
-/// session, so a device that comes back later is picked up again.
+/// A stream whose rebuild failed is retried for the rest of the session, so a
+/// device that comes back later is picked up again: first after this long,
+/// then at doubling intervals up to `FAILED_STREAM_RETRY_MAX` (each retry can
+/// walk cpal's device enumeration).
 pub const FAILED_STREAM_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+pub const FAILED_STREAM_RETRY_MAX: Duration = Duration::from_secs(300);
+/// A rebuilt stream that dies before it has delivered audio for this long
+/// did not really recover.
+pub const HEALTHY_AFTER_REBUILD: Duration = Duration::from_secs(30);
+/// After this many rebuilt streams in a row died early, rebuilding on the same
+/// device is treated as failed (a wedged device that opens but never works).
+pub const MAX_SHORT_LIVED_REBUILDS: u32 = 3;
 
 /// Lifecycle of one capture stream within a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +100,12 @@ struct HealthInner {
     suppressed_error_logs: u64,
     /// When the stream was last marked `Failed` (or last retried).
     failed_at: Option<Instant>,
+    /// Wait before the next retry of a `Failed` stream.
+    retry_interval: Duration,
+    /// The running stream was installed by a rebuild or hot-swap.
+    installed_by_rebuild: bool,
+    /// Consecutive rebuilt streams that died before running healthily.
+    short_lived_rebuilds: u32,
 }
 
 /// Health of one capture stream. The data callback only touches an atomic.
@@ -120,6 +135,9 @@ impl StreamHealth {
                 last_error_log: None,
                 suppressed_error_logs: 0,
                 failed_at: None,
+                retry_interval: FAILED_STREAM_RETRY_INTERVAL,
+                installed_by_rebuild: false,
+                short_lived_rebuilds: 0,
             }),
         }
     }
@@ -151,6 +169,7 @@ impl StreamHealth {
         inner.status = StreamStatus::Running;
         inner.running_since_ms = self.millis(now);
         inner.awaiting_first_callback = is_rebuild;
+        inner.installed_by_rebuild = is_rebuild;
         if !is_rebuild {
             inner.degraded_announced = false;
         }
@@ -167,9 +186,18 @@ impl StreamHealth {
     }
 
     /// Rebuilding failed. The stream stays `Failed` until a later retry
-    /// (see `retry_due`) or a hot-swap installs a new stream.
+    /// (see `retry_due`) or a hot-swap installs a new stream. Failing again
+    /// after a retry that did not work, or after a rebuilt stream died early
+    /// again, doubles the wait.
     pub fn mark_failed(&self, now: Instant) {
         let mut inner = self.lock();
+        let escalate = inner.status == StreamStatus::Failed
+            || inner.short_lived_rebuilds >= MAX_SHORT_LIVED_REBUILDS;
+        inner.retry_interval = if escalate {
+            (inner.retry_interval * 2).min(FAILED_STREAM_RETRY_MAX)
+        } else {
+            FAILED_STREAM_RETRY_INTERVAL
+        };
         inner.status = StreamStatus::Failed;
         inner.awaiting_first_callback = false;
         inner.failed_at = Some(now);
@@ -180,20 +208,43 @@ impl StreamHealth {
     /// True (once per interval) when a `Failed` stream should be retried.
     pub fn retry_due(&self, now: Instant) -> bool {
         let mut inner = self.lock();
+        let interval = inner.retry_interval;
         let due = inner.status == StreamStatus::Failed
             && inner
                 .failed_at
-                .map_or(true, |t| now.saturating_duration_since(t) >= FAILED_STREAM_RETRY_INTERVAL);
+                .map_or(true, |t| now.saturating_duration_since(t) >= interval);
         if due {
             inner.failed_at = Some(now);
         }
         due
     }
 
+    /// The user was told about this outage (degraded, unavailable or
+    /// exhausted), so the stream coming back is announced too.
+    pub fn announce_outage(&self) {
+        self.lock().degraded_announced = true;
+    }
+
+    /// Several rebuilt streams in a row died before running healthily:
+    /// rebuilding on the same device again is not going to work.
+    pub fn rebuilds_keep_dying(&self) -> bool {
+        self.lock().short_lived_rebuilds >= MAX_SHORT_LIVED_REBUILDS
+    }
+
     /// Transition `Running -> Dead`. Returns false if the stream was not running.
-    fn mark_dead(&self, inner: &mut HealthInner) -> bool {
+    fn mark_dead(&self, inner: &mut HealthInner, now: Instant) -> bool {
         if inner.status != StreamStatus::Running {
             return false;
+        }
+        let lived_ms = self.millis(now).saturating_sub(inner.running_since_ms);
+        let delivered = self.last_callback_ms.load(Ordering::Relaxed) >= inner.running_since_ms;
+        if !inner.installed_by_rebuild
+            || (delivered && lived_ms >= HEALTHY_AFTER_REBUILD.as_millis() as u64)
+        {
+            inner.short_lived_rebuilds = 0;
+            inner.retry_interval = FAILED_STREAM_RETRY_INTERVAL;
+        } else {
+            inner.short_lived_rebuilds += 1;
         }
         inner.status = StreamStatus::Dead;
         inner.awaiting_first_callback = false;
@@ -220,7 +271,7 @@ impl StreamHealth {
 
         let persistent = matches!(error, AudioError::DeviceDisconnected)
             || inner.errors.len() > ERROR_BURST_LIMIT;
-        let became_dead = persistent && self.mark_dead(&mut inner);
+        let became_dead = persistent && self.mark_dead(&mut inner, now);
 
         let log_due = became_dead
             || inner
@@ -252,7 +303,7 @@ impl StreamHealth {
             .load(Ordering::Relaxed)
             .max(inner.running_since_ms);
         let silent_for = self.millis(now).saturating_sub(last_activity);
-        silent_for > STALL_TIMEOUT.as_millis() as u64 && self.mark_dead(&mut inner)
+        silent_for > STALL_TIMEOUT.as_millis() as u64 && self.mark_dead(&mut inner, now)
     }
 
     /// True once, for a rebuilt stream that has delivered its first callback
@@ -417,16 +468,67 @@ mod tests {
     }
 
     #[test]
-    fn failed_streams_are_retried_every_thirty_seconds() {
+    fn failed_streams_are_retried_with_a_growing_interval() {
         let epoch = Instant::now();
         let health = running(epoch);
         assert!(!health.retry_due(at(epoch, 60_000)), "only failed streams are retried");
-        health.mark_failed(at(epoch, 1_000));
-        assert!(health.record_error(&AudioError::StreamFailed, at(epoch, 1_500)).already_dead);
-        assert!(!health.retry_due(at(epoch, 30_000)));
-        assert!(health.retry_due(at(epoch, 31_000)));
-        assert!(!health.retry_due(at(epoch, 32_000)), "one retry per interval");
-        health.mark_running(at(epoch, 33_000), true);
-        assert!(!health.retry_due(at(epoch, 90_000)));
+        health.mark_failed(at(epoch, 0));
+        assert!(health.record_error(&AudioError::StreamFailed, at(epoch, 500)).already_dead);
+        assert!(!health.retry_due(at(epoch, 29_000)));
+        assert!(health.retry_due(at(epoch, 30_000)));
+        assert!(!health.retry_due(at(epoch, 31_000)), "one retry per interval");
+
+        // Each failed retry doubles the wait: 60 s, 120 s, 240 s, then 300 s.
+        let mut t = 30_000;
+        for wait in [60_000, 120_000, 240_000, 300_000, 300_000] {
+            health.mark_failed(at(epoch, t));
+            assert!(!health.retry_due(at(epoch, t + wait - 1_000)), "retried before {wait} ms");
+            assert!(health.retry_due(at(epoch, t + wait)), "not retried after {wait} ms");
+            t += wait;
+        }
+
+        // A stream that comes back starts the schedule over.
+        health.mark_running(at(epoch, t), true);
+        assert!(!health.retry_due(at(epoch, t + 1_000_000)));
+        health.record_error(&AudioError::DeviceDisconnected, at(epoch, t));
+        health.mark_failed(at(epoch, t));
+        assert!(health.retry_due(at(epoch, t + 30_000)));
+    }
+
+    fn rebuild_then_kill(health: &StreamHealth, installed_ms: u64, delivered_ms: Option<u64>, died_ms: u64, epoch: Instant) {
+        health.mark_running(at(epoch, installed_ms), true);
+        if let Some(ms) = delivered_ms {
+            health.on_callback(at(epoch, ms));
+        }
+        assert!(health.record_error(&AudioError::DeviceDisconnected, at(epoch, died_ms)).became_dead);
+    }
+
+    #[test]
+    fn rebuilds_that_die_early_are_counted_until_one_runs_healthily() {
+        let epoch = Instant::now();
+        let health = running(epoch);
+        health.record_error(&AudioError::DeviceDisconnected, epoch);
+        assert!(!health.rebuilds_keep_dying(), "the original stream dying is not a failed rebuild");
+
+        rebuild_then_kill(&health, 1_000, None, 2_000, epoch); // never delivered
+        rebuild_then_kill(&health, 3_000, Some(3_100), 4_000, epoch); // delivered briefly
+        assert!(!health.rebuilds_keep_dying());
+        rebuild_then_kill(&health, 5_000, None, 50_000, epoch); // alive but silent
+        assert!(health.rebuilds_keep_dying(), "three rebuilds in a row died early");
+
+        // Giving up now, and after each retried stream that dies early again,
+        // waits longer before the next retry.
+        health.mark_failed(at(epoch, 50_000));
+        assert!(health.retry_due(at(epoch, 110_000)), "60 s, not 30 s, after a failed streak");
+        rebuild_then_kill(&health, 110_000, None, 111_000, epoch);
+        health.mark_failed(at(epoch, 111_000));
+        assert!(!health.retry_due(at(epoch, 230_000)));
+        assert!(health.retry_due(at(epoch, 231_000)), "120 s");
+
+        // One that runs healthily for 30 s clears the streak and the backoff.
+        rebuild_then_kill(&health, 240_000, Some(240_100), 271_000, epoch);
+        assert!(!health.rebuilds_keep_dying());
+        health.mark_failed(at(epoch, 271_000));
+        assert!(health.retry_due(at(epoch, 301_000)));
     }
 }

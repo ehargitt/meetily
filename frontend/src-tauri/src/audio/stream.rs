@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 use super::devices::{AudioDevice, get_device_and_config};
 use super::pipeline::AudioCapture;
-use super::recording_state::{RecordingState, DeviceType, StreamHealthEvent};
+use super::recording_state::{RecordingState, DeviceType};
 use super::capture::{AudioCaptureBackend, get_current_backend};
 
 #[cfg(target_os = "macos")]
@@ -446,7 +446,7 @@ impl AudioStreamManager {
     pub async fn start_streams(
         &mut self,
         microphone_device: Option<Arc<AudioDevice>>,
-        system_device: Option<Arc<AudioDevice>>,
+        system_audio: std::result::Result<Arc<AudioDevice>, String>,
         recording_sender: Option<mpsc::UnboundedSender<super::recording_state::AudioChunk>>,
     ) -> Result<()> {
         use super::capture::get_current_backend;
@@ -472,32 +472,37 @@ impl AudioStreamManager {
             info!("ℹ️ No microphone device specified, skipping microphone stream");
         }
 
-        // Start system audio stream
-        if let Some(sys_device) = system_device {
-            info!("🔊 Creating system audio stream: {} (backend: {:?})", sys_device.name, backend);
-            match AudioStream::create(sys_device.clone(), self.state.clone(), DeviceType::System, recording_sender.clone()).await {
-                Ok(stream) => {
-                    self.state.set_system_device(sys_device);
-                    self.system_stream = Some(stream);
-                    self.state.stream_health(DeviceType::System).mark_running(Instant::now(), false);
-                    info!("✅ System audio stream created with {:?} backend", backend);
-                }
-                Err(e) => {
-                    // Don't fail if only system audio fails: record mic-only, but say so.
-                    warn!("⚠️ Failed to create system audio stream: {}", e);
-                    self.state.emit_health_event(StreamHealthEvent::SystemAudioUnavailable {
-                        device_name: Some(sys_device.name.clone()),
-                        reason: e.to_string(),
-                    });
+        // Start system audio stream. If it cannot start, record mic-only and
+        // say so, but only once start can no longer fail.
+        let system_unavailable = match system_audio {
+            Ok(sys_device) => {
+                info!("🔊 Creating system audio stream: {} (backend: {:?})", sys_device.name, backend);
+                let created = AudioStream::create(sys_device.clone(), self.state.clone(), DeviceType::System, recording_sender.clone()).await;
+                // Recorded even on failure: the supervisor's retries reopen this device.
+                self.state.set_system_device(sys_device.clone());
+                match created {
+                    Ok(stream) => {
+                        self.system_stream = Some(stream);
+                        self.state.stream_health(DeviceType::System).mark_running(Instant::now(), false);
+                        info!("✅ System audio stream created with {:?} backend", backend);
+                        None
+                    }
+                    Err(e) => {
+                        warn!("⚠️ Failed to create system audio stream: {}", e);
+                        Some((Some(sys_device.name.clone()), e.to_string()))
+                    }
                 }
             }
-        } else {
-            info!("ℹ️ No system device specified, skipping system audio stream");
-        }
+            Err(reason) => Some((None, reason)),
+        };
 
         // Ensure at least one stream was created
         if self.microphone_stream.is_none() && self.system_stream.is_none() {
             return Err(anyhow::anyhow!("No audio streams could be created"));
+        }
+
+        if let Some((device_name, reason)) = system_unavailable {
+            self.state.report_system_audio_unavailable(device_name, reason);
         }
 
         Ok(())

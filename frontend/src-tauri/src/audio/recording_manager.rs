@@ -223,15 +223,16 @@ impl RecordingManager {
     ///
     /// # Arguments
     /// * `microphone_device` - Optional microphone device to use
-    /// * `system_device` - Optional system audio device to use
+    /// * `system_device` - System audio device, or why none could be resolved
     /// * `auto_save` - Whether to save audio checkpoints (true) or just transcripts/metadata (false)
     pub(crate) async fn start_recording(
         &mut self,
         microphone_device: Option<Arc<AudioDevice>>,
-        system_device: Option<Arc<AudioDevice>>,
+        system_audio: std::result::Result<Arc<AudioDevice>, String>,
         auto_save: bool,
     ) -> std::result::Result<mpsc::UnboundedReceiver<AudioChunk>, RecordingStartError> {
         info!("Starting recording manager (auto_save: {})", auto_save);
+        let system_device = system_audio.as_ref().ok().cloned();
 
         // Set up transcription channel
         let (transcription_sender, transcription_receiver) = mpsc::unbounded_channel::<AudioChunk>();
@@ -287,7 +288,7 @@ impl RecordingManager {
 
         // Start audio streams - they send RAW unmixed chunks to pipeline for mixing
         // Pipeline handles mixing and distribution to both recording and transcription
-        self.stream_manager.start_streams(microphone_device.clone(), system_device.clone(), None).await?;
+        self.stream_manager.start_streams(microphone_device.clone(), system_audio, None).await?;
 
         // Start device monitoring to detect disconnects
         if let Some(ref mut monitor) = self.device_monitor {
