@@ -21,5 +21,10 @@ pub use engine::{
 pub use worker::{
     start_transcription_task,
     reset_speech_detected_flag,
-    TranscriptUpdate
+    EngineKind,
+    ProgressSnapshot,
+    TranscriptUpdate,
+    TranscriptionProgress,
+    TranscriptionTask,
+    TRANSCRIPTION_WORKERS,
 };

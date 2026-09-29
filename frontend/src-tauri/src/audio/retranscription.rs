@@ -112,6 +112,16 @@ pub async fn start_retranscription<R: Runtime>(
     // Acquire guard - ensures flag is cleared even on panic/early return
     let _guard = RetranscriptionGuard::acquire(&meeting_id).map_err(|e| anyhow!(e))?;
 
+    // Re-checked here: a recording may have started since the command returned.
+    if super::recording_commands::transcription_engine_in_use() {
+        let error = super::recording_commands::engine_in_use_error("re-transcribe a meeting");
+        let _ = app.emit(
+            "retranscription-error",
+            RetranscriptionError { meeting_id: meeting_id.clone(), error: error.clone() },
+        );
+        return Err(anyhow!(error));
+    }
+
     // Reset cancellation flag
     RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
 
@@ -778,6 +788,11 @@ pub async fn start_retranscription_command<R: Runtime>(
     // Check if retranscription is already in progress (guard will be acquired in start_retranscription)
     if is_retranscription_in_progress() {
         return Err("Retranscription already in progress".to_string());
+    }
+
+    // Loading its model would swap or unload the one a recording is transcribing with.
+    if super::recording_commands::transcription_engine_in_use() {
+        return Err(super::recording_commands::engine_in_use_error("re-transcribe a meeting"));
     }
 
     // Speaker identification writes this meeting's labels; the two must not overlap.

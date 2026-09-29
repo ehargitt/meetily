@@ -1,6 +1,6 @@
 // audio/transcription/worker.rs
 //
-// Parallel transcription worker pool and chunk processing logic.
+// Transcription worker and chunk processing logic.
 
 use super::engine::TranscriptionEngine;
 use super::provider::TranscriptionError;
@@ -8,8 +8,14 @@ use crate::audio::AudioChunk;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Runtime};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+/// Serial processing keeps transcripts in chronological order.
+pub const TRANSCRIPTION_WORKERS: usize = 1;
 
 // Sequence counter for transcript updates
 static SEQUENCE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -47,360 +53,425 @@ pub struct TranscriptUpdate {
 // NOTE: get_transcript_history and get_recording_meeting_name functions
 // have been moved to recording_commands.rs where they have access to RECORDING_MANAGER
 
-/// Optimized parallel transcription task ensuring ZERO chunk loss
+/// Where the transcription task reports to. `AppHandle` in the app; a recorder in tests.
+pub trait TranscriptionEvents: Clone + Send + Sync + 'static {
+    fn emit_json(&self, event: &str, payload: serde_json::Value);
+}
+
+impl<R: Runtime> TranscriptionEvents for AppHandle<R> {
+    fn emit_json(&self, event: &str, payload: serde_json::Value) {
+        if let Err(e) = self.emit(event, payload) {
+            error!("Failed to emit {}: {}", event, e);
+        }
+    }
+}
+
+/// Which engine a transcription task ended up using, so stop unloads that one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineKind {
+    Whisper,
+    Parakeet,
+    Other,
+}
+
+/// Point-in-time chunk accounting for one recording's transcription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressSnapshot {
+    /// Speech chunks received from the audio pipeline.
+    pub queued: u64,
+    /// Chunks actually transcribed (including ones with no speech in them).
+    pub completed: u64,
+    /// Chunks the engine failed on.
+    pub failed: u64,
+    /// Chunks never transcribed: model unavailable or worker gone.
+    pub skipped: u64,
+}
+
+impl ProgressSnapshot {
+    /// Chunks received but not yet handled.
+    pub fn pending(&self) -> u64 {
+        self.queued
+            .saturating_sub(self.completed + self.failed + self.skipped)
+    }
+
+    /// Chunks with no transcript: failed, skipped, or still pending.
+    pub fn not_transcribed(&self) -> u64 {
+        self.queued.saturating_sub(self.completed)
+    }
+}
+
+/// Live counters for one recording's transcription task, shared with
+/// `get_transcription_status` and the stop drain.
+#[derive(Debug)]
+pub struct TranscriptionProgress {
+    queued: AtomicU64,
+    completed: AtomicU64,
+    failed: AtomicU64,
+    skipped: AtomicU64,
+    busy: AtomicBool,
+    finished: AtomicBool,
+    last_activity: Mutex<Instant>,
+    engine_kind: OnceLock<EngineKind>,
+}
+
+impl TranscriptionProgress {
+    fn new() -> Self {
+        Self {
+            queued: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            skipped: AtomicU64::new(0),
+            busy: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            last_activity: Mutex::new(Instant::now()),
+            engine_kind: OnceLock::new(),
+        }
+    }
+
+    pub fn snapshot(&self) -> ProgressSnapshot {
+        ProgressSnapshot {
+            queued: self.queued.load(Ordering::SeqCst),
+            completed: self.completed.load(Ordering::SeqCst),
+            failed: self.failed.load(Ordering::SeqCst),
+            skipped: self.skipped.load(Ordering::SeqCst),
+        }
+    }
+
+    /// True once the task has ended (normally, by panic, or by abort).
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::SeqCst)
+    }
+
+    /// True while a chunk is being transcribed.
+    pub fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::SeqCst)
+    }
+
+    /// Time since a chunk was last queued or handled.
+    pub fn idle_for(&self) -> Duration {
+        self.last_activity.lock().unwrap_or_else(|e| e.into_inner()).elapsed()
+    }
+
+    pub fn engine_kind(&self) -> Option<EngineKind> {
+        self.engine_kind.get().copied()
+    }
+
+    fn touch(&self) {
+        *self.last_activity.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    fn record(&self, outcome: ChunkOutcome) {
+        let counter = match outcome {
+            ChunkOutcome::Transcribed => &self.completed,
+            ChunkOutcome::Failed => &self.failed,
+            ChunkOutcome::Skipped => &self.skipped,
+        };
+        counter.fetch_add(1, Ordering::SeqCst);
+        self.busy.store(false, Ordering::SeqCst);
+        self.touch();
+    }
+}
+
+/// Marks the progress finished when the task's future is dropped, however it ends.
+struct FinishedOnDrop(Arc<TranscriptionProgress>);
+
+impl Drop for FinishedOnDrop {
+    fn drop(&mut self) {
+        self.0.busy.store(false, Ordering::SeqCst);
+        self.0.finished.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A running transcription task and its live accounting.
+pub struct TranscriptionTask {
+    pub handle: JoinHandle<()>,
+    pub progress: Arc<TranscriptionProgress>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkOutcome {
+    Transcribed,
+    Failed,
+    Skipped,
+}
+
+/// Session-level reasons transcription stops working while audio keeps recording.
+/// Each is reported to the frontend once per recording, never per chunk.
+#[derive(Debug, Clone, Copy)]
+enum ActiveFailure {
+    EngineInit,
+    ModelUnavailable,
+    WorkerStopped,
+}
+
+#[derive(Default)]
+struct ActiveFailureLatch {
+    engine_init: AtomicBool,
+    model_unavailable: AtomicBool,
+    worker_stopped: AtomicBool,
+}
+
+impl ActiveFailureLatch {
+    fn report<E: TranscriptionEvents>(&self, events: &E, failure: ActiveFailure, detail: &str) {
+        let (latch, user_message, actionable) = match failure {
+            ActiveFailure::EngineInit => (
+                &self.engine_init,
+                "Live transcription could not start. Audio is still being recorded; check your transcription model settings.",
+                true,
+            ),
+            ActiveFailure::ModelUnavailable => (
+                &self.model_unavailable,
+                "The speech recognition model is no longer loaded, so live transcription stopped. Audio is still being recorded.",
+                false,
+            ),
+            ActiveFailure::WorkerStopped => (
+                &self.worker_stopped,
+                "Live transcription stopped unexpectedly. Audio is still being recorded.",
+                false,
+            ),
+        };
+        if latch.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        error!("Transcription stopped for this recording ({:?}): {}", failure, detail);
+        events.emit_json(
+            "transcription-error",
+            serde_json::json!({
+                "error": detail,
+                "userMessage": user_message,
+                "actionable": actionable,
+                "phase": "active"
+            }),
+        );
+    }
+}
+
+/// Start the transcription task for one recording.
+///
+/// Every chunk the pipeline sends is accounted for in the returned progress:
+/// transcribed, failed, or skipped. If the engine cannot start or the worker
+/// dies, the frontend is told once and remaining chunks are drained and counted
+/// as skipped, so the pipeline's sends never fail and loss is reported honestly.
 pub fn start_transcription_task<R: Runtime>(
     app: AppHandle<R>,
-    transcription_receiver: tokio::sync::mpsc::UnboundedReceiver<AudioChunk>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        info!("🚀 Starting optimized parallel transcription task - guaranteeing zero chunk loss");
+    transcription_receiver: mpsc::UnboundedReceiver<AudioChunk>,
+) -> TranscriptionTask {
+    let progress = Arc::new(TranscriptionProgress::new());
+    let task_progress = Arc::clone(&progress);
+
+    let handle = tokio::spawn(async move {
+        let _finished = FinishedOnDrop(Arc::clone(&task_progress));
+        let failures = Arc::new(ActiveFailureLatch::default());
+        info!("🚀 Starting transcription task");
 
         // Initialize transcription engine (Whisper or Parakeet based on config)
-        let transcription_engine = match super::engine::get_or_init_transcription_engine(&app).await {
-            Ok(engine) => engine,
+        let engine = match super::engine::get_or_init_transcription_engine(&app).await {
+            Ok(engine) => Some(engine),
             Err(e) => {
-                error!("Failed to initialize transcription engine: {}", e);
-                let _ = app.emit("transcription-error", serde_json::json!({
-                    "error": e,
-                    "userMessage": "Recording failed: Unable to initialize speech recognition. Please check your model settings.",
-                    "actionable": true,
-                    "phase": "active"
-                }));
-                return;
+                failures.report(&app, ActiveFailure::EngineInit, &e);
+                None
             }
         };
 
-        // Create parallel workers for faster processing while preserving ALL chunks
-        const NUM_WORKERS: usize = 1; // Serial processing ensures transcripts emit in chronological order
-        let (work_sender, work_receiver) = tokio::sync::mpsc::unbounded_channel::<AudioChunk>();
-        let work_receiver = Arc::new(tokio::sync::Mutex::new(work_receiver));
+        run_transcription(engine, transcription_receiver, app, task_progress, failures).await;
+    });
 
-        // Track completion: AtomicU64 for chunks queued, AtomicU64 for chunks completed
-        let chunks_queued = Arc::new(AtomicU64::new(0));
-        let chunks_completed = Arc::new(AtomicU64::new(0));
-        let input_finished = Arc::new(AtomicBool::new(false));
+    TranscriptionTask { handle, progress }
+}
 
-        info!("📊 Starting {} transcription worker{} (serial mode for ordered emission)", NUM_WORKERS, if NUM_WORKERS == 1 { "" } else { "s" });
+/// Dispatch chunks from the pipeline to the worker until the pipeline closes the channel.
+async fn run_transcription<E: TranscriptionEvents>(
+    engine: Option<TranscriptionEngine>,
+    mut receiver: mpsc::UnboundedReceiver<AudioChunk>,
+    events: E,
+    progress: Arc<TranscriptionProgress>,
+    failures: Arc<ActiveFailureLatch>,
+) {
+    let mut worker = engine.map(|engine| {
+        let kind = match &engine {
+            TranscriptionEngine::Whisper(_) => EngineKind::Whisper,
+            TranscriptionEngine::Parakeet(_) => EngineKind::Parakeet,
+            TranscriptionEngine::Provider(_) => EngineKind::Other,
+        };
+        let _ = progress.engine_kind.set(kind);
+        let (work_sender, work_receiver) = mpsc::unbounded_channel::<AudioChunk>();
+        let handle = tokio::spawn(run_worker(
+            engine,
+            work_receiver,
+            events.clone(),
+            Arc::clone(&progress),
+            Arc::clone(&failures),
+        ));
+        (work_sender, handle)
+    });
 
-        // Spawn worker tasks
-        let mut worker_handles = Vec::new();
-        for worker_id in 0..NUM_WORKERS {
-            let engine_clone = match &transcription_engine {
-                TranscriptionEngine::Whisper(e) => TranscriptionEngine::Whisper(e.clone()),
-                TranscriptionEngine::Parakeet(e) => TranscriptionEngine::Parakeet(e.clone()),
-                TranscriptionEngine::Provider(p) => TranscriptionEngine::Provider(p.clone()),
-            };
-            let app_clone = app.clone();
-            let work_receiver_clone = work_receiver.clone();
-            let chunks_completed_clone = chunks_completed.clone();
-            let input_finished_clone = input_finished.clone();
-            let chunks_queued_clone = chunks_queued.clone();
+    while let Some(chunk) = receiver.recv().await {
+        progress.queued.fetch_add(1, Ordering::SeqCst);
+        progress.touch();
 
-            let worker_handle = tokio::spawn(async move {
-                info!("👷 Worker {} started", worker_id);
-
-                // PRE-VALIDATE model state to avoid repeated async calls per chunk
-                let initial_model_loaded = engine_clone.is_model_loaded().await;
-                let current_model = engine_clone
-                    .get_current_model()
-                    .await
-                    .unwrap_or_else(|| "unknown".to_string());
-
-                let engine_name = engine_clone.provider_name();
-
-                if initial_model_loaded {
-                    info!(
-                        "✅ Worker {} pre-validation: {} model '{}' is loaded and ready",
-                        worker_id, engine_name, current_model
-                    );
-                } else {
-                    warn!("⚠️ Worker {} pre-validation: {} model not loaded - chunks may be skipped", worker_id, engine_name);
-                }
-
-                loop {
-                    // Try to get a chunk to process
-                    let chunk = {
-                        let mut receiver = work_receiver_clone.lock().await;
-                        receiver.recv().await
-                    };
-
-                    match chunk {
-                        Some(chunk) => {
-                            // PERFORMANCE OPTIMIZATION: Reduce logging in hot path
-                            // Only log every 10th chunk per worker to reduce I/O overhead
-                            let should_log_this_chunk = chunk.chunk_id % 10 == 0;
-
-                            if should_log_this_chunk {
-                                info!(
-                                    "👷 Worker {} processing chunk {} with {} samples",
-                                    worker_id,
-                                    chunk.chunk_id,
-                                    chunk.data.len()
-                                );
-                            }
-
-                            // Check if model is still loaded before processing
-                            if !engine_clone.is_model_loaded().await {
-                                warn!("⚠️ Worker {}: Model unloaded, but continuing to preserve chunk {}", worker_id, chunk.chunk_id);
-                                // Still count as completed even if we can't process
-                                chunks_completed_clone.fetch_add(1, Ordering::SeqCst);
-                                continue;
-                            }
-
-                            let chunk_timestamp = chunk.timestamp;
-                            let chunk_duration = chunk.data.len() as f64 / chunk.sample_rate as f64;
-
-                            // Transcribe with provider-agnostic approach
-                            match transcribe_chunk_with_provider(
-                                &engine_clone,
-                                chunk,
-                                &app_clone,
-                            )
-                            .await
-                            {
-                                Ok((transcript, confidence_opt, is_partial)) => {
-                                    let confidence_str = match confidence_opt {
-                                        Some(c) => format!("{:.2}", c),
-                                        None => "N/A".to_string(),
-                                    };
-
-                                    info!("🔍 Worker {} transcription result: text='{}', confidence={}, partial={}",
-                worker_id, transcript, confidence_str, is_partial);
-
-                                    if should_emit_transcript(&transcript) {
-                                        // PERFORMANCE: Only log transcription results, not every processing step
-                                        info!("✅ Worker {} transcribed: {} (confidence: {}, partial: {})",
-                                              worker_id, transcript, confidence_str, is_partial);
-
-                                        // Emit speech-detected event for frontend UX (only on first detection per session)
-                                        // This is lightweight and provides better user feedback
-                                        let current_flag = SPEECH_DETECTED_EMITTED.load(Ordering::SeqCst);
-                                        info!("🔍 Checking speech-detected flag: current={}, will_emit={}", current_flag, !current_flag);
-
-                                        if !current_flag {
-                                            SPEECH_DETECTED_EMITTED.store(true, Ordering::SeqCst);
-                                            match app_clone.emit("speech-detected", serde_json::json!({
-                                                "message": "Speech activity detected"
-                                            })) {
-                                                Ok(_) => info!("🎤 ✅ First speech detected - successfully emitted speech-detected event"),
-                                                Err(e) => error!("🎤 ❌ Failed to emit speech-detected event: {}", e),
-                                            }
-                                        } else {
-                                            info!("🔍 Speech already detected in this session, not re-emitting");
-                                        }
-
-                                        // Generate sequence ID and calculate timestamps FIRST
-                                        let sequence_id = SEQUENCE_COUNTER.fetch_add(1, Ordering::SeqCst);
-                                        let audio_start_time = chunk_timestamp; // Already in seconds from recording start
-                                        let audio_end_time = chunk_timestamp + chunk_duration;
-
-                                        // Save structured transcript segment to recording manager (only final results)
-                                        // Save ALL segments (partial and final) to ensure complete JSON
-                                        // Create structured segment with full timestamp data
-                                        // NOTE: This is now handled via the transcript-update event emission below
-                                        // The recording_commands module listens to these events and saves them
-                                        // This decouples the transcription worker from direct RECORDING_MANAGER access
-
-                                        // Emit transcript update with NEW recording-relative timestamps
-
-                                        let update = TranscriptUpdate {
-                                            text: transcript,
-                                            timestamp: format_current_timestamp(), // Wall-clock for reference
-                                            source: "Audio".to_string(),
-                                            sequence_id,
-                                            chunk_start_time: chunk_timestamp, // Legacy compatibility
-                                            is_partial,
-                                            confidence: confidence_opt.unwrap_or(0.85), // Default for providers without confidence
-                                            // NEW: Recording-relative timestamps for sync
-                                            audio_start_time,
-                                            audio_end_time,
-                                            duration: chunk_duration,
-                                        };
-
-                                        if let Err(e) = app_clone.emit("transcript-update", &update)
-                                        {
-                                            error!(
-                                                "Worker {}: Failed to emit transcript update: {}",
-                                                worker_id, e
-                                            );
-                                        }
-                                        // PERFORMANCE: Removed verbose logging of every emission
-                                    }
-                                }
-                                Err(e) => {
-                                    // Improved error handling with specific cases
-                                    match e {
-                                        TranscriptionError::AudioTooShort { .. } => {
-                                            // Skip silently, this is expected for very short chunks
-                                            info!("Worker {}: {}", worker_id, e);
-                                            chunks_completed_clone.fetch_add(1, Ordering::SeqCst);
-                                            continue;
-                                        }
-                                        TranscriptionError::ModelNotLoaded => {
-                                            warn!("Worker {}: Model unloaded during transcription", worker_id);
-                                            chunks_completed_clone.fetch_add(1, Ordering::SeqCst);
-                                            continue;
-                                        }
-                                        _ => {
-                                            warn!("Worker {}: Transcription failed: {}", worker_id, e);
-                                            let _ = app_clone.emit("transcription-warning", e.to_string());
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Mark chunk as completed
-                            let completed =
-                                chunks_completed_clone.fetch_add(1, Ordering::SeqCst) + 1;
-                            let queued = chunks_queued_clone.load(Ordering::SeqCst);
-
-                            // PERFORMANCE: Only log progress every 5th chunk to reduce I/O overhead
-                            if completed % 5 == 0 || should_log_this_chunk {
-                                info!(
-                                    "Worker {}: Progress {}/{} chunks ({:.1}%)",
-                                    worker_id,
-                                    completed,
-                                    queued,
-                                    (completed as f64 / queued.max(1) as f64 * 100.0)
-                                );
-                            }
-
-                            // Emit progress event for frontend
-                            let progress_percentage = if queued > 0 {
-                                (completed as f64 / queued as f64 * 100.0) as u32
-                            } else {
-                                100
-                            };
-
-                            let _ = app_clone.emit("transcription-progress", serde_json::json!({
-                                "worker_id": worker_id,
-                                "chunks_completed": completed,
-                                "chunks_queued": queued,
-                                "progress_percentage": progress_percentage,
-                                "message": format!("Worker {} processing... ({}/{})", worker_id, completed, queued)
-                            }));
-                        }
-                        None => {
-                            // No more chunks available
-                            if input_finished_clone.load(Ordering::SeqCst) {
-                                // Double-check that all queued chunks are actually completed
-                                let final_queued = chunks_queued_clone.load(Ordering::SeqCst);
-                                let final_completed = chunks_completed_clone.load(Ordering::SeqCst);
-
-                                if final_completed >= final_queued {
-                                    info!(
-                                        "👷 Worker {} finishing - all {}/{} chunks processed",
-                                        worker_id, final_completed, final_queued
-                                    );
-                                    break;
-                                } else {
-                                    warn!("👷 Worker {} detected potential chunk loss: {}/{} completed, waiting...", worker_id, final_completed, final_queued);
-                                    // AGGRESSIVE POLLING: Reduced from 50ms to 5ms for faster chunk detection during shutdown
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-                                }
-                            } else {
-                                // AGGRESSIVE POLLING: Reduced from 10ms to 1ms for faster response during shutdown
-                                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                            }
-                        }
-                    }
-                }
-
-                info!("👷 Worker {} completed", worker_id);
-            });
-
-            worker_handles.push(worker_handle);
-        }
-
-        // Main dispatcher: receive chunks and distribute to workers
-        let mut receiver = transcription_receiver;
-        while let Some(chunk) = receiver.recv().await {
-            let queued = chunks_queued.fetch_add(1, Ordering::SeqCst) + 1;
-            info!(
-                "📥 Dispatching chunk {} to workers (total queued: {})",
-                chunk.chunk_id, queued
-            );
-
-            if let Err(_) = work_sender.send(chunk) {
-                error!("❌ Failed to send chunk to workers - this should not happen!");
-                break;
+        let delivered = match &worker {
+            Some((work_sender, handle)) if !handle.is_finished() => work_sender.send(chunk).is_ok(),
+            _ => false,
+        };
+        if !delivered {
+            if worker.take().is_some() {
+                failures.report(&events, ActiveFailure::WorkerStopped, "Transcription worker exited");
             }
+            progress.skipped.fetch_add(1, Ordering::SeqCst);
         }
+    }
 
-        // Signal that input is finished
-        input_finished.store(true, Ordering::SeqCst);
-        drop(work_sender); // Close the channel to signal workers
-
-        let total_chunks_queued = chunks_queued.load(Ordering::SeqCst);
-        info!("📭 Input finished with {} total chunks queued. Waiting for all {} workers to complete...",
-              total_chunks_queued, NUM_WORKERS);
-
-        // Emit final chunk count to frontend
-        let _ = app.emit("transcription-queue-complete", serde_json::json!({
-            "total_chunks": total_chunks_queued,
-            "message": format!("{} chunks queued for processing - waiting for completion", total_chunks_queued)
-        }));
-
-        // Wait for all workers to complete
-        for (worker_id, handle) in worker_handles.into_iter().enumerate() {
-            if let Err(e) = handle.await {
-                error!("❌ Worker {} panicked: {:?}", worker_id, e);
-            } else {
-                info!("✅ Worker {} completed successfully", worker_id);
-            }
+    // Input finished: let the worker drain its queue, then account for anything it never handled.
+    if let Some((work_sender, handle)) = worker {
+        drop(work_sender);
+        if let Err(e) = handle.await {
+            failures.report(&events, ActiveFailure::WorkerStopped, &format!("Transcription worker failed: {}", e));
         }
+    }
+    let unhandled = progress.snapshot().pending();
+    if unhandled > 0 {
+        progress.skipped.fetch_add(unhandled, Ordering::SeqCst);
+    }
 
-        // Final verification with retry logic to catch any stragglers
-        let mut verification_attempts = 0;
-        const MAX_VERIFICATION_ATTEMPTS: u32 = 10;
+    let snapshot = progress.snapshot();
+    events.emit_json(
+        "transcription-queue-complete",
+        serde_json::json!({
+            "total_chunks": snapshot.queued,
+            "message": format!("{} chunks queued for processing", snapshot.queued)
+        }),
+    );
+    info!(
+        "Transcription task finished: {} queued, {} transcribed, {} failed, {} skipped",
+        snapshot.queued, snapshot.completed, snapshot.failed, snapshot.skipped
+    );
+}
 
-        loop {
-            let final_queued = chunks_queued.load(Ordering::SeqCst);
-            let final_completed = chunks_completed.load(Ordering::SeqCst);
+async fn run_worker<E: TranscriptionEvents>(
+    engine: TranscriptionEngine,
+    mut work_receiver: mpsc::UnboundedReceiver<AudioChunk>,
+    events: E,
+    progress: Arc<TranscriptionProgress>,
+    failures: Arc<ActiveFailureLatch>,
+) {
+    let engine_name = engine.provider_name().to_string();
+    if engine.is_model_loaded().await {
+        let current_model = engine
+            .get_current_model()
+            .await
+            .unwrap_or_else(|| "unknown".to_string());
+        info!("✅ Worker: {} model '{}' is loaded and ready", engine_name, current_model);
+    } else {
+        warn!("⚠️ Worker: {} model not loaded - chunks will be skipped", engine_name);
+    }
 
-            if final_queued == final_completed {
-                info!(
-                    "🎉 ALL {} chunks processed successfully - ZERO chunks lost!",
-                    final_completed
-                );
-                break;
-            } else if verification_attempts < MAX_VERIFICATION_ATTEMPTS {
-                verification_attempts += 1;
-                warn!("⚠️ Chunk count mismatch (attempt {}): {} queued, {} completed - waiting for stragglers...",
-                     verification_attempts, final_queued, final_completed);
+    while let Some(chunk) = work_receiver.recv().await {
+        progress.busy.store(true, Ordering::SeqCst);
+        let outcome = process_chunk(&engine, chunk, &events, &failures).await;
+        progress.record(outcome);
 
-                // Wait a bit for any remaining chunks to be processed
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            } else {
-                error!(
-                    "❌ CRITICAL: After {} attempts, chunk loss detected: {} queued, {} completed",
-                    MAX_VERIFICATION_ATTEMPTS, final_queued, final_completed
-                );
+        let snapshot = progress.snapshot();
+        let handled = snapshot.queued - snapshot.pending();
+        let progress_percentage = if snapshot.queued > 0 {
+            (handled as f64 / snapshot.queued as f64 * 100.0) as u32
+        } else {
+            100
+        };
+        events.emit_json(
+            "transcription-progress",
+            serde_json::json!({
+                "worker_id": 0,
+                "chunks_completed": snapshot.completed,
+                "chunks_processed": handled,
+                "chunks_queued": snapshot.queued,
+                "progress_percentage": progress_percentage,
+                "message": format!("Transcribing... ({}/{})", handled, snapshot.queued)
+            }),
+        );
+    }
 
-                // Emit critical error event
-                let _ = app.emit(
-                    "transcript-chunk-loss-detected",
-                    serde_json::json!({
-                        "chunks_queued": final_queued,
-                        "chunks_completed": final_completed,
-                        "chunks_lost": final_queued - final_completed,
-                        "message": "Some transcript chunks may have been lost during shutdown"
-                    }),
-                );
-                break;
-            }
+    info!("👷 Transcription worker completed");
+}
+
+async fn process_chunk<E: TranscriptionEvents>(
+    engine: &TranscriptionEngine,
+    chunk: AudioChunk,
+    events: &E,
+    failures: &ActiveFailureLatch,
+) -> ChunkOutcome {
+    if !engine.is_model_loaded().await {
+        failures.report(events, ActiveFailure::ModelUnavailable, "No transcription model is loaded");
+        return ChunkOutcome::Skipped;
+    }
+
+    let chunk_id = chunk.chunk_id;
+    let chunk_timestamp = chunk.timestamp;
+    let chunk_duration = chunk.data.len() as f64 / chunk.sample_rate as f64;
+
+    let (transcript, confidence_opt, is_partial) = match transcribe_chunk_with_provider(engine, chunk).await {
+        Ok(result) => result,
+        // Expected for very short chunks: there was nothing to transcribe.
+        Err(e @ TranscriptionError::AudioTooShort { .. }) => {
+            info!("Chunk {}: {}", chunk_id, e);
+            return ChunkOutcome::Transcribed;
         }
+        Err(TranscriptionError::ModelNotLoaded) => {
+            failures.report(events, ActiveFailure::ModelUnavailable, "Model unloaded during transcription");
+            return ChunkOutcome::Skipped;
+        }
+        Err(e) => {
+            warn!("Chunk {}: transcription failed: {}", chunk_id, e);
+            events.emit_json("transcription-warning", serde_json::Value::String(e.to_string()));
+            return ChunkOutcome::Failed;
+        }
+    };
 
-        info!("✅ Parallel transcription task completed - all workers finished, ready for model unload");
-    })
+    if !should_emit_transcript(&transcript) {
+        return ChunkOutcome::Transcribed;
+    }
+
+    let confidence_str = match confidence_opt {
+        Some(c) => format!("{:.2}", c),
+        None => "N/A".to_string(),
+    };
+    info!("✅ Transcribed chunk {}: {} (confidence: {}, partial: {})",
+          chunk_id, transcript, confidence_str, is_partial);
+
+    // Emit speech-detected event for frontend UX (only on first detection per session)
+    if !SPEECH_DETECTED_EMITTED.swap(true, Ordering::SeqCst) {
+        events.emit_json(
+            "speech-detected",
+            serde_json::json!({ "message": "Speech activity detected" }),
+        );
+        info!("🎤 First speech detected - emitted speech-detected event");
+    }
+
+    // The recording_commands listener saves each update to the meeting's transcript store.
+    let update = TranscriptUpdate {
+        text: transcript,
+        timestamp: format_current_timestamp(), // Wall-clock for reference
+        source: "Audio".to_string(),
+        sequence_id: SEQUENCE_COUNTER.fetch_add(1, Ordering::SeqCst),
+        chunk_start_time: chunk_timestamp, // Legacy compatibility
+        is_partial,
+        confidence: confidence_opt.unwrap_or(0.85), // Default for providers without confidence
+        audio_start_time: chunk_timestamp, // Already in seconds from recording start
+        audio_end_time: chunk_timestamp + chunk_duration,
+        duration: chunk_duration,
+    };
+    match serde_json::to_value(&update) {
+        Ok(payload) => events.emit_json("transcript-update", payload),
+        Err(e) => error!("Failed to serialize transcript update: {}", e),
+    }
+
+    ChunkOutcome::Transcribed
 }
 
 /// Transcribe audio chunk using the appropriate provider (Whisper, Parakeet, or trait-based)
 /// Returns: (text, confidence Option, is_partial)
-async fn transcribe_chunk_with_provider<R: Runtime>(
+async fn transcribe_chunk_with_provider(
     engine: &TranscriptionEngine,
     chunk: AudioChunk,
-    app: &AppHandle<R>,
 ) -> std::result::Result<(String, Option<f32>, bool), TranscriptionError> {
     // Convert to 16kHz mono for transcription
     let transcription_data = if chunk.sample_rate != 16000 {
@@ -434,135 +505,56 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
         energy
     );
 
-    // Transcribe using the appropriate engine (with improved error handling)
-    match engine {
+    // Transcribe using the appropriate engine
+    let result = match engine {
         TranscriptionEngine::Whisper(whisper_engine) => {
             // Get language preference from global state
             let language = crate::get_language_preference_internal();
-
-            match whisper_engine
+            whisper_engine
                 .transcribe_audio_with_confidence(speech_samples, language)
                 .await
-            {
-                Ok((text, confidence, is_partial)) => {
-                    let cleaned_text = text.trim().to_string();
-                    if cleaned_text.is_empty() {
-                        return Ok((String::new(), Some(confidence), is_partial));
-                    }
-
-                    info!(
-                        "Whisper transcription complete for chunk {}: '{}' (confidence: {:.2}, partial: {})",
-                        chunk.chunk_id, cleaned_text, confidence, is_partial
-                    );
-
-                    Ok((cleaned_text, Some(confidence), is_partial))
-                }
-                Err(e) => {
-                    error!(
-                        "Whisper transcription failed for chunk {}: {}",
-                        chunk.chunk_id, e
-                    );
-
-                    let transcription_error = TranscriptionError::EngineFailed(e.to_string());
-                    let _ = app.emit(
-                        "transcription-error",
-                        &serde_json::json!({
-                            "error": transcription_error.to_string(),
-                            "userMessage": format!("Transcription failed: {}", transcription_error),
-                            "actionable": false,
-                            "phase": "active"
-                        }),
-                    );
-
-                    Err(transcription_error)
-                }
-            }
+                .map(|(text, confidence, is_partial)| (text.trim().to_string(), Some(confidence), is_partial))
+                .map_err(|e| TranscriptionError::EngineFailed(e.to_string()))
         }
-        TranscriptionEngine::Parakeet(parakeet_engine) => {
-            match parakeet_engine.transcribe_audio(speech_samples).await {
-                Ok(text) => {
-                    let cleaned_text = text.trim().to_string();
-                    if cleaned_text.is_empty() {
-                        return Ok((String::new(), None, false));
-                    }
-
-                    info!(
-                        "Parakeet transcription complete for chunk {}: '{}'",
-                        chunk.chunk_id, cleaned_text
-                    );
-
-                    // Parakeet doesn't provide confidence or partial results
-                    Ok((cleaned_text, None, false))
-                }
-                Err(e) => {
-                    error!(
-                        "Parakeet transcription failed for chunk {}: {}",
-                        chunk.chunk_id, e
-                    );
-
-                    let transcription_error = TranscriptionError::EngineFailed(e.to_string());
-                    let _ = app.emit(
-                        "transcription-error",
-                        &serde_json::json!({
-                            "error": transcription_error.to_string(),
-                            "userMessage": format!("Transcription failed: {}", transcription_error),
-                            "actionable": false,
-                            "phase": "active"
-                        }),
-                    );
-
-                    Err(transcription_error)
-                }
-            }
-        }
+        TranscriptionEngine::Parakeet(parakeet_engine) => parakeet_engine
+            .transcribe_audio(speech_samples)
+            .await
+            // Parakeet doesn't provide confidence or partial results
+            .map(|text| (text.trim().to_string(), None, false))
+            .map_err(|e| TranscriptionError::EngineFailed(e.to_string())),
         TranscriptionEngine::Provider(provider) => {
-            // NEW: Trait-based provider (clean, unified interface)
             let language = crate::get_language_preference_internal();
+            provider
+                .transcribe(speech_samples, language)
+                .await
+                .map(|result| (result.text.trim().to_string(), result.confidence, result.is_partial))
+        }
+    };
 
-            match provider.transcribe(speech_samples, language).await {
-                Ok(result) => {
-                    let cleaned_text = result.text.trim().to_string();
-                    if cleaned_text.is_empty() {
-                        return Ok((String::new(), result.confidence, result.is_partial));
-                    }
-
-                    let confidence_str = match result.confidence {
-                        Some(c) => format!("confidence: {:.2}", c),
-                        None => "no confidence".to_string(),
-                    };
-
-                    info!(
-                        "{} transcription complete for chunk {}: '{}' ({}, partial: {})",
-                        provider.provider_name(),
-                        chunk.chunk_id,
-                        cleaned_text,
-                        confidence_str,
-                        result.is_partial
-                    );
-
-                    Ok((cleaned_text, result.confidence, result.is_partial))
-                }
-                Err(e) => {
-                    error!(
-                        "{} transcription failed for chunk {}: {}",
-                        provider.provider_name(),
-                        chunk.chunk_id,
-                        e
-                    );
-
-                    let _ = app.emit(
-                        "transcription-error",
-                        &serde_json::json!({
-                            "error": e.to_string(),
-                            "userMessage": format!("Transcription failed: {}", e),
-                            "actionable": false,
-                            "phase": "active"
-                        }),
-                    );
-
-                    Err(e)
-                }
+    match result {
+        Ok(transcript) => {
+            if !transcript.0.is_empty() {
+                info!(
+                    "{} transcription complete for chunk {}: '{}'",
+                    engine.provider_name(),
+                    chunk.chunk_id,
+                    transcript.0
+                );
             }
+            Ok(transcript)
+        }
+        Err(e) => {
+            error!(
+                "{} transcription failed for chunk {}: {}",
+                engine.provider_name(),
+                chunk.chunk_id,
+                e
+            );
+            // An engine error caused by an unload is a session problem, not a bad chunk.
+            if !engine.is_model_loaded().await {
+                return Err(TranscriptionError::ModelNotLoaded);
+            }
+            Err(e)
         }
     }
 }
@@ -588,21 +580,193 @@ fn format_recording_time(seconds: f64) -> String {
     let secs = total_seconds % 60;
 
     format!("[{:02}:{:02}]", minutes, secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::recording_state::DeviceType;
+    use crate::audio::transcription::provider::{TranscriptResult, TranscriptionProvider};
+    use async_trait::async_trait;
+
+    #[test]
+    fn keeps_short_acknowledgements() {
+        assert!(should_emit_transcript("Yes"));
+        assert!(should_emit_transcript("ok"));
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
+    #[test]
+    fn drops_empty_and_whitespace_only() {
+        assert!(!should_emit_transcript(""));
+        assert!(!should_emit_transcript("   "));
+    }
 
-        #[test]
-        fn keeps_short_acknowledgements() {
-            assert!(should_emit_transcript("Yes"));
-            assert!(should_emit_transcript("ok"));
-        }
+    #[derive(Clone, Default)]
+    struct RecordedEvents(Arc<Mutex<Vec<(String, serde_json::Value)>>>);
 
-        #[test]
-        fn drops_empty_and_whitespace_only() {
-            assert!(!should_emit_transcript(""));
-            assert!(!should_emit_transcript("   "));
+    impl TranscriptionEvents for RecordedEvents {
+        fn emit_json(&self, event: &str, payload: serde_json::Value) {
+            self.0.lock().unwrap().push((event.to_string(), payload));
         }
     }
+
+    impl RecordedEvents {
+        fn named(&self, event: &str) -> Vec<serde_json::Value> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(name, _)| name == event)
+                .map(|(_, payload)| payload.clone())
+                .collect()
+        }
+    }
+
+    /// Chunk behaviour is encoded in its first sample.
+    const SPEECH: f32 = 0.1;
+    const ENGINE_ERROR: f32 = 0.2;
+    const PANIC: f32 = 0.3;
+
+    /// Fake engine: transcribes, fails or panics per chunk, and "unloads" its
+    /// model after `unload_after` successful calls.
+    struct ScriptedProvider {
+        calls: AtomicU64,
+        unload_after: u64,
+    }
+
+    #[async_trait]
+    impl TranscriptionProvider for ScriptedProvider {
+        async fn transcribe(
+            &self,
+            audio: Vec<f32>,
+            _language: Option<String>,
+        ) -> Result<TranscriptResult, TranscriptionError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match audio[0] {
+                x if x == ENGINE_ERROR => Err(TranscriptionError::EngineFailed("decoder error".into())),
+                x if x == PANIC => panic!("engine crashed"),
+                _ => Ok(TranscriptResult {
+                    text: "hello".into(),
+                    confidence: Some(0.9),
+                    is_partial: false,
+                }),
+            }
+        }
+
+        async fn is_model_loaded(&self) -> bool {
+            self.calls.load(Ordering::SeqCst) < self.unload_after
+        }
+
+        async fn get_current_model(&self) -> Option<String> {
+            Some("scripted".into())
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "Scripted"
+        }
+    }
+
+    fn chunk(marker: f32, id: u64) -> AudioChunk {
+        AudioChunk {
+            data: vec![marker; 1600],
+            sample_rate: 16000,
+            timestamp: id as f64,
+            chunk_id: id,
+            device_type: DeviceType::Microphone,
+        }
+    }
+
+    async fn run_script(markers: &[f32], unload_after: u64) -> (ProgressSnapshot, RecordedEvents) {
+        let engine = TranscriptionEngine::Provider(Arc::new(ScriptedProvider {
+            calls: AtomicU64::new(0),
+            unload_after,
+        }));
+        let (sender, receiver) = mpsc::unbounded_channel();
+        for (id, marker) in markers.iter().enumerate() {
+            sender.send(chunk(*marker, id as u64)).unwrap();
+        }
+        drop(sender);
+
+        let events = RecordedEvents::default();
+        let progress = Arc::new(TranscriptionProgress::new());
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_transcription(
+                Some(engine),
+                receiver,
+                events.clone(),
+                Arc::clone(&progress),
+                Arc::new(ActiveFailureLatch::default()),
+            ),
+        )
+        .await
+        .expect("the transcription task must finish once its input closes");
+        (progress.snapshot(), events)
+    }
+
+    #[tokio::test]
+    async fn only_transcribed_chunks_count_as_completed() {
+        // One engine error, two transcribed, then the model is gone for three more.
+        let (snapshot, events) =
+            run_script(&[ENGINE_ERROR, SPEECH, SPEECH, SPEECH, SPEECH, SPEECH], 3).await;
+
+        assert_eq!(
+            snapshot,
+            ProgressSnapshot { queued: 6, completed: 2, failed: 1, skipped: 3 }
+        );
+        assert_eq!(snapshot.not_transcribed(), 4);
+        assert_eq!(snapshot.pending(), 0);
+        assert_eq!(events.named("transcript-update").len(), 2);
+        assert_eq!(events.named("transcription-warning").len(), 1, "per-chunk failure is a warning");
+
+        let errors = events.named("transcription-error");
+        assert_eq!(errors.len(), 1, "model loss is reported once, not per chunk");
+        assert_eq!(errors[0]["phase"], "active");
+    }
+
+    #[tokio::test]
+    async fn a_dead_worker_is_reported_once_and_its_chunks_count_as_lost() {
+        let (snapshot, events) =
+            run_script(&[SPEECH, PANIC, SPEECH, SPEECH, SPEECH], u64::MAX).await;
+
+        assert_eq!(snapshot.queued, 5);
+        assert_eq!(snapshot.completed, 1);
+        assert_eq!(snapshot.not_transcribed(), 4);
+        assert_eq!(snapshot.pending(), 0, "nothing is left looking in-progress");
+
+        let errors = events.named("transcription-error");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["phase"], "active");
+    }
+
+    #[tokio::test]
+    async fn chunks_after_worker_death_are_skipped_not_queued_into_it() {
+        let engine = TranscriptionEngine::Provider(Arc::new(ScriptedProvider {
+            calls: AtomicU64::new(0),
+            unload_after: u64::MAX,
+        }));
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let events = RecordedEvents::default();
+        let progress = Arc::new(TranscriptionProgress::new());
+        let task = tokio::spawn(run_transcription(
+            Some(engine),
+            receiver,
+            events.clone(),
+            Arc::clone(&progress),
+            Arc::new(ActiveFailureLatch::default()),
+        ));
+
+        sender.send(chunk(PANIC, 0)).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await; // the worker panics on it
+        sender.send(chunk(SPEECH, 1)).unwrap();
+        sender.send(chunk(SPEECH, 2)).unwrap();
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot.queued, 3);
+        assert_eq!(snapshot.completed, 0);
+        assert_eq!(snapshot.skipped, 3);
+        assert_eq!(events.named("transcription-error").len(), 1);
+    }
+}
