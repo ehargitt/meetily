@@ -35,7 +35,16 @@ pub fn default_output_device() -> Result<AudioDevice> {
         return Ok(AudioDevice::new(device.name()?, DeviceType::Output));
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    // System audio on Linux is captured from a monitor source. cpal's default
+    // output is the ALSA `default` PCM, which on the capture side is the
+    // microphone, so offer the first monitor source ALSA knows instead.
+    #[cfg(target_os = "linux")]
+    {
+        return super::platform::default_system_audio_device()?
+            .ok_or_else(|| anyhow!("No system-audio monitor source is configured in ALSA"));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let host = cpal::default_host();
         let device = host
