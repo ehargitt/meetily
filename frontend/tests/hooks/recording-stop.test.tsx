@@ -12,8 +12,14 @@ const originalPreferences = { ...await import('../../src/lib/summary-language-pr
 const originalToast = { ...await import('sonner') };
 const originalNavigation = { ...await import('next/navigation') };
 const originalPath = { ...await import('@tauri-apps/api/path') };
+const originalConfig = { ...await import('../../src/contexts/ConfigContext') };
+const originalRecordingNotification = { ...await import('../../src/lib/recordingNotification') };
+const originalTooltip = { ...await import('../../src/components/ui/tooltip') };
 afterAll(() => {
+  mock.module('../../src/components/ui/tooltip', () => originalTooltip);
   mock.module('@tauri-apps/api/path', () => originalPath);
+  mock.module('../../src/contexts/ConfigContext', () => originalConfig);
+  mock.module('../../src/lib/recordingNotification', () => originalRecordingNotification);
   mock.module('@tauri-apps/api/core', () => originalCore);
   mock.module('../../src/lib/analytics', () => originalAnalytics);
   mock.module('../../src/lib/summary-language-preferences', () => originalPreferences);
@@ -30,6 +36,7 @@ const setStatus = mock((status: string) => { calls.push(`status ${status}`); });
 const recordingState: Record<string, unknown> = {};
 const resetRecordingState = () => Object.assign(recordingState, {
   status: RecordingStatus.IDLE, isRecording: false, setStatus, isStopping: false, isProcessing: false, isSaving: false,
+  isPaused: false, isStartingRecording: false,
 });
 resetRecordingState();
 mock.module('../../src/contexts/RecordingStateContext', () => recordingStateModule(recordingState));
@@ -39,7 +46,7 @@ const markMeetingAsSaved = mock(async () => { calls.push('marked saved'); });
 mock.module('../../src/contexts/TranscriptContext', () => ({
   useTranscripts: () => ({
     transcriptsRef: { current: [transcript] }, flushBuffer() {}, clearTranscripts() {},
-    meetingTitle: 'Standup', markMeetingAsSaved,
+    meetingTitle: 'Standup', markMeetingAsSaved, setMeetingTitle() {},
   }),
 }));
 
@@ -58,6 +65,7 @@ mock.module('../../src/services/storageService', () => ({
 
 mock.module('../../src/lib/analytics', () => ({ default: {
   trackPageView() {}, trackButtonClick() {}, trackBackendConnection() {},
+  trackTranscriptionSuccess() {}, trackTranscriptionError() {},
   // Ends the completion-analytics block early, before it loads the real store plugin.
   getMeetingsCountToday: async () => { throw new Error('analytics are not under test'); },
 } }));
@@ -74,11 +82,20 @@ const notify = mock(() => {});
 mock.module('sonner', () => ({ toast: { info: toastInfo, error: toastError, success: notify, warning: toastWarning } }));
 
 let startIdentification: () => Promise<StartSpeakerIdResult>;
-let backendRecording: boolean;
+let backendRecording: boolean | (() => never);
+let transcriptionModelReady: boolean;
 let stopRecordingResult: () => Promise<void>;
 const invoke = mock(async (command: string, args?: Record<string, unknown>): Promise<unknown> => {
   if (command === 'api_get_meetings') return [];
-  if (command === 'is_recording') return backendRecording;
+  if (command === 'is_recording') return typeof backendRecording === 'function' ? backendRecording() : backendRecording;
+  if (command === 'api_get_transcript_config') return { provider: 'parakeet' };
+  if (command === 'parakeet_init') return null;
+  if (command === 'parakeet_has_available_models') return transcriptionModelReady;
+  if (command === 'parakeet_get_available_models') return [];
+  if (command === 'start_recording_with_devices_and_meeting') {
+    calls.push('start_recording');
+    return null;
+  }
   if (command === 'stop_recording') {
     calls.push('stop_recording');
     return stopRecordingResult();
@@ -101,6 +118,16 @@ mock.module('@tauri-apps/api/event', () => ({
   },
 }));
 mock.module('@tauri-apps/api/path', () => ({ ...originalPath, appDataDir: async () => '/app-data' }));
+mock.module('../../src/contexts/ConfigContext', () => ({
+  ...originalConfig,
+  useConfig: () => ({ selectedDevices: { micDevice: null, systemDevice: null } }),
+}));
+mock.module('../../src/lib/recordingNotification', () => ({ showRecordingNotification: async () => {} }));
+// Radix tooltips need a DOM, which bun does not have; RecordingControls renders plain children.
+const Passthrough = ({ children }: { children?: React.ReactNode }) => <>{children}</>;
+mock.module('../../src/components/ui/tooltip', () => ({
+  ...originalTooltip, Tooltip: Passthrough, TooltipTrigger: Passthrough, TooltipProvider: Passthrough, TooltipContent: () => null,
+}));
 async function emit(name: string, payload: unknown) {
   await act(async () => { eventHandlers.get(name)?.forEach(handler => handler({ payload })); });
 }
@@ -110,6 +137,9 @@ const { useRecordingStop, SPEAKER_MODELS_HINT_SHOWN_KEY, cancelPostSaveNavigatio
   await import('../../src/hooks/useRecordingStop');
 const { RecordingPostProcessingProvider } = await import('../../src/contexts/RecordingPostProcessingProvider');
 const { stopBackendRecording } = await import('../../src/lib/stopBackendRecording');
+const { useRecordingStart } = await import('../../src/hooks/useRecordingStart');
+const { RecordingControls } = await import('../../src/components/RecordingControls');
+const { Square } = await import('lucide-react');
 
 // The hook uses browser storage and window; bun provides neither, and other suites may have
 // installed their own window, so every global is put back as it was.
@@ -122,7 +152,7 @@ class MemoryStorage {
 }
 let localStorageImpl: Pick<MemoryStorage, 'getItem' | 'setItem'>;
 const browserGlobals: Record<string, PropertyDescriptor> = {
-  window: { configurable: true, writable: true, value: {} },
+  window: { configurable: true, writable: true, value: { addEventListener() {}, removeEventListener() {} } },
   sessionStorage: { configurable: true, writable: true, value: new MemoryStorage() },
   localStorage: { configurable: true, get: () => localStorageImpl },
 };
@@ -147,6 +177,7 @@ beforeEach(() => {
   transcriptionStatus = transcriptionDone;
   saveMeetingResult = async () => ({ meeting_id: 'meeting-new' });
   backendRecording = true;
+  transcriptionModelReady = true;
   stopRecordingResult = async () => {};
   resetRecordingState();
   localStorageImpl = new MemoryStorage();
@@ -395,8 +426,80 @@ describe('stopBackendRecording results', () => {
     expect(calls).not.toContain('stop_recording');
   });
 
+  test('a failed is_recording check falls through to the real stop', async () => {
+    backendRecording = () => { throw new Error('state command failed'); };
+    expect(await stopBackendRecording()).toBe('stopped');
+    expect(calls).toContain('stop_recording');
+  });
+
   test('any other stop failure is rethrown', async () => {
     stopRecordingResult = async () => { throw 'Failed to stop recording: encoder busy'; };
     await expect(stopBackendRecording()).rejects.toBe('Failed to stop recording: encoder busy');
+  });
+});
+
+describe('a new start and the pending post-save navigation', () => {
+  // As above: keep the 2 s post-save delay short but real.
+  beforeEach(() => {
+    globalThis.setTimeout = ((callback: () => void, delay?: number) =>
+      realSetTimeout(callback, delay === 2000 ? 30 : delay !== undefined && delay >= 500 ? 0 : delay)) as typeof setTimeout;
+  });
+  let start: ReturnType<typeof useRecordingStart>;
+  function Starter() {
+    start = useRecordingStart(false, () => {}, () => {});
+    return null;
+  }
+  async function saveThenStart() {
+    await act(async () => { renderer = create(<SidebarProvider><Recorder /><Starter /></SidebarProvider>); });
+    await act(async () => { await stop.handleRecordingStop(true); });
+    await act(async () => { await start.handleRecordingStart(); });
+    await settle();
+  }
+
+  test('a start refused for a missing model keeps the navigation to the saved meeting', async () => {
+    transcriptionModelReady = false;
+    await saveThenStart();
+    expect(calls).not.toContain('start_recording');
+    expect(calls).toContain('navigate /meeting-details?id=meeting-new&source=recording');
+  });
+
+  test('a start that passes the model check cancels it', async () => {
+    await saveThenStart();
+    expect(calls).toContain('start_recording');
+    expect(push).not.toHaveBeenCalled();
+  });
+});
+
+describe('the Stop button', () => {
+  const onRecordingStop = mock<(callApi?: boolean) => void>(() => {});
+  async function clickStop() {
+    Object.assign(recordingState, { isRecording: true, status: RecordingStatus.RECORDING });
+    await act(async () => {
+      renderer = create(
+        <RecordingControls
+          isRecording barHeights={['4px']} onRecordingStop={onRecordingStop} onRecordingStart={() => {}}
+          onTranscriptReceived={() => {}} isRecordingDisabled={false} isParentProcessing={false}
+        />,
+      );
+    });
+    const stopButton = renderer!.root.find(node => node.type === 'button' && node.findAllByType(Square).length > 0);
+    await act(async () => { stopButton.props.onClick(); });
+  }
+  beforeEach(() => onRecordingStop.mockClear());
+
+  test('an idle backend is not stopped or saved, and the status returns to idle', async () => {
+    backendRecording = false;
+    await clickStop();
+    await until(() => calls.includes(`status ${RecordingStatus.IDLE}`), 'the idle reset');
+    expect(calls).not.toContain('stop_recording');
+    expect(onRecordingStop).not.toHaveBeenCalled();
+  });
+
+  test('a live backend is stopped and the post-stop save runs', async () => {
+    await clickStop();
+    await until(() => onRecordingStop.mock.calls.length > 0, 'the post-stop call');
+    expect(calls).toContain('stop_recording');
+    expect(onRecordingStop).toHaveBeenCalledWith(true);
+    expect(calls).not.toContain(`status ${RecordingStatus.IDLE}`);
   });
 });
