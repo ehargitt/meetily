@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{Device, Stream, SupportedStreamConfig};
@@ -7,7 +8,7 @@ use tokio::sync::mpsc;
 
 use super::devices::{AudioDevice, get_device_and_config};
 use super::pipeline::AudioCapture;
-use super::recording_state::{RecordingState, DeviceType};
+use super::recording_state::{RecordingState, DeviceType, StreamHealthEvent};
 use super::capture::{AudioCaptureBackend, get_current_backend};
 
 #[cfg(target_os = "macos")]
@@ -350,7 +351,46 @@ impl AudioStream {
         info!("Audio stream stopped and device reference dropped");
         Ok(())
     }
+
+    /// Stop the stream on a blocking thread, bounded by `STREAM_STOP_TIMEOUT`.
+    ///
+    /// Teardown can block (cpal joins its worker thread; a wedged sound server
+    /// can hang it) and can panic (cpal's ALSA `Drop` unwraps the worker join, so
+    /// a worker that panicked panics again here). Neither may abort a stop or a
+    /// rebuild: a panicked worker means the stream was already dead, and a hung
+    /// teardown thread is abandoned.
+    pub async fn stop_off_runtime(self) {
+        let name = self.device.name.clone();
+        let teardown = tokio::task::spawn_blocking(move || self.stop());
+        match tokio::time::timeout(STREAM_STOP_TIMEOUT, teardown).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => warn!("Failed to stop audio stream '{}': {}", name, e),
+            Ok(Err(join_error)) => warn!(
+                "Audio stream '{}' teardown {} (stream was already dead); continuing",
+                name,
+                if join_error.is_panic() { "panicked" } else { "was cancelled" }
+            ),
+            Err(_) => warn!(
+                "Audio stream '{}' teardown still blocked after {:?}; abandoning it",
+                name, STREAM_STOP_TIMEOUT
+            ),
+        }
+    }
+
+    /// Synchronous counterpart of `stop_off_runtime` for `Drop`, which cannot
+    /// await: contains a teardown panic instead of letting it escape `drop`.
+    fn stop_contained(self) {
+        let name = self.device.name.clone();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.stop())) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!("Failed to stop audio stream '{}': {}", name, e),
+            Err(_) => warn!("Audio stream '{}' teardown panicked (stream was already dead)", name),
+        }
+    }
 }
+
+/// Upper bound on one stream teardown before it is abandoned.
+const STREAM_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Audio stream manager for handling multiple streams
 pub struct AudioStreamManager {
@@ -389,6 +429,7 @@ impl AudioStreamManager {
                 Ok(stream) => {
                     self.state.set_microphone_device(mic_device);
                     self.microphone_stream = Some(stream);
+                    self.state.stream_health(DeviceType::Microphone).mark_running(Instant::now(), false);
                     info!("✅ Microphone stream created successfully");
                 }
                 Err(e) => {
@@ -407,11 +448,16 @@ impl AudioStreamManager {
                 Ok(stream) => {
                     self.state.set_system_device(sys_device);
                     self.system_stream = Some(stream);
+                    self.state.stream_health(DeviceType::System).mark_running(Instant::now(), false);
                     info!("✅ System audio stream created with {:?} backend", backend);
                 }
                 Err(e) => {
+                    // Don't fail if only system audio fails: record mic-only, but say so.
                     warn!("⚠️ Failed to create system audio stream: {}", e);
-                    // Don't fail if only system audio fails
+                    self.state.emit_health_event(StreamHealthEvent::SystemAudioUnavailable {
+                        device_name: Some(sys_device.name.clone()),
+                        reason: e.to_string(),
+                    });
                 }
             }
         } else {
@@ -426,46 +472,32 @@ impl AudioStreamManager {
         Ok(())
     }
 
-    /// Stop all audio streams
-    pub fn stop_streams(&mut self) -> Result<()> {
+    /// Stop all audio streams (off the async runtime; see `AudioStream::stop_off_runtime`).
+    pub async fn stop_streams(&mut self) {
         info!("Stopping all audio streams");
-
-        let mut errors = Vec::new();
-
-        // Stop microphone stream
-        if let Some(mic_stream) = self.microphone_stream.take() {
-            if let Err(e) = mic_stream.stop() {
-                error!("Failed to stop microphone stream: {}", e);
-                errors.push(e);
-            }
+        for stream in [self.microphone_stream.take(), self.system_stream.take()].into_iter().flatten() {
+            stream.stop_off_runtime().await;
         }
+        info!("All audio streams stopped");
+    }
 
-        // Stop system stream
-        if let Some(sys_stream) = self.system_stream.take() {
-            if let Err(e) = sys_stream.stop() {
-                error!("Failed to stop system stream: {}", e);
-                errors.push(e);
-            }
-        }
-
-        if !errors.is_empty() {
-            Err(anyhow::anyhow!("Failed to stop some streams: {:?}", errors))
-        } else {
-            info!("All audio streams stopped successfully");
-            Ok(())
+    fn stream_slot(&mut self, device_type: DeviceType) -> &mut Option<AudioStream> {
+        match device_type {
+            DeviceType::Microphone => &mut self.microphone_stream,
+            DeviceType::System => &mut self.system_stream,
         }
     }
 
-    /// Take the microphone stream OUT of the manager, keeping system audio
-    /// running. The caller stops/drops it OUTSIDE any lock — a cpal teardown
-    /// of a dead BT device can stall and must not block a held mutex.
-    pub fn take_mic_stream(&mut self) -> Option<AudioStream> {
-        self.microphone_stream.take()
+    /// Take one stream OUT of the manager, leaving the other running. The
+    /// caller stops it OUTSIDE any lock — a cpal teardown of a dead device can
+    /// stall and must not block a held mutex.
+    pub fn take_stream(&mut self, device_type: DeviceType) -> Option<AudioStream> {
+        self.stream_slot(device_type).take()
     }
 
-    /// Set a new microphone stream (used after hot-swap creation).
-    pub fn set_mic_stream(&mut self, stream: AudioStream) {
-        self.microphone_stream = Some(stream);
+    /// Install a replacement stream (after a rebuild or hot-swap).
+    pub fn set_stream(&mut self, device_type: DeviceType, stream: AudioStream) {
+        *self.stream_slot(device_type) = Some(stream);
     }
 
     /// Get stream count
@@ -488,8 +520,9 @@ impl AudioStreamManager {
 
 impl Drop for AudioStreamManager {
     fn drop(&mut self) {
-        if let Err(e) = self.stop_streams() {
-            error!("Error stopping streams during drop: {}", e);
+        // Normally already stopped via `stop_streams`; this covers early exits.
+        for stream in [self.microphone_stream.take(), self.system_stream.take()].into_iter().flatten() {
+            stream.stop_contained();
         }
     }
 }
