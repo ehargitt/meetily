@@ -169,8 +169,9 @@ impl StreamHealth {
     }
 
     /// A stream was installed: at session start, or by a rebuild or hot-swap
-    /// (`is_rebuild`), in which case its first callback ends the outage and is
-    /// reported as a recovery if the outage was announced.
+    /// (`is_rebuild`), in which case the outage ends once the stream has been
+    /// delivering audio for `RECOVERED_AFTER_AUDIO`, and is reported as a
+    /// recovery if the outage was announced.
     pub fn mark_running(&self, now: Instant, is_rebuild: bool) {
         let mut inner = self.lock();
         inner.status = StreamStatus::Running;
@@ -240,7 +241,8 @@ impl StreamHealth {
         true
     }
 
-    /// Milliseconds of audio delivered since the stream was installed.
+    /// Milliseconds from the stream's install to its latest callback: how long
+    /// it has been delivering audio, not a count of samples.
     fn delivered_ms(&self, inner: &HealthInner) -> u64 {
         self.last_callback_ms
             .load(Ordering::Relaxed)
