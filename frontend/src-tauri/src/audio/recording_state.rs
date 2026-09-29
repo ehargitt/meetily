@@ -11,6 +11,7 @@ use super::buffer_pool::AudioBufferPool;
 mod stream_health;
 pub use stream_health::{
     ErrorOutcome, StreamFault, StreamHealth, StreamHealthEvent, StreamStatus, MAX_SHORT_LIVED_REBUILDS,
+    RECOVERED_AFTER_AUDIO,
 };
 
 /// Non-stream audio errors (e.g. a failed hand-off to the pipeline) can repeat
@@ -450,8 +451,9 @@ impl RecordingState {
         warn!("System audio unavailable ({:?}): {} — recording microphone only", device_name, reason);
         let health = self.stream_health(DeviceType::System);
         health.mark_failed(Instant::now());
-        health.announce_outage();
-        self.emit_health_event(StreamHealthEvent::SystemAudioUnavailable { device_name, reason });
+        if health.claim_failure_announcement() {
+            self.emit_health_event(StreamHealthEvent::SystemAudioUnavailable { device_name, reason });
+        }
     }
 
     /// Report that the session can no longer capture any audio. Emitted once;

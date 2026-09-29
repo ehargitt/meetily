@@ -32,11 +32,14 @@ const ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
 /// walk cpal's device enumeration).
 pub const FAILED_STREAM_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 pub const FAILED_STREAM_RETRY_MAX: Duration = Duration::from_secs(300);
-/// A rebuilt stream that dies before it has delivered audio for this long
-/// did not really recover.
-pub const HEALTHY_AFTER_REBUILD: Duration = Duration::from_secs(30);
-/// After this many rebuilt streams in a row died early, rebuilding on the same
-/// device is treated as failed (a wedged device that opens but never works).
+/// A rebuilt stream that has delivered audio for this long has recovered: its
+/// recovery is announced, and if it dies later that does not count toward
+/// giving up on the device (e.g. a mic that stalls after overruns every so
+/// often keeps being rebuilt on the same device).
+pub const RECOVERED_AFTER_AUDIO: Duration = Duration::from_secs(3);
+/// After this many rebuilt streams in a row died without delivering
+/// `RECOVERED_AFTER_AUDIO` of audio, rebuilding on the same device is treated
+/// as failed (a wedged device that opens but never works).
 pub const MAX_SHORT_LIVED_REBUILDS: u32 = 3;
 
 /// Lifecycle of one capture stream within a session.
@@ -91,9 +94,12 @@ struct HealthInner {
     status: StreamStatus,
     running_since_ms: u64,
     awaiting_first_callback: bool,
-    /// `audio-stream-degraded` was emitted for the current outage, so its
-    /// recovery is announced too.
+    /// The user was told about the current outage (degraded, unavailable or
+    /// exhausted), so its recovery is announced and it is not announced again.
     degraded_announced: bool,
+    /// The user was told the stream was given up on in the current outage;
+    /// later failed retries stay quiet.
+    failure_announced: bool,
     errors: VecDeque<Instant>,
     last_degraded_event: Option<Instant>,
     last_error_log: Option<Instant>,
@@ -130,6 +136,7 @@ impl StreamHealth {
                 running_since_ms: 0,
                 awaiting_first_callback: false,
                 degraded_announced: false,
+                failure_announced: false,
                 errors: VecDeque::new(),
                 last_degraded_event: None,
                 last_error_log: None,
@@ -172,6 +179,7 @@ impl StreamHealth {
         inner.installed_by_rebuild = is_rebuild;
         if !is_rebuild {
             inner.degraded_announced = false;
+            inner.failure_announced = false;
         }
         inner.errors.clear();
         inner.failed_at = None;
@@ -219,10 +227,24 @@ impl StreamHealth {
         due
     }
 
-    /// The user was told about this outage (degraded, unavailable or
-    /// exhausted), so the stream coming back is announced too.
-    pub fn announce_outage(&self) {
-        self.lock().degraded_announced = true;
+    /// True the first time in an outage that the stream is given up on: the
+    /// caller tells the user. Later failures (retries that do not work) in the
+    /// same outage return false and stay quiet until the stream recovers.
+    pub fn claim_failure_announcement(&self) -> bool {
+        let mut inner = self.lock();
+        if inner.failure_announced {
+            return false;
+        }
+        inner.failure_announced = true;
+        inner.degraded_announced = true;
+        true
+    }
+
+    /// Milliseconds of audio delivered since the stream was installed.
+    fn delivered_ms(&self, inner: &HealthInner) -> u64 {
+        self.last_callback_ms
+            .load(Ordering::Relaxed)
+            .saturating_sub(inner.running_since_ms)
     }
 
     /// Several rebuilt streams in a row died before running healthily:
@@ -232,15 +254,12 @@ impl StreamHealth {
     }
 
     /// Transition `Running -> Dead`. Returns false if the stream was not running.
-    fn mark_dead(&self, inner: &mut HealthInner, now: Instant) -> bool {
+    fn mark_dead(&self, inner: &mut HealthInner) -> bool {
         if inner.status != StreamStatus::Running {
             return false;
         }
-        let lived_ms = self.millis(now).saturating_sub(inner.running_since_ms);
-        let delivered = self.last_callback_ms.load(Ordering::Relaxed) >= inner.running_since_ms;
-        if !inner.installed_by_rebuild
-            || (delivered && lived_ms >= HEALTHY_AFTER_REBUILD.as_millis() as u64)
-        {
+        let recovered = self.delivered_ms(inner) >= RECOVERED_AFTER_AUDIO.as_millis() as u64;
+        if !inner.installed_by_rebuild || recovered {
             inner.short_lived_rebuilds = 0;
             inner.retry_interval = FAILED_STREAM_RETRY_INTERVAL;
         } else {
@@ -271,7 +290,7 @@ impl StreamHealth {
 
         let persistent = matches!(error, AudioError::DeviceDisconnected)
             || inner.errors.len() > ERROR_BURST_LIMIT;
-        let became_dead = persistent && self.mark_dead(&mut inner, now);
+        let became_dead = persistent && self.mark_dead(&mut inner);
 
         let log_due = became_dead
             || inner
@@ -303,29 +322,33 @@ impl StreamHealth {
             .load(Ordering::Relaxed)
             .max(inner.running_since_ms);
         let silent_for = self.millis(now).saturating_sub(last_activity);
-        silent_for > STALL_TIMEOUT.as_millis() as u64 && self.mark_dead(&mut inner, now)
+        silent_for > STALL_TIMEOUT.as_millis() as u64 && self.mark_dead(&mut inner)
     }
 
-    /// True once, for a rebuilt stream that has delivered its first callback
-    /// after an outage the user was told about (`audio-stream-degraded`, or a
-    /// stream given up on). A hot-swap nobody was warned about ends silently.
+    /// True once, when a rebuilt stream has delivered `RECOVERED_AFTER_AUDIO`
+    /// of audio after an outage the user was told about. That ends the
+    /// outage. A hot-swap nobody was warned about ends silently.
     pub fn take_recovered(&self) -> bool {
         let mut inner = self.lock();
-        let delivered = self.last_callback_ms.load(Ordering::Relaxed) >= inner.running_since_ms;
-        if inner.status == StreamStatus::Running && inner.awaiting_first_callback && delivered {
+        let recovered = self.delivered_ms(&inner) >= RECOVERED_AFTER_AUDIO.as_millis() as u64;
+        if inner.status == StreamStatus::Running && inner.awaiting_first_callback && recovered {
             inner.awaiting_first_callback = false;
+            inner.failure_announced = false;
             return std::mem::take(&mut inner.degraded_announced);
         }
         false
     }
 
-    /// Rate limit for `audio-stream-degraded`. A true result means the caller
-    /// announces this outage, and its recovery will be announced too.
+    /// Whether to emit `audio-stream-degraded`: once per outage (not again
+    /// while it has not recovered), and at most once per stream per
+    /// `DEGRADED_EVENT_INTERVAL`. A true result means the caller announces
+    /// this outage, and its recovery will be announced too.
     pub fn should_emit_degraded(&self, now: Instant) -> bool {
         let mut inner = self.lock();
-        let due = inner
-            .last_degraded_event
-            .map_or(true, |t| now.saturating_duration_since(t) >= DEGRADED_EVENT_INTERVAL);
+        let due = !inner.degraded_announced
+            && inner
+                .last_degraded_event
+                .map_or(true, |t| now.saturating_duration_since(t) >= DEGRADED_EVENT_INTERVAL);
         if due {
             inner.last_degraded_event = Some(now);
             inner.degraded_announced = true;
@@ -435,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_is_reported_once_after_the_first_callback() {
+    fn recovery_is_reported_once_after_three_seconds_of_audio() {
         let epoch = Instant::now();
         let health = running(epoch);
         health.record_error(&AudioError::DeviceDisconnected, epoch);
@@ -444,17 +467,50 @@ mod tests {
         assert!(!health.take_recovered(), "no audio since the rebuild yet");
         assert!(!health.record_error(&AudioError::StreamFailed, at(epoch, 1_100)).already_dead);
         health.on_callback(at(epoch, 1_200));
+        assert!(!health.take_recovered(), "one callback is not a recovery");
+        health.on_callback(at(epoch, 4_000));
         assert!(health.take_recovered());
         assert!(!health.take_recovered());
     }
 
     #[test]
-    fn degraded_events_are_rate_limited_to_one_per_ten_seconds() {
+    fn an_outage_is_announced_once_and_degraded_events_are_rate_limited() {
         let epoch = Instant::now();
         let health = running(epoch);
         assert!(health.should_emit_degraded(epoch));
+        assert!(!health.should_emit_degraded(at(epoch, 60_000)), "same outage, not recovered");
+
+        // Recovered, then a new outage: announced again, but not within 10 s.
+        health.mark_running(at(epoch, 1_000), true);
+        health.on_callback(at(epoch, 5_000));
+        assert!(health.take_recovered());
         assert!(!health.should_emit_degraded(at(epoch, 9_000)));
         assert!(health.should_emit_degraded(at(epoch, 10_000)));
+    }
+
+    #[test]
+    fn giving_up_is_announced_once_per_outage() {
+        let epoch = Instant::now();
+        let health = running(epoch);
+        health.record_error(&AudioError::DeviceDisconnected, epoch);
+        health.mark_failed(at(epoch, 1_000));
+        assert!(health.claim_failure_announcement());
+        // Retries that open but die again stay quiet.
+        for retry_ms in [31_000, 91_000] {
+            rebuild_then_kill(&health, retry_ms, Some(retry_ms + 500), retry_ms + 1_000, epoch);
+            assert!(!health.take_recovered(), "half a second of audio is not a recovery");
+            assert!(!health.should_emit_degraded(at(epoch, retry_ms + 1_000)));
+            health.mark_failed(at(epoch, retry_ms + 1_000));
+            assert!(!health.claim_failure_announcement());
+        }
+        // A real recovery ends the outage; the next one is announced again.
+        health.mark_running(at(epoch, 300_000), true);
+        health.on_callback(at(epoch, 304_000));
+        assert!(health.take_recovered());
+        health.record_error(&AudioError::DeviceDisconnected, at(epoch, 400_000));
+        assert!(health.should_emit_degraded(at(epoch, 400_000)));
+        health.mark_failed(at(epoch, 401_000));
+        assert!(health.claim_failure_announcement());
     }
 
     #[test]
@@ -504,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuilds_that_die_early_are_counted_until_one_runs_healthily() {
+    fn rebuilds_without_real_audio_are_counted_until_one_delivers() {
         let epoch = Instant::now();
         let health = running(epoch);
         health.record_error(&AudioError::DeviceDisconnected, epoch);
@@ -514,7 +570,7 @@ mod tests {
         rebuild_then_kill(&health, 3_000, Some(3_100), 4_000, epoch); // delivered briefly
         assert!(!health.rebuilds_keep_dying());
         rebuild_then_kill(&health, 5_000, None, 50_000, epoch); // alive but silent
-        assert!(health.rebuilds_keep_dying(), "three rebuilds in a row died early");
+        assert!(health.rebuilds_keep_dying(), "three rebuilds in a row delivered no real audio");
 
         // Giving up now, and after each retried stream that dies early again,
         // waits longer before the next retry.
@@ -525,10 +581,26 @@ mod tests {
         assert!(!health.retry_due(at(epoch, 230_000)));
         assert!(health.retry_due(at(epoch, 231_000)), "120 s");
 
-        // One that runs healthily for 30 s clears the streak and the backoff.
-        rebuild_then_kill(&health, 240_000, Some(240_100), 271_000, epoch);
+        // One that delivers real audio clears the streak and the backoff.
+        rebuild_then_kill(&health, 240_000, Some(245_000), 248_000, epoch);
         assert!(!health.rebuilds_keep_dying());
         health.mark_failed(at(epoch, 271_000));
         assert!(health.retry_due(at(epoch, 301_000)));
+    }
+
+    #[test]
+    fn a_stream_that_stalls_after_delivering_audio_is_never_given_up_on() {
+        // cpal#730: a mic that stalls after an overrun every 10-25 s.
+        let epoch = Instant::now();
+        let health = running(epoch);
+        health.record_error(&AudioError::DeviceDisconnected, epoch);
+        let mut t = 1_000;
+        for lived in [10_000, 25_000, 12_000, 18_000, 10_000, 22_000] {
+            health.mark_running(at(epoch, t), true);
+            health.on_callback(at(epoch, t + lived));
+            assert!(health.check_stall(at(epoch, t + lived + 3_100), true));
+            assert!(!health.rebuilds_keep_dying(), "gave up on a stream that delivered {lived} ms of audio");
+            t += lived + 3_500;
+        }
     }
 }
