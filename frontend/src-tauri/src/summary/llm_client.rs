@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::summary::context_budget::ContextBudget;
+use crate::summary::context_budget::{rough_token_count, ContextBudget};
 
 const REQUEST_TIMEOUT_DURATION: Duration = Duration::from_secs(300);
 /// Slowest prompt-plus-output rate an Ollama request is given time for: roughly an 8B model
@@ -97,8 +97,9 @@ pub fn build_openai_compat_chat_body(
 #[derive(Debug, Serialize)]
 struct OllamaChatOptions {
     num_ctx: usize,
-    /// Caps the completion at the budget's output reserve so prompt and output always fit
-    /// `num_ctx`; unbounded output would make Ollama shift out the start of the prompt.
+    /// Caps the completion at the room this prompt leaves in the window (at least the budget's
+    /// output reserve), so prompt and output fit `num_ctx`; unbounded output would make Ollama
+    /// shift out the start of the prompt.
     num_predict: usize,
 }
 
@@ -116,7 +117,8 @@ struct OllamaChatRequest {
 }
 
 /// Build the Ollama `/api/chat` body: non-streaming, thinking disabled, and with a budget,
-/// `options.num_ctx` = its window and `options.num_predict` = its output reserve.
+/// `options.num_ctx` = its window and `options.num_predict` = the room this prompt leaves
+/// ([`ContextBudget::output_room`]).
 pub fn build_ollama_chat_body(
     model_name: &str,
     system_prompt: &str,
@@ -139,7 +141,8 @@ pub fn build_ollama_chat_body(
         think: false,
         options: context_budget.map(|budget| OllamaChatOptions {
             num_ctx: budget.context_tokens,
-            num_predict: budget.output_reserve_tokens,
+            num_predict: budget
+                .output_room(rough_token_count(system_prompt) + rough_token_count(user_prompt)),
         }),
     })
 }
@@ -172,6 +175,7 @@ impl OllamaChatResponse {
                 .thinking
                 .as_deref()
                 .is_some_and(|thinking| !thinking.trim().is_empty()),
+            truncated: self.done_reason.as_deref() == Some("length"),
         }
     }
 
@@ -242,6 +246,7 @@ impl ClaudeChatResponse {
             reasoning_stripped: self.content.iter().any(|block| {
                 matches!(block.block_type.as_str(), "thinking" | "redacted_thinking")
             }),
+            truncated: false,
         })
     }
 }
@@ -250,6 +255,9 @@ impl ClaudeChatResponse {
 pub(crate) struct LlmCompletion {
     pub content: String,
     pub reasoning_stripped: bool,
+    /// The model stopped at its output limit (Ollama `done_reason: "length"`), so the content
+    /// may end mid-way. Always false where the provider response is not inspected for it.
+    pub truncated: bool,
 }
 
 impl ChatResponse {
@@ -270,6 +278,7 @@ impl ChatResponse {
                 .into_iter()
                 .flatten()
                 .any(|reasoning| !reasoning.trim().is_empty()),
+            truncated: false,
         })
     }
 }
@@ -406,6 +415,7 @@ pub(crate) async fn generate_summary(
         .map(|content| LlmCompletion {
             content,
             reasoning_stripped: false,
+            truncated: false,
         })
         .map_err(|e| e.to_string());
     }
@@ -774,6 +784,7 @@ mod tests {
                 LlmCompletion {
                     content: String::new(),
                     reasoning_stripped: true,
+                    truncated: false,
                 }
             );
         }
@@ -786,7 +797,9 @@ mod tests {
         assert_eq!(body["stream"], false);
         assert_eq!(body["think"], false);
         assert_eq!(body["options"]["num_ctx"], 16_384);
-        assert_eq!(body["options"]["num_predict"], 4096);
+        // A small prompt gets the room the window leaves, not just the 4096 reserve.
+        let prompt_tokens = rough_token_count("sys") + rough_token_count("user");
+        assert_eq!(body["options"]["num_predict"], 16_384 - prompt_tokens - 64);
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["content"], "user");
         assert!(body.get("reasoning_effort").is_none());
@@ -820,10 +833,18 @@ mod tests {
             LlmCompletion {
                 content: "Summary".to_string(),
                 reasoning_stripped: true,
+                truncated: false,
             }
         );
         assert!(response.filled_context(16_384));
         assert!(!response.filled_context(32_768));
+
+        let cut_off: OllamaChatResponse = serde_json::from_value(json!({
+            "message": {"role": "assistant", "content": "Half a sum"},
+            "done_reason": "length"
+        }))
+        .unwrap();
+        assert!(cut_off.completion().truncated);
     }
 
     #[test]
@@ -1077,7 +1098,8 @@ mod tests {
             assert_eq!(request_path(&request), "/api/chat");
             assert!(body.get("think").is_none());
             assert_eq!(body["options"]["num_ctx"], 8192, "the retry keeps the context window");
-            assert_eq!(body["options"]["num_predict"], 2048);
+            let prompt_tokens = rough_token_count("system") + rough_token_count("user");
+            assert_eq!(body["options"]["num_predict"], ContextBudget::for_ollama(8192).output_room(prompt_tokens));
 
             write_json_response(
                 &mut stream,
@@ -1118,6 +1140,7 @@ mod tests {
             LlmCompletion {
                 content: "Meeting summary.".to_string(),
                 reasoning_stripped: false,
+                truncated: false,
             }
         );
     }
@@ -1137,6 +1160,7 @@ mod tests {
             Some(LlmCompletion {
                 content: "Meeting summary.".to_string(),
                 reasoning_stripped: true,
+                truncated: false,
             })
         );
     }
