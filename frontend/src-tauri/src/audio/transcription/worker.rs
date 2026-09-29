@@ -123,7 +123,7 @@ pub struct TranscriptionProgress {
 }
 
 impl TranscriptionProgress {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             queued: AtomicU64::new(0),
             completed: AtomicU64::new(0),

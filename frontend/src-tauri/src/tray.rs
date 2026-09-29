@@ -9,10 +9,8 @@ use tauri::{
 
 use crate::audio::recording_commands::{StopSource, STOP_IN_PROGRESS_ERROR};
 
-/// Set by the first Quit; a second Quit while the recording is being saved exits immediately.
+/// Set while a Quit is stopping and saving; a second Quit meanwhile exits immediately.
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
-/// Longest Quit waits for the recording to stop (transcription drain + audio encode).
-const QUIT_STOP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// Longest Quit then waits for the frontend to save the stopped meeting.
 const QUIT_SAVE_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -227,9 +225,11 @@ async fn wait_for_frontend_save(saves_before: u64, timeout: Duration) {
 
 /// Quit from the tray. During a recording, stop and save it first (the same
 /// path as tray Stop), wait for the frontend to store the meeting, then exit;
-/// each wait is bounded. A meeting stopped moments before Quit also gets its
-/// frontend save waited for. If the stop fails the recording is still live, so
-/// the app stays open. A second Quit while any of this runs exits immediately.
+/// each wait is bounded (the stop by the stop's own worst case). A meeting
+/// stopped moments before Quit also gets its frontend save waited for, and a
+/// background transcription still running writes what it has before exit. If
+/// the stop fails the recording is still live, so the app stays open and the
+/// user is told. A second Quit while Quit is stopping and saving exits at once.
 fn quit_handler<R: Runtime>(app: &AppHandle<R>) {
     if QUIT_REQUESTED.swap(true, Ordering::SeqCst) {
         log::warn!("Tray: Quit clicked again; exiting now");
@@ -243,19 +243,22 @@ fn quit_handler<R: Runtime>(app: &AppHandle<R>) {
             log::info!("Tray: Quit during a recording; stopping and saving it first");
             set_tray_state(&app, RecordingState::Stopping);
             let saves_before = crate::database::repositories::transcript::saved_meeting_count();
+            let stop_bound = crate::audio::recording_commands::current_stop_time_bound();
 
-            match tokio::time::timeout(QUIT_STOP_TIMEOUT, stop_for_quit(&app)).await {
+            match tokio::time::timeout(stop_bound, stop_for_quit(&app)).await {
                 Ok(true) => wait_for_frontend_save(saves_before, QUIT_SAVE_TIMEOUT).await,
                 Ok(false) => {
                     log::error!(
-                        "Tray: the recording could not be stopped, so Meetily stays open and keeps recording; Quit again to exit anyway"
+                        "Tray: the recording could not be stopped, so Meetily stays open and keeps recording"
                     );
+                    QUIT_REQUESTED.store(false, Ordering::SeqCst);
+                    notify_quit_cancelled(&app).await;
                     update_tray_menu_async(&app).await;
                     return;
                 }
                 Err(_) => log::error!(
                     "Tray: stopping the recording took over {}s; exiting anyway",
-                    QUIT_STOP_TIMEOUT.as_secs()
+                    stop_bound.as_secs()
                 ),
             }
         } else if let Some(stop) = crate::audio::recording_commands::last_completed_stop() {
@@ -265,8 +268,26 @@ fn quit_handler<R: Runtime>(app: &AppHandle<R>) {
                 wait_for_frontend_save(stop.saved_meetings, remaining).await;
             }
         }
+        crate::audio::recording_commands::close_lingering_drain_for_exit(&app).await;
         app.exit(0);
     });
+}
+
+/// Tell the user Quit did not exit because the recording could not be stopped.
+async fn notify_quit_cancelled<R: Runtime>(app: &AppHandle<R>) {
+    let Some(notifications) =
+        app.try_state::<crate::notifications::commands::NotificationManagerState<tauri::Wry>>()
+    else {
+        return;
+    };
+    if let Err(e) = crate::notifications::commands::show_system_error_notification(
+        &notifications,
+        "Meetily is still recording: the recording could not be stopped, so Meetily stayed open. Stop the recording from the Meetily window, then quit.".to_string(),
+    )
+    .await
+    {
+        log::error!("Tray: failed to show the Quit-cancelled notification: {}", e);
+    }
 }
 
 fn check_updates_handler<R: Runtime>(app: &AppHandle<R>) {
