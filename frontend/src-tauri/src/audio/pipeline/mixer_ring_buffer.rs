@@ -19,8 +19,8 @@
 //!   silence inserted where it happened.
 //! - Clock drift and residual misalignment are corrected in steps of at most
 //!   `CORRECTION_STEP_MS` per chunk: samples are dropped from the stream that
-//!   runs ahead or the last sample is held in the one that lags, so no
-//!   audible cut and no silence is introduced.
+//!   runs ahead, or the incoming chunk's first sample is repeated in the one
+//!   that lags, so no audible cut and no silence is introduced.
 
 use std::collections::VecDeque;
 
