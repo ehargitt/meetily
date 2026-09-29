@@ -37,6 +37,20 @@ function isFromCurrentSession(sessionId: number | undefined, session: Transcript
   return sessionId >= session.minimum;
 }
 
+/**
+ * Seeds the filter after a (re)load from the last session the backend issued:
+ * a recording backend is running that session, an idle one has retired them all.
+ */
+function seedSessionFilter(session: TranscriptSessionFilter, lastSessionId: number, backendRecording: boolean) {
+  session.highest = Math.max(session.highest, lastSessionId);
+  if (session.current !== null) return; // recording-started already named the session
+  if (backendRecording) {
+    session.current = lastSessionId;
+  } else {
+    session.minimum = Math.max(session.minimum, lastSessionId + 1);
+  }
+}
+
 export function TranscriptProvider({ children }: { children: ReactNode }) {
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
   const [meetingTitle, setMeetingTitle] = useState('+ New Call');
@@ -60,7 +74,9 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   // recording (from recording-started). Clearing for a new recording retires
   // every session seen so far (`minimum`), so a previous meeting's lingering
   // drain can't append to the new one before its own session id arrives.
-  // Nothing is known after a webview reload, so every update is accepted then.
+  // A webview reload (tray Start or Settings) resets it; it is then seeded
+  // from the backend on mount. An older backend reports no session, and every
+  // update is accepted until recording-started names one.
   const transcriptSessionRef = useRef<TranscriptSessionFilter>({ current: null, minimum: 0, highest: 0 });
   const isRecordingRef = useRef(recordingState.isRecording);
   isRecordingRef.current = recordingState.isRecording;
@@ -411,6 +427,19 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
         unlistenFn();
         console.log('🧹 CLEANUP: MAIN transcript listener cleaned up');
       }
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    recordingService.getRecordingState()
+      .then(backendState => {
+        if (cancelled || typeof backendState.last_session_id !== 'number') return;
+        seedSessionFilter(transcriptSessionRef.current, backendState.last_session_id, backendState.is_recording);
+      })
+      .catch(error => console.warn('[TranscriptContext] Could not read the last transcription session:', error));
+    return () => {
+      cancelled = true;
     };
   }, []);
 

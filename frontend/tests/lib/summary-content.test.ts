@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { hasVisibleSummaryContent, parseSummaryContent } from '../../src/lib/summary-content';
+import { hasVisibleSummaryContent, parseSummaryContent, readSummaryMetadata } from '../../src/lib/summary-content';
 
 describe('summary content validation', () => {
   test('accepts visible markdown and rejects whitespace or reasoning markers', () => {
@@ -28,5 +28,13 @@ describe('summary content validation', () => {
   test('parses one historical double-encoded payload', () => {
     expect(parseSummaryContent('{"markdown":"Visible"}')).toEqual({ markdown: 'Visible' });
     expect(parseSummaryContent('{not json')).toBeNull();
+  });
+});
+
+describe('summary metadata', () => {
+  test('reads combine_truncated, treating a missing field as false', () => {
+    expect(readSummaryMetadata({ markdown: 'Visible', combine_truncated: true }).combineTruncated).toBe(true);
+    expect(readSummaryMetadata({ markdown: 'Visible' }).combineTruncated).toBe(false);
+    expect(readSummaryMetadata({ markdown: 'Visible', combine_truncated: 'yes' }).combineTruncated).toBe(false);
   });
 });

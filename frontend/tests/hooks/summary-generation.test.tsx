@@ -157,6 +157,16 @@ describe('summary state restored when returning to a meeting', () => {
     expect(timers.size).toBe(0);
   });
 
+  test('warns instead of announcing success when part of a long meeting was shortened', async () => {
+    await show(response());
+    getSummary = async () => response({ status: 'completed', data: { markdown: 'Finished summary', combine_truncated: true } });
+    await tick();
+    expect(text()).toContain('completed');
+    const messages = notify.mock.calls.map(call => (call as unknown[])[0]);
+    expect(messages).toContain('Summary generated, but part of a long meeting had to be shortened to fit the model.');
+    expect(messages).not.toContain('Summary generated successfully!');
+  });
+
   test('keeps regeneration loading with old content and restores content on failure', async () => {
     await show(response({ data: { markdown: 'Previous summary' } }));
     expect(text()).toContain('processing');

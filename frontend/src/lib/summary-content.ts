@@ -66,6 +66,7 @@ const SummaryMetadata = z.object({
   MeetingName: z.string().optional(),
   reasoning_stripped: z.boolean().optional(),
   normalization_fallback: z.boolean().optional(),
+  combine_truncated: z.boolean().optional(),
 }).passthrough();
 
 export function readSummaryMetadata(value: unknown) {
@@ -75,11 +76,13 @@ export function readSummaryMetadata(value: unknown) {
         meetingName: parsed.data.MeetingName ?? null,
         reasoningStripped: parsed.data.reasoning_stripped === true,
         normalizationFallback: parsed.data.normalization_fallback === true,
+        combineTruncated: parsed.data.combine_truncated === true,
       }
     : {
         meetingName: null,
         reasoningStripped: false,
         normalizationFallback: false,
+        combineTruncated: false,
       };
 }
 

@@ -7,6 +7,7 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 type BackendState = {
   is_recording: boolean; is_paused: boolean; is_active: boolean;
   recording_duration: number | null; active_duration: number | null;
+  last_session_id?: number | null;
 };
 const idle: BackendState = { is_recording: false, is_paused: false, is_active: false, recording_duration: null, active_duration: null };
 const live: BackendState = { ...idle, is_recording: true, is_active: true, recording_duration: 12, active_duration: 12 };
@@ -103,8 +104,8 @@ describe('mounting while the backend is already recording (webview reload)', () 
 
     await until(() => recording.status === RecordingStatus.RECORDING && recording.isRecording, 'RECORDING');
     await until(() => transcripts.currentMeetingId === 'meeting-before-reload', 'the restored meeting id');
-    // Polling runs every 500 ms only while a session is live.
-    await until(() => stateCalls() >= 2, 'a polled state sync');
+    // Polling runs every 500 ms only while a session is live (two reads are the mount reads).
+    await until(() => stateCalls() >= 3, 'a polled state sync');
 
     // No session is known after a reload, so a tagged update is still accepted.
     await emit('transcript-update', transcriptUpdate(7, 3, 'after the reload'));
@@ -114,12 +115,13 @@ describe('mounting while the backend is already recording (webview reload)', () 
   test('an idle backend stays idle and a stored id is not adopted', async () => {
     sessionStorage.setItem('indexeddb_current_meeting_id', 'meeting-left-over');
     await mount();
-    await until(() => stateCalls() >= 1, 'the mount sync');
+    await until(() => stateCalls() >= 2, 'the mount reads');
     await act(() => new Promise(resolve => setTimeout(resolve, 600)));
 
     expect(recording.status).toBe(RecordingStatus.IDLE);
     expect(transcripts.currentMeetingId).toBeNull();
-    expect(stateCalls()).toBe(1);
+    // One mount read per provider; no polling while idle.
+    expect(stateCalls()).toBe(2);
   });
 });
 
@@ -176,5 +178,43 @@ describe('transcript updates from another transcription session', () => {
     await emit('transcript-update', transcriptUpdate(3, 6, 'meeting B early'));
     await until(() => shownTexts().includes('meeting B early'), 'the new session');
     expect(shownTexts()).toEqual(['meeting B early']);
+  });
+});
+
+describe('the session filter after a webview reload (tray Start or Settings)', () => {
+  // Both providers read get_recording_state on mount; the second read seeds the filter.
+  const seeded = () => until(() => stateCalls() >= 2, 'the mount state reads');
+
+  test('an idle backend retires every session it issued, so a lingering drain is dropped', async () => {
+    backendState = { ...idle, last_session_id: 5 };
+    await mount();
+    await seeded();
+
+    await act(async () => { transcripts.clearTranscripts(); });
+    await emit('transcript-update', transcriptUpdate(1, 5, 'previous meeting lingering drain'));
+    await emit('transcript-update', transcriptUpdate(2, 6, 'new meeting'));
+    await until(() => shownTexts().includes('new meeting'), 'the new session');
+    expect(shownTexts()).toEqual(['new meeting']);
+  });
+
+  test('a recording backend\'s last session is the live one and keeps its segments', async () => {
+    backendState = { ...live, last_session_id: 5 };
+    await mount();
+    await seeded();
+
+    await emit('transcript-update', transcriptUpdate(1, 4, 'older lingering drain'));
+    await emit('transcript-update', transcriptUpdate(2, 5, 'live meeting'));
+    await until(() => shownTexts().includes('live meeting'), 'the live session');
+    expect(shownTexts()).toEqual(['live meeting']);
+  });
+
+  test('a clear during a live recording keeps the live session', async () => {
+    await mount();
+    await emit('recording-started', { message: 'started', session_id: 5 });
+    await until(() => recording.isRecording, 'the recording');
+
+    await act(async () => { transcripts.clearTranscripts(); });
+    await emit('transcript-update', transcriptUpdate(1, 5, 'live meeting'));
+    await until(() => shownTexts().includes('live meeting'), 'the live session');
   });
 });

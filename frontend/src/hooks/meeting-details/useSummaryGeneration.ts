@@ -267,7 +267,11 @@ export function useSummaryGeneration({
         toast.warning('Summary generated with fallback', {
           description: 'English normalization failed, so the original sanitized summary was kept.',
         });
-      } else {
+      }
+      if (metadata.combineTruncated) {
+        toast.warning('Summary generated, but part of a long meeting had to be shortened to fit the model.');
+      }
+      if (!metadata.normalizationFallback && !metadata.combineTruncated) {
         toast.success('Summary generated successfully!', {
           description: metadata.reasoningStripped
             ? 'Your meeting summary is ready. Model reasoning was filtered out of the notes.'
