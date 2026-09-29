@@ -22,8 +22,8 @@ use super::vad::{ContinuousVadProcessor};
 /// length. The live path cannot: with continuous audio (e.g. a podcast played
 /// as system audio) a 2000ms redemption keeps one VAD segment open
 /// indefinitely, withholds live transcript emission, and overruns the
-/// accumulated-speech-buffer warning threshold. Bounded live segmentation
-/// during continuous speech is tracked separately in #756.
+/// accumulated-speech-buffer warning threshold. Continuous speech that never
+/// pauses is cut by the VAD itself at 30 s (#756).
 const VAD_REDEMPTION_TIME_MS: u32 = 500;
 
 /// Mixing window length. Windows are only mixed once both streams have one.
@@ -766,8 +766,7 @@ impl AudioPipeline {
         // batch value (2000ms, `import.rs`/`retranscription.rs`) was tried here
         // first, but under continuous system audio it kept a VAD segment open
         // indefinitely and withheld live transcript emission, so live and batch
-        // deliberately diverge. Bounded live segments under continuous speech
-        // are tracked in #756.
+        // deliberately diverge. Continuous speech is cut at 30 s by the VAD (#756).
         let vad_processor =
             ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS)?;
         info!(
@@ -1304,8 +1303,8 @@ mod tests {
 
     #[test]
     fn test_live_vad_redemption_matches_pro_policy() {
-        // Live uses the established 500ms pause policy; it does not bound
-        // uninterrupted speech. Batch import/retranscription use 2000ms.
+        // Live uses the established 500ms pause policy; uninterrupted speech is
+        // bounded separately by the VAD's 30 s cut. Batch import/retranscription use 2000ms.
         // See #679 and #756.
         assert_eq!(VAD_REDEMPTION_TIME_MS, 500);
     }
