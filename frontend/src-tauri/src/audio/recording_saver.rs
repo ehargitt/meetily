@@ -434,20 +434,55 @@ impl RecordingSaver {
         }
     }
 
-    /// Wait for the accumulation task to write every chunk the pipeline sent.
-    /// The pipeline has stopped (dropping its sender) before this is called.
-    async fn drain_accumulator(&mut self) {
-        let Some(mut accumulator) = self.accumulator.take() else { return };
-        match tokio::time::timeout(ACCUMULATOR_DRAIN_TIMEOUT, &mut accumulator).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => error!("Recording saver accumulation task failed: {}", e),
-            Err(_) => {
-                error!(
-                    "Recording saver accumulation task still running after {}s; finalizing without later chunks",
-                    ACCUMULATOR_DRAIN_TIMEOUT.as_secs()
-                );
-                accumulator.abort();
+    /// Wait (bounded) for the accumulation task to take every chunk the
+    /// pipeline sent. The pipeline has stopped (dropping its sender) before
+    /// this is called. Returns false if the task is still running.
+    async fn wait_for_accumulator(&mut self) -> bool {
+        let Some(accumulator) = self.accumulator.as_mut() else { return true };
+        match tokio::time::timeout(ACCUMULATOR_DRAIN_TIMEOUT, accumulator).await {
+            Ok(joined) => {
+                if let Err(e) = joined {
+                    error!("Recording saver accumulation task failed: {}", e);
+                }
+                self.accumulator = None;
+                true
             }
+            Err(_) => false,
+        }
+    }
+
+    /// Like `wait_for_accumulator`, but abort a task that is still running.
+    async fn drain_accumulator(&mut self) {
+        if self.wait_for_accumulator().await {
+            return;
+        }
+        error!(
+            "Recording saver accumulation task still running after {}s; finalizing without later chunks",
+            ACCUMULATOR_DRAIN_TIMEOUT.as_secs()
+        );
+        if let Some(accumulator) = self.accumulator.take() {
+            accumulator.abort();
+        }
+    }
+
+    /// Once the pipeline has stopped, write the audio still buffered in
+    /// memory (up to a checkpoint's worth, more after write failures) to a
+    /// checkpoint. Stop then waits for transcription before `stop_and_save`;
+    /// without this a quit or crash in that wait would lose the tail.
+    /// A failure here is retried by `stop_and_save`.
+    pub async fn checkpoint_unsaved_audio(&mut self) {
+        let Some(saver) = self.incremental_saver.clone() else { return };
+        if !self.wait_for_accumulator().await {
+            warn!(
+                "Recording saver still writing after {}s; the unsaved audio is written when the recording is saved",
+                ACCUMULATOR_DRAIN_TIMEOUT.as_secs()
+            );
+            return;
+        }
+        match tokio::task::spawn_blocking(move || saver.blocking_lock().write_pending_checkpoint()).await {
+            Ok(Ok(())) => info!("Unsaved audio written to a checkpoint"),
+            Ok(Err(e)) => warn!("Failed to checkpoint unsaved audio; retrying when the recording is saved: {}", e),
+            Err(e) => warn!("Unsaved audio checkpoint task failed; retrying when the recording is saved: {}", e),
         }
     }
 
@@ -489,7 +524,7 @@ impl RecordingSaver {
                     let message = finalize_failure_message(
                         &e.to_string(),
                         saver.get_checkpoint_count(),
-                        saver.has_unsaved_audio(),
+                        saver.unsaved_seconds(),
                         self.meeting_folder.as_deref(),
                     );
                     if let Err(emit_error) = app.emit("recording-save-error", serde_json::json!({ "message": message })) {
@@ -577,15 +612,15 @@ impl RecordingSaver {
 }
 
 /// User message for a failed finalize. It points at the WAV checkpoints only
-/// when some were written.
+/// when some were written, and says how much audio they are missing.
 fn finalize_failure_message(
     error: &str,
     checkpoints_written: u32,
-    has_unsaved_audio: bool,
+    unsaved_seconds: f64,
     meeting_folder: Option<&std::path::Path>,
 ) -> String {
     if checkpoints_written == 0 {
-        return if has_unsaved_audio {
+        return if unsaved_seconds > 0.0 {
             format!("The meeting audio could not be written to disk ({}), so the meeting has no audio file.", error)
         } else {
             format!("No audio was captured for this meeting, so it has no audio file ({}).", error)
@@ -594,9 +629,18 @@ fn finalize_failure_message(
     let checkpoints = meeting_folder
         .map(|folder| folder.join(".checkpoints").display().to_string())
         .unwrap_or_else(|| "the meeting folder's .checkpoints folder".to_string());
+    let kept = if unsaved_seconds > 0.0 {
+        format!(
+            "The rest of the recorded audio is kept as WAV files in {}; {:.0} seconds could not be written to disk and are missing from them.",
+            checkpoints,
+            unsaved_seconds.ceil()
+        )
+    } else {
+        format!("The recorded audio is kept as WAV files in {}.", checkpoints)
+    };
     format!(
-        "The meeting audio could not be finalized ({}), so the meeting has no audio file. The recorded audio is kept as WAV files in {}.",
-        error, checkpoints
+        "The meeting audio could not be finalized ({}), so the meeting has no audio file. {}",
+        error, kept
     )
 }
 
@@ -666,6 +710,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_unsaved_tail_is_checkpointed_after_the_last_chunk_arrives() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("meeting");
+        std::fs::create_dir_all(folder.join(".checkpoints")).unwrap();
+
+        let mut saver = RecordingSaver::new();
+        saver.incremental_saver = Some(Arc::new(AsyncMutex::new(
+            IncrementalAudioSaver::new(folder.clone(), 48000).unwrap(),
+        )));
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let incremental = saver.incremental_saver.clone().unwrap();
+        saver.start_accumulation(true, receiver);
+
+        // All 35 s is queued before the accumulator has taken any of it.
+        for i in 0..70 {
+            sender
+                .send(AudioChunk {
+                    data: vec![0.2; 24000],
+                    sample_rate: 48000,
+                    timestamp: i as f64 * 0.5,
+                    chunk_id: i,
+                    device_type: DeviceType::Microphone,
+                })
+                .unwrap();
+        }
+        drop(sender); // the pipeline stopping
+
+        saver.checkpoint_unsaved_audio().await;
+
+        // Everything is on disk before transcription drains, so a crash now loses nothing.
+        let guard = incremental.lock().await;
+        assert_eq!(guard.get_checkpoint_count(), 2);
+        assert_eq!(guard.unsaved_seconds(), 0.0);
+        let tail = std::fs::metadata(folder.join(".checkpoints/audio_chunk_001.wav")).unwrap();
+        assert_eq!(tail.len(), 44 + 48000 * 5 * 2);
+    }
+
+    #[tokio::test]
     async fn transcript_writes_are_debounced_and_late_segments_still_reach_the_file() {
         let debounce = Duration::from_millis(50);
         let temp = tempfile::tempdir().unwrap();
@@ -697,16 +779,20 @@ mod tests {
     #[test]
     fn finalize_failure_mentions_checkpoints_only_when_some_exist() {
         let folder = std::path::Path::new("/meetings/Standup");
-        let none = finalize_failure_message("No audio checkpoints to merge", 0, false, Some(folder));
+        let none = finalize_failure_message("No audio checkpoints to merge", 0, 0.0, Some(folder));
         assert!(none.starts_with("No audio was captured"));
         assert!(!none.contains(".checkpoints"));
 
-        let unwritten = finalize_failure_message("disk full", 0, true, Some(folder));
+        let unwritten = finalize_failure_message("disk full", 0, 5.0, Some(folder));
         assert!(unwritten.contains("could not be written to disk"));
         assert!(!unwritten.contains(".checkpoints"));
 
-        let some = finalize_failure_message("FFmpeg failed", 3, true, Some(folder));
-        assert!(some.contains("/meetings/Standup/.checkpoints"));
+        let all_kept = finalize_failure_message("FFmpeg failed", 3, 0.0, Some(folder));
+        assert!(all_kept.contains("The recorded audio is kept as WAV files in /meetings/Standup/.checkpoints"));
+
+        let some_lost = finalize_failure_message("disk full", 3, 120.0, Some(folder));
+        assert!(some_lost.contains("/meetings/Standup/.checkpoints"));
+        assert!(some_lost.contains("120 seconds could not be written to disk"));
     }
 
     #[test]

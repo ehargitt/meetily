@@ -11,7 +11,8 @@ use super::ffmpeg::find_ffmpeg_path;
 /// Seconds of audio per checkpoint file.
 const CHECKPOINT_SECONDS: usize = 30;
 /// Unsaved audio kept in memory while checkpoint writes keep failing. Beyond
-/// this the oldest unsaved audio is dropped so a full disk cannot exhaust RAM.
+/// this the oldest unsaved audio is dropped so a full disk cannot exhaust RAM;
+/// silence of the same length takes its place once checkpoints can be written.
 const MAX_PENDING_SECONDS: usize = 600;
 const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(5);
 const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60);
@@ -38,6 +39,11 @@ pub struct IncrementalAudioSaver {
     /// Samples dropped at the in-memory cap since the last drop log.
     dropped_since_log: usize,
     last_drop_log: Option<Instant>,
+    /// Samples dropped at the in-memory cap over the whole recording.
+    dropped_total: usize,
+    /// Silence still to be written in place of dropped samples, ahead of the
+    /// next checkpoint, so later audio keeps its place against the transcript.
+    silence_owed: usize,
     #[cfg(test)]
     write_attempts: u64,
 }
@@ -68,6 +74,8 @@ impl IncrementalAudioSaver {
             next_attempt_at: None,
             dropped_since_log: 0,
             last_drop_log: None,
+            dropped_total: 0,
+            silence_owed: 0,
             #[cfg(test)]
             write_attempts: 0,
         })
@@ -116,13 +124,16 @@ impl IncrementalAudioSaver {
         }
     }
 
-    /// Drop the oldest unsaved audio beyond the in-memory cap.
+    /// Drop the oldest unsaved audio beyond the in-memory cap. The next
+    /// checkpoint write puts the same length of silence in its place.
     fn enforce_pending_limit(&mut self, now: Instant) -> Result<()> {
         let excess = self.pending.len().saturating_sub(self.max_pending_samples);
         if excess == 0 {
             return Ok(());
         }
         self.pending.drain(..excess);
+        self.silence_owed += excess;
+        self.dropped_total += excess;
         self.dropped_since_log += excess;
         if self.last_drop_log.map_or(true, |at| now.duration_since(at) >= DROP_LOG_INTERVAL) {
             error!(
@@ -140,7 +151,11 @@ impl IncrementalAudioSaver {
     }
 
     /// Write the buffered audio as the next checkpoint and clear the buffer.
-    fn write_pending_checkpoint(&mut self) -> Result<()> {
+    ///
+    /// Also called once capture has stopped, so the unsaved tail survives a
+    /// crash or quit before `finalize`. Blocking file I/O: keep it off the
+    /// async runtime.
+    pub fn write_pending_checkpoint(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
@@ -149,18 +164,35 @@ impl IncrementalAudioSaver {
         {
             self.write_attempts += 1;
         }
-        let checkpoint_path = self.checkpoints_dir
-            .join(format!("audio_chunk_{:03}.wav", self.checkpoint_count));
-        write_wav_atomically(&checkpoint_path, &self.pending, self.sample_rate)?;
+        let samples = std::mem::take(&mut self.pending);
+        let written = write_checkpoints(&self.checkpoint_batch(), &samples);
+        self.record_checkpoint_write(written, samples)
+    }
 
-        let duration_seconds = self.pending.len() as f32 / self.sample_rate as f32;
-        self.checkpoint_count += 1;
+    /// Where the next checkpoint write starts and how much silence it owes.
+    fn checkpoint_batch(&self) -> CheckpointBatch {
+        CheckpointBatch {
+            dir: self.checkpoints_dir.clone(),
+            first_index: self.checkpoint_count,
+            silence_samples: self.silence_owed,
+            max_silence_file_samples: self.checkpoint_interval_samples,
+            sample_rate: self.sample_rate,
+        }
+    }
+
+    /// Account for a checkpoint write of `samples` (taken out of `pending`);
+    /// on failure they go back to `pending` to be retried.
+    fn record_checkpoint_write(&mut self, written: CheckpointsWritten, samples: Vec<f32>) -> Result<()> {
+        self.checkpoint_count += written.files;
+        self.silence_owed -= written.silence_samples;
+        if let Err(e) = written.result {
+            self.pending = samples;
+            return Err(e);
+        }
         info!("Saved checkpoint {}: {:.2}s of audio ({} samples)",
               self.checkpoint_count,
-              duration_seconds,
-              self.pending.len());
-        self.pending.clear();
-
+              samples.len() as f32 / self.sample_rate as f32,
+              samples.len());
         Ok(())
     }
 
@@ -171,24 +203,19 @@ impl IncrementalAudioSaver {
     pub async fn finalize(&mut self) -> Result<PathBuf> {
         info!("Finalizing incremental recording...");
 
+        // Normally already written by `write_pending_checkpoint` when capture stopped.
         if !self.pending.is_empty() {
             info!("Saving final checkpoint with remaining {} samples", self.pending.len());
             // Up to MAX_PENDING_SECONDS of audio after write failures: write it off the runtime.
-            let path = self.checkpoints_dir
-                .join(format!("audio_chunk_{:03}.wav", self.checkpoint_count));
+            let batch = self.checkpoint_batch();
             let samples = std::mem::take(&mut self.pending);
-            let sample_rate = self.sample_rate;
             let (written, samples) = tokio::task::spawn_blocking(move || {
-                let written = write_wav_atomically(&path, &samples, sample_rate);
+                let written = write_checkpoints(&batch, &samples);
                 (written, samples)
             })
             .await
             .map_err(|e| anyhow!("Final checkpoint write task failed: {}", e))?;
-            if let Err(e) = written {
-                self.pending = samples;
-                return Err(e);
-            }
-            self.checkpoint_count += 1;
+            self.record_checkpoint_write(written, samples)?;
         }
 
         if self.checkpoint_count == 0 {
@@ -196,7 +223,7 @@ impl IncrementalAudioSaver {
         }
 
         let checkpoints: Vec<PathBuf> = (0..self.checkpoint_count)
-            .map(|i| self.checkpoints_dir.join(format!("audio_chunk_{:03}.wav", i)))
+            .map(|i| checkpoint_path(&self.checkpoints_dir, i))
             .collect();
         let final_audio_path = self.meeting_folder.join("audio.mp4");
         encode_wav_checkpoints(&checkpoints, &self.checkpoints_dir, &final_audio_path).await?;
@@ -223,10 +250,63 @@ impl IncrementalAudioSaver {
         self.checkpoint_count
     }
 
-    /// Audio is buffered that no checkpoint holds yet.
-    pub fn has_unsaved_audio(&self) -> bool {
-        !self.pending.is_empty()
+    /// Seconds of recorded audio no checkpoint holds: still buffered, or
+    /// dropped at the in-memory cap while checkpoints could not be written.
+    pub fn unsaved_seconds(&self) -> f64 {
+        (self.pending.len() + self.dropped_total) as f64 / self.sample_rate as f64
     }
+}
+
+fn checkpoint_path(dir: &Path, index: u32) -> PathBuf {
+    dir.join(format!("audio_chunk_{:03}.wav", index))
+}
+
+/// Where a checkpoint write goes, and the silence owed for dropped audio that
+/// must be written ahead of the samples.
+struct CheckpointBatch {
+    dir: PathBuf,
+    first_index: u32,
+    silence_samples: usize,
+    /// Silence is written in files of at most this many samples, so a long
+    /// outage never allocates its whole length at once.
+    max_silence_file_samples: usize,
+    sample_rate: u32,
+}
+
+/// What a checkpoint write put on disk. `files` and `silence_samples` count
+/// what was written even when `result` is an error part way through.
+struct CheckpointsWritten {
+    files: u32,
+    silence_samples: usize,
+    result: Result<()>,
+}
+
+/// Write the batch's owed silence, then `samples`, as consecutive checkpoints.
+fn write_checkpoints(batch: &CheckpointBatch, samples: &[f32]) -> CheckpointsWritten {
+    let mut written = CheckpointsWritten { files: 0, silence_samples: 0, result: Ok(()) };
+    if batch.silence_samples > 0 {
+        let silence = vec![0.0f32; batch.silence_samples.min(batch.max_silence_file_samples)];
+        while written.silence_samples < batch.silence_samples {
+            let length = (batch.silence_samples - written.silence_samples).min(silence.len());
+            let path = checkpoint_path(&batch.dir, batch.first_index + written.files);
+            if let Err(e) = write_wav_atomically(&path, &silence[..length], batch.sample_rate) {
+                written.result = Err(e);
+                return written;
+            }
+            written.files += 1;
+            written.silence_samples += length;
+        }
+        warn!(
+            "Wrote {:.1}s of silence in place of audio that could not be saved",
+            written.silence_samples as f64 / batch.sample_rate as f64
+        );
+    }
+    let path = checkpoint_path(&batch.dir, batch.first_index + written.files);
+    written.result = write_wav_atomically(&path, samples, batch.sample_rate);
+    if written.result.is_ok() {
+        written.files += 1;
+    }
+    written
 }
 
 /// Write mono samples as a 16-bit PCM WAV via a temp file and rename, so a
@@ -269,9 +349,15 @@ fn checkpoint_files(dir: &Path, extension: &str) -> std::io::Result<Vec<PathBuf>
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|path| path.extension().and_then(|s| s.to_str()) == Some(extension))
         .collect();
-    // audio_chunk_000, audio_chunk_001, ... sort lexically into recording order
-    files.sort();
+    // Indices are zero-padded to only three digits, so after audio_chunk_999
+    // names stop sorting lexically: order by the parsed index instead.
+    files.sort_by_key(|path| (checkpoint_index(path).unwrap_or(u32::MAX), path.clone()));
     Ok(files)
+}
+
+/// The index in a checkpoint name like `audio_chunk_1000.wav`.
+fn checkpoint_index(path: &Path) -> Option<u32> {
+    path.file_stem()?.to_str()?.rsplit('_').next()?.parse().ok()
 }
 
 /// Write an FFmpeg concat-demuxer list for `files` and return its path.
@@ -646,6 +732,88 @@ mod tests {
 
         assert!(last.unwrap_err().to_string().contains("were lost"));
         assert_eq!(saver.pending.len(), 48000 * MAX_PENDING_SECONDS);
+    }
+
+    /// Sample count of each WAV checkpoint in recording order, and whether it is all silence.
+    fn written_checkpoints(checkpoints_dir: &Path) -> Vec<(usize, bool)> {
+        checkpoint_files(checkpoints_dir, "wav")
+            .unwrap()
+            .iter()
+            .map(|path| {
+                let data = std::fs::read(path).unwrap().split_off(44);
+                (data.len() / 2, data.iter().all(|&byte| byte == 0))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dropped_audio_is_replaced_by_silence_once_checkpoints_can_be_written_again() {
+        // A low sample rate keeps the files small: 30 s is 3000 samples, the cap 60000.
+        let rate = 100;
+        let (_temp_dir, meeting_folder) = meeting_with_checkpoints_dir("Disk_Back");
+        let checkpoints_dir = meeting_folder.join(".checkpoints");
+        let mut saver = IncrementalAudioSaver::new(meeting_folder.clone(), rate).unwrap();
+        std::fs::remove_dir(&checkpoints_dir).unwrap();
+
+        let start = Instant::now();
+        let one_minute = vec![0.1f32; rate as usize * 60];
+        for minute in 0..12 {
+            let _ = saver.add_samples_at(&one_minute, start + Duration::from_secs(minute * 60));
+        }
+        let dropped = rate as usize * (12 * 60 - MAX_PENDING_SECONDS);
+        assert!((saver.unsaved_seconds() - 12.0 * 60.0).abs() < 1e-9);
+
+        std::fs::create_dir(&checkpoints_dir).unwrap();
+        let one_second = vec![0.1f32; rate as usize];
+        saver.add_samples_at(&one_second, start + Duration::from_secs(13 * 60)).unwrap();
+
+        // The dropped two minutes come back as four 30 s silent checkpoints ahead
+        // of the buffered audio, so every later sample keeps its place.
+        let written = written_checkpoints(&checkpoints_dir);
+        let silence_file = rate as usize * CHECKPOINT_SECONDS;
+        assert_eq!(dropped, 4 * silence_file);
+        assert_eq!(&written[..4], &[(silence_file, true); 4]);
+        assert_eq!(written[4], (rate as usize * (MAX_PENDING_SECONDS + 1), false));
+        assert_eq!(written.len(), 5);
+        assert_eq!(saver.checkpoint_count, 5);
+        assert!((saver.unsaved_seconds() - 120.0).abs() < 1e-9, "the dropped audio stays reported as lost");
+    }
+
+    #[test]
+    fn recovery_joins_checkpoints_in_numeric_order_past_999() {
+        let temp_dir = tempdir().unwrap();
+        let indices = [1001, 7, 100, 999, 1000, 0, 101, 99, 10000];
+        for index in indices {
+            std::fs::write(checkpoint_path(temp_dir.path(), index), b"").unwrap();
+        }
+
+        let ordered: Vec<u32> = checkpoint_files(temp_dir.path(), "wav")
+            .unwrap()
+            .iter()
+            .map(|path| checkpoint_index(path).unwrap())
+            .collect();
+
+        assert_eq!(ordered, vec![0, 7, 99, 100, 101, 999, 1000, 1001, 10000]);
+    }
+
+    #[tokio::test]
+    async fn the_unsaved_tail_is_written_before_finalize_and_only_once() {
+        let (_temp_dir, meeting_folder) = meeting_with_checkpoints_dir("Tail");
+        let checkpoints_dir = meeting_folder.join(".checkpoints");
+        let mut saver = IncrementalAudioSaver::new(meeting_folder.clone(), 48000).unwrap();
+        for i in 0..70 {  // 35 s: one checkpoint, 5 s buffered
+            saver.add_chunk(chunk(24000, i)).unwrap();
+        }
+
+        saver.write_pending_checkpoint().unwrap();
+        assert_eq!(written_checkpoints(&checkpoints_dir), vec![(48000 * 30, false), (48000 * 5, false)]);
+        // A second call (as finalize makes) has nothing left to write.
+        saver.write_pending_checkpoint().unwrap();
+        assert_eq!(saver.checkpoint_count, 2);
+
+        let final_path = saver.finalize().await.unwrap();
+        let extra = decoded_sample_count(&final_path) as f64 - 48000.0 * 35.0;
+        assert!((0.0..AAC_FRAME).contains(&extra), "{extra} extra samples");
     }
 
     #[tokio::test]

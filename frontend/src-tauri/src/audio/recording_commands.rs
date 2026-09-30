@@ -983,6 +983,8 @@ async fn stop_recording_tail<R: Runtime>(app: &AppHandle<R>) -> Result<(), Strin
     let (taken_manager, recorded_seconds) = take_manager_for_stop();
     let manager_for_cleanup = match taken_manager {
         Some(mut manager) => {
+            // Stopping clears the recording and pause clocks, statistics and device names.
+            let summary = manager.summary();
             // Use FORCE FLUSH to immediately process all accumulated audio - eliminates 30s delay!
             info!("🚀 Using FORCE FLUSH to eliminate pipeline accumulation delays");
             if let Err(e) = manager.stop_streams_and_force_flush().await {
@@ -991,7 +993,9 @@ async fn stop_recording_tail<R: Runtime>(app: &AppHandle<R>) -> Result<(), Strin
                 return Err(format!("Failed to stop audio streams: {}", e));
             }
             info!("✅ Audio streams stopped successfully - no more chunks will be created");
-            Some(manager)
+            // The transcription wait below can take minutes: get the audio on disk first.
+            manager.checkpoint_unsaved_audio().await;
+            Some((manager, summary))
         }
         None => {
             warn!("No recording manager found to stop");
@@ -1004,19 +1008,16 @@ async fn stop_recording_tail<R: Runtime>(app: &AppHandle<R>) -> Result<(), Strin
 
     // Step 3.5: Track meeting ended analytics with privacy-safe metadata
     // Extract all data from manager BEFORE any async operations to avoid Send issues
-    let analytics_data = if let Some(ref manager) = manager_for_cleanup {
-        let state = manager.get_state();
-        let stats = state.get_stats();
-
+    let analytics_data = if let Some((ref manager, ref summary)) = manager_for_cleanup {
         Some((
-            manager.get_recording_duration(),
-            manager.get_active_recording_duration().unwrap_or(0.0),
-            manager.get_total_pause_duration(),
+            summary.total_duration,
+            summary.active_duration.unwrap_or(0.0),
+            summary.pause_duration,
             manager.get_transcript_segments().len() as u64,
-            state.has_fatal_error(),
-            state.get_microphone_device().map(|d| d.name.clone()),
-            state.get_system_device().map(|d| d.name.clone()),
-            stats.chunks_processed,
+            summary.had_fatal_error,
+            summary.microphone_name.clone(),
+            summary.system_name.clone(),
+            summary.chunks_processed,
         ))
     } else {
         None
@@ -1116,7 +1117,7 @@ async fn stop_recording_tail<R: Runtime>(app: &AppHandle<R>) -> Result<(), Strin
     );
 
     // Perform final cleanup with the manager if available
-    let (meeting_folder, meeting_name) = if let Some(mut manager) = manager_for_cleanup {
+    let (meeting_folder, meeting_name) = if let Some((mut manager, summary)) = manager_for_cleanup {
         info!("🧹 Performing final cleanup and saving recording data");
 
         // Extract meeting info BEFORE async operations
@@ -1125,7 +1126,7 @@ async fn stop_recording_tail<R: Runtime>(app: &AppHandle<R>) -> Result<(), Strin
 
         // The final encode takes time proportional to the recording.
         let save_timeout = save_timeout_for(recorded_seconds);
-        match tokio::time::timeout(save_timeout, manager.save_recording_only(app)).await {
+        match tokio::time::timeout(save_timeout, manager.save_recording_only(app, summary.active_duration)).await {
             Ok(Ok(_)) => {
                 info!("✅ Recording data saved successfully during cleanup");
             }

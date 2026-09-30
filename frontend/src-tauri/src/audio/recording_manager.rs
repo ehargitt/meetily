@@ -183,6 +183,21 @@ pub async fn wake_audio_connection_for_swap(speaker_device_name: &str) -> Result
     }).await.map_err(|e| anyhow::anyhow!("Join error: {}", e))?
 }
 
+/// A recording's totals, captured when stop begins.
+#[derive(Debug, Clone)]
+pub struct RecordingSummary {
+    /// Seconds since recording started, pauses included.
+    pub total_duration: Option<f64>,
+    /// Seconds recorded, pauses excluded.
+    pub active_duration: Option<f64>,
+    /// Seconds paused, including a pause still in progress.
+    pub pause_duration: f64,
+    pub chunks_processed: u64,
+    pub had_fatal_error: bool,
+    pub microphone_name: Option<String>,
+    pub system_name: Option<String>,
+}
+
 /// Simplified recording manager that coordinates all audio components
 pub struct RecordingManager {
     state: Arc<RecordingState>,
@@ -361,13 +376,38 @@ impl RecordingManager {
         Ok(())
     }
 
-    /// Save recording after transcription is complete
-    pub async fn save_recording_only<R: tauri::Runtime>(&mut self, app: &tauri::AppHandle<R>) -> Result<()> {
-        debug!("Saving recording with transcript chunks");
+    /// Write the audio the saver still holds in memory to a checkpoint. Call
+    /// after `stop_streams_and_force_flush`, before waiting for transcription.
+    pub async fn checkpoint_unsaved_audio(&mut self) {
+        self.recording_saver.checkpoint_unsaved_audio().await;
+    }
 
-        // Get actual recording duration from state
-        let recording_duration = self.state.get_active_recording_duration();
-        info!("Recording duration from state: {:?}s", recording_duration);
+    /// Durations, counts and device names of the recording so far. Read it
+    /// before stopping: stopping and `cleanup` clear what it is built from.
+    pub fn summary(&self) -> RecordingSummary {
+        RecordingSummary {
+            total_duration: self.state.get_recording_duration(),
+            active_duration: self.state.get_active_recording_duration(),
+            pause_duration: self.state.get_total_pause_duration()
+                + self.state.get_current_pause_duration().unwrap_or(0.0),
+            chunks_processed: self.state.get_stats().chunks_processed,
+            had_fatal_error: self.state.has_fatal_error(),
+            microphone_name: self.state.get_microphone_device().map(|d| d.name.clone()),
+            system_name: self.state.get_system_device().map(|d| d.name.clone()),
+        }
+    }
+
+    /// Save recording after transcription is complete
+    ///
+    /// `recording_duration` is the active (unpaused) duration, read by
+    /// `summary` before the streams stopped.
+    pub async fn save_recording_only<R: tauri::Runtime>(
+        &mut self,
+        app: &tauri::AppHandle<R>,
+        recording_duration: Option<f64>,
+    ) -> Result<()> {
+        debug!("Saving recording with transcript chunks");
+        info!("Recording duration: {:?}s", recording_duration);
 
         // Save the recording with actual duration
         match self.recording_saver.stop_and_save(app, recording_duration).await {
@@ -613,6 +653,44 @@ impl Drop for RecordingManager {
     fn drop(&mut self) {
         // Note: Can't call async cleanup in Drop, but streams have their own Drop implementations
         self.state.cleanup();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::devices::DeviceType;
+
+    #[tokio::test]
+    async fn the_summary_keeps_what_stopping_clears() {
+        let mut manager = RecordingManager::new();
+        let state = manager.get_state().clone();
+        state.start_recording().unwrap();
+        state.set_microphone_device(Arc::new(AudioDevice::new("USB Mic".to_string(), DeviceType::Input)));
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        state.set_audio_sender(sender);
+        state
+            .send_audio_chunk(AudioChunk {
+                data: vec![0.0; 480],
+                sample_rate: 48000,
+                timestamp: 0.0,
+                chunk_id: 0,
+                device_type: RecordingDeviceType::Microphone,
+            })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        state.pause_recording().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        let summary = manager.summary();
+        manager.stop_streams_and_force_flush().await.unwrap();
+
+        assert_eq!(state.get_active_recording_duration(), None, "stopping clears the recording clock");
+        assert!(summary.total_duration.is_some());
+        assert!(summary.active_duration.unwrap() >= 0.03);
+        assert!(summary.pause_duration >= 0.03, "the pause still in progress counts");
+        assert_eq!(summary.chunks_processed, 1);
+        assert_eq!(summary.microphone_name.as_deref(), Some("USB Mic"));
     }
 }
 
