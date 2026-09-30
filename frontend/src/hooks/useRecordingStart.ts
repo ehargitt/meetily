@@ -226,6 +226,13 @@ export function useRecordingStart(
       if (typeof window !== 'undefined') {
         const shouldAutoStart = sessionStorage.getItem('autoStartRecording');
         if (shouldAutoStart === 'true' && !isRecording && !isAutoStarting) {
+          // Another start is already running; this request would only clear
+          // its transcripts before the backend refused it.
+          if (status === RecordingStatus.STARTING) {
+            console.log('Auto-start ignored - a recording is already starting');
+            sessionStorage.removeItem('autoStartRecording');
+            return;
+          }
           // Starts are refused before the flag is set; this catches a save
           // that began after that check. Drop the flag so it can't start a
           // recording on some later visit to this page.
@@ -331,7 +338,9 @@ export function useRecordingStart(
   // Listen for direct recording trigger from sidebar when already on home page
   useEffect(() => {
     const handleDirectStart = async () => {
-      if (isRecording || isAutoStarting) {
+      // STARTING: another start is running, and this one would clear its
+      // transcripts before the backend refused it.
+      if (isRecording || isAutoStarting || status === RecordingStatus.STARTING) {
         console.log('Recording already in progress, ignoring direct start event');
         return;
       }

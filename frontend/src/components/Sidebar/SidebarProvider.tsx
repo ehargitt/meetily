@@ -187,6 +187,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const requestRecordingStartRef = React.useRef(requestRecordingStart);
   requestRecordingStartRef.current = requestRecordingStart;
   useEffect(() => {
+    if (typeof window === 'undefined') return;
     const handleTrayStart = () => requestRecordingStartRef.current('tray');
     window.addEventListener('start-recording-from-tray', handleTrayStart);
     return () => window.removeEventListener('start-recording-from-tray', handleTrayStart);

@@ -220,14 +220,14 @@ async fn stop_recording<R: Runtime>(app: AppHandle<R>, args: RecordingArgs) -> R
                 log_error!("Failed to emit recording-stop-complete event: {}", e);
             }
 
-            // Create the save directory if it doesn't exist
+            // Create the save directory if it doesn't exist. Logged only: the
+            // recording has stopped and its save is under way, so an Err here
+            // would tell the frontend a finished stop had failed.
             if let Some(parent) = std::path::Path::new(&args.save_path).parent() {
                 if !parent.exists() {
                     log_info!("Creating directory: {:?}", parent);
                     if let Err(e) = std::fs::create_dir_all(parent) {
-                        let err_msg = format!("Failed to create save directory: {}", e);
-                        log_error!("{}", err_msg);
-                        return Err(err_msg);
+                        log_error!("Failed to create save directory: {}", e);
                     }
                 }
             }
