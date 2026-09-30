@@ -160,9 +160,10 @@ impl TruePeakLimiter {
 /// - Used by: Netflix, YouTube, Spotify, all professional broadcast
 /// - Perceptually accurate (not just simple RMS)
 ///
-/// Gain stays at unity until the integrated loudness shows speech is present,
-/// is limited to `MIN_GAIN_DB..=MAX_GAIN_DB`, and glides to each new value, so a
-/// quiet noise floor or system-audio bleed is never boosted by tens of dB.
+/// Gain is limited to `MIN_GAIN_DB..=MAX_GAIN_DB`, the allowed boost ramps up from
+/// unity only as the integrated loudness rises out of the noise-floor range, and the
+/// gain glides to each new value, so a quiet noise floor or system-audio bleed is
+/// never boosted by tens of dB.
 pub struct LoudnessNormalizer {
     ebur128: ebur128::EbuR128,
     limiter: TruePeakLimiter,
@@ -176,8 +177,11 @@ pub struct LoudnessNormalizer {
 
 impl LoudnessNormalizer {
     const TARGET_LUFS: f64 = -23.0;
-    /// Integrated loudness below this is noise floor or bleed, not speech, and is left at unity gain.
-    const SPEECH_PRESENT_LUFS: f64 = -45.0;
+    /// At or below this integrated loudness the input is taken to be noise floor or bleed
+    /// and is left at unity gain.
+    const NOISE_FLOOR_LUFS: f64 = -60.0;
+    /// From this integrated loudness up, the full `MAX_GAIN_DB` boost is allowed.
+    const FULL_BOOST_LUFS: f64 = -45.0;
     const MIN_GAIN_DB: f64 = -20.0;
     const MAX_GAIN_DB: f64 = 12.0;
     const GAIN_SMOOTHING_MS: f32 = 50.0;
@@ -214,12 +218,24 @@ impl LoudnessNormalizer {
         })
     }
 
-    /// Gain in dB that brings `integrated_lufs` to the target, or unity when no speech is present yet.
+    /// Gain in dB that moves `integrated_lufs` toward the target, within the boost allowed at that loudness.
     fn target_gain_db(integrated_lufs: f64) -> f64 {
-        if !integrated_lufs.is_finite() || integrated_lufs < Self::SPEECH_PRESENT_LUFS {
+        if !integrated_lufs.is_finite() {
             return 0.0;
         }
-        (Self::TARGET_LUFS - integrated_lufs).clamp(Self::MIN_GAIN_DB, Self::MAX_GAIN_DB)
+        (Self::TARGET_LUFS - integrated_lufs)
+            .clamp(Self::MIN_GAIN_DB, Self::max_boost_db(integrated_lufs))
+    }
+
+    /// Integrated loudness alone cannot tell a distant talker from a noise floor at the
+    /// same level, so between `NOISE_FLOOR_LUFS` and `FULL_BOOST_LUFS` the allowed boost
+    /// rises linearly from 0 to `MAX_GAIN_DB`. Output loudness then rises continuously
+    /// with input (no jump at either end): a -55 LUFS floor gains at most 4 dB and stays
+    /// near -51 LUFS, far below speech, while -50 LUFS speech still gains 8 dB.
+    fn max_boost_db(integrated_lufs: f64) -> f64 {
+        let ramp = (integrated_lufs - Self::NOISE_FLOOR_LUFS)
+            / (Self::FULL_BOOST_LUFS - Self::NOISE_FLOOR_LUFS);
+        Self::MAX_GAIN_DB * ramp.clamp(0.0, 1.0)
     }
 
     /// Normalize loudness using EBU R128 standard with true peak limiting
@@ -846,16 +862,56 @@ mod loudness_normalizer_tests {
         integrated_lufs(&samples[samples.len() / 2..])
     }
 
+    /// `signal` rescaled so its integrated loudness is `lufs`.
+    fn at_lufs(signal: Vec<f32>, lufs: f64) -> Vec<f32> {
+        let scale = 10_f64.powf((lufs - integrated_lufs(&signal)) / 20.0) as f32;
+        signal.into_iter().map(|sample| sample * scale).collect()
+    }
+
+    /// Settled loudness change the normalizer applies to `input`.
+    fn settled_gain_db(input: &[f32]) -> f64 {
+        settled_lufs(&normalize(input)) - settled_lufs(input)
+    }
+
     #[test]
-    fn a_noise_floor_is_left_at_unity_gain() {
-        let input = noise(0.003, 10.0);
-        assert!(integrated_lufs(&input) < LoudnessNormalizer::SPEECH_PRESENT_LUFS);
+    fn a_deep_noise_floor_is_left_at_unity_gain() {
+        let input = at_lufs(noise(0.01, 10.0), LoudnessNormalizer::NOISE_FLOOR_LUFS - 2.0);
 
         let output = normalize(&input);
 
         assert_eq!(output.len(), input.len());
         let gain = rms(&output) / rms(&input);
         assert!((gain - 1.0).abs() < 0.01, "noise floor gain was {gain}x");
+    }
+
+    #[test]
+    fn a_noise_floor_in_the_ramp_stays_far_below_speech_level() {
+        let input = at_lufs(noise(0.01, 10.0), -55.0);
+
+        let output_lufs = settled_lufs(&normalize(&input));
+
+        assert!(output_lufs < -50.0, "a -55 LUFS floor was raised to {output_lufs} LUFS");
+    }
+
+    #[test]
+    fn quiet_speech_gain_rises_continuously_to_the_ceiling() {
+        let levels = [-52.0, -50.0, -48.0, -46.0, -45.5, -44.5, -44.0, -42.0];
+        let gains: Vec<f64> = levels
+            .iter()
+            .map(|&lufs| settled_gain_db(&at_lufs(tone(0.01, 8.0), lufs)))
+            .collect();
+
+        for (&lufs, &gain) in levels.iter().zip(&gains) {
+            let ramp = (lufs - LoudnessNormalizer::NOISE_FLOOR_LUFS)
+                / (LoudnessNormalizer::FULL_BOOST_LUFS - LoudnessNormalizer::NOISE_FLOOR_LUFS);
+            let expected = (LoudnessNormalizer::MAX_GAIN_DB * ramp.min(1.0))
+                .min(LoudnessNormalizer::TARGET_LUFS - lufs);
+            assert!((gain - expected).abs() < 0.5, "{lufs} LUFS gained {gain} dB, expected {expected}");
+        }
+        assert!(gains[1] > 6.0, "-50 LUFS speech gained only {} dB", gains[1]);
+        assert!(gains.windows(2).all(|pair| pair[1] >= pair[0] - 0.2), "gains {gains:?}");
+        let knee_step = gains[5] - gains[4];
+        assert!(knee_step < 1.5, "gain jumps {knee_step} dB across -45 LUFS");
     }
 
     #[test]
@@ -877,7 +933,7 @@ mod loudness_normalizer_tests {
         let input = tone(0.012, 12.0);
         let input_lufs = integrated_lufs(&input);
         assert!(
-            input_lufs > LoudnessNormalizer::SPEECH_PRESENT_LUFS
+            input_lufs > LoudnessNormalizer::FULL_BOOST_LUFS
                 && LoudnessNormalizer::TARGET_LUFS - input_lufs > LoudnessNormalizer::MAX_GAIN_DB,
             "input is {input_lufs} LUFS"
         );
