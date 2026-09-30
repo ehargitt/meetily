@@ -107,8 +107,29 @@ pub fn parse_audio_device(name: &str) -> Result<AudioDevice> {
     AudioDevice::from_name(name)
 }
 
-/// Get device and config for audio operations
+/// A wedged sound server can block device lookup indefinitely; give up after this.
+const DEVICE_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Get device and config for audio operations.
+///
+/// The lookup is blocking (cpal talks to the sound server), so it runs on a
+/// blocking thread and is abandoned after `DEVICE_LOOKUP_TIMEOUT`.
 pub async fn get_device_and_config(
+    audio_device: &AudioDevice,
+) -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
+    let requested = audio_device.clone();
+    let lookup = tokio::task::spawn_blocking(move || find_device_and_config(&requested));
+    match tokio::time::timeout(DEVICE_LOOKUP_TIMEOUT, lookup).await {
+        Ok(joined) => joined.map_err(|e| anyhow!("Device lookup for '{}' failed: {}", audio_device.name, e))?,
+        Err(_) => Err(anyhow!(
+            "Timed out after {:?} looking up audio device '{}' (sound server not responding)",
+            DEVICE_LOOKUP_TIMEOUT,
+            audio_device.name
+        )),
+    }
+}
+
+fn find_device_and_config(
     audio_device: &AudioDevice,
 ) -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
     #[cfg(target_os = "windows")]
@@ -116,7 +137,12 @@ pub async fn get_device_and_config(
         return super::platform::get_windows_device(audio_device);
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        return find_linux_capture_device(audio_device);
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         use cpal::traits::{DeviceTrait, HostTrait};
 
@@ -135,42 +161,55 @@ pub async fn get_device_and_config(
                     }
                 }
             }
-            DeviceType::Output => {
-                #[cfg(target_os = "macos")]
-                {
-                    // Use default host for all macOS output devices
-                    // Core Audio backend uses direct cidre API for system capture, not cpal
-                    for device in host.output_devices()? {
-                        if let Ok(name) = device.name() {
-                            if name == audio_device.name {
-                                let default_config = device
-                                    .default_output_config()
-                                    .map_err(|e| anyhow!("Failed to get output config: {}", e))?;
-                                return Ok((device, default_config));
-                            }
-                        }
-                    }
-                }
-
-                #[cfg(target_os = "linux")]
-                {
-                    // For Linux, we use PulseAudio monitor sources for system audio
-                    if let Ok(pulse_host) = cpal::host_from_id(cpal::HostId::Alsa) {
-                        for device in pulse_host.input_devices()? {
-                            if let Ok(name) = device.name() {
-                                if name == audio_device.name {
-                                    let default_config = device
-                                        .default_input_config()
-                                        .map_err(|e| anyhow!("Failed to get default input config: {}", e))?;
-                                    return Ok((device, default_config));
-                                }
-                            }
+            // Use default host for all macOS output devices
+            // Core Audio backend uses direct cidre API for system capture, not cpal
+            DeviceType::Output if cfg!(target_os = "macos") => {
+                for device in host.output_devices()? {
+                    if let Ok(name) = device.name() {
+                        if name == audio_device.name {
+                            let default_config = device
+                                .default_output_config()
+                                .map_err(|e| anyhow!("Failed to get output config: {}", e))?;
+                            return Ok((device, default_config));
                         }
                     }
                 }
             }
+            DeviceType::Output => {}
         }
 
         Err(anyhow!("Device not found: {}", audio_device.name))
     }
+}
+
+/// Linux: both microphones and system audio (monitor sources) are ALSA
+/// capture PCMs.
+///
+/// cpal's ALSA enumeration opens every PCM it steps over in both directions
+/// (including `dmix`, which starts the card's playback hardware), so the name
+/// is first checked against ALSA's name hints and a miss fails without any
+/// enumeration. `default` needs none: cpal hands it out unopened. Any other
+/// name is found by enumerating lazily and stopping at the match.
+#[cfg(target_os = "linux")]
+fn find_linux_capture_device(
+    audio_device: &AudioDevice,
+) -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    let pcm_name = super::platform::resolve_capture_pcm(audio_device)?;
+    let host = cpal::default_host();
+
+    let device = if pcm_name == "default" {
+        host.default_input_device()
+            .ok_or_else(|| anyhow!("No default input device"))?
+    } else {
+        host.devices()?
+            .find(|device| device.name().map_or(false, |name| name == pcm_name))
+            .ok_or_else(|| anyhow!("ALSA lists '{}' but it could not be opened", pcm_name))?
+    };
+
+    let config = device
+        .default_input_config()
+        .map_err(|e| anyhow!("Failed to get input config for '{}': {}", pcm_name, e))?;
+    Ok((device, config))
 }

@@ -31,6 +31,7 @@ pub struct CustomOpenAIConfig {
 }
 
 pub mod commands;
+pub mod context_budget;
 pub(crate) mod language_detection;
 pub mod llm_client;
 pub(crate) mod metadata;
@@ -70,5 +71,6 @@ pub use template_commands::{
 
 // Re-export commonly used items
 pub use llm_client::LLMProvider;
-pub use processor::{chunk_text, extract_meeting_name_from_markdown, rough_token_count};
+pub use context_budget::rough_token_count;
+pub use processor::{chunk_text, extract_meeting_name_from_markdown};
 pub use service::SummaryService;

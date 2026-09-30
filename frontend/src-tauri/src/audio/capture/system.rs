@@ -2,7 +2,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use futures_util::{Stream, StreamExt};
 use anyhow::Result;
-use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::traits::HostTrait;
 
 
 #[cfg(target_os = "macos")]
@@ -25,17 +25,33 @@ impl SystemAudioCapture {
 
     pub fn list_system_devices() -> Result<Vec<String>> {
         let host = cpal::default_host();
-        let devices = host.output_devices()
-            .map_err(|e| anyhow::anyhow!("Failed to enumerate output devices: {}", e))?;
 
-        let mut device_names = Vec::new();
-        for device in devices {
-            if let Ok(name) = device.name() {
-                device_names.push(name);
-            }
+        // cpal's ALSA enumeration opens every PCM; list from name hints instead.
+        #[cfg(target_os = "linux")]
+        {
+            use crate::audio::devices::{platform::configure_linux_audio, DeviceType};
+            return Ok(configure_linux_audio(&host)?
+                .into_iter()
+                .filter(|device| device.device_type == DeviceType::Output)
+                .map(|device| device.name)
+                .collect());
         }
 
-        Ok(device_names)
+        #[cfg(not(target_os = "linux"))]
+        {
+            use cpal::traits::DeviceTrait;
+            let devices = host.output_devices()
+                .map_err(|e| anyhow::anyhow!("Failed to enumerate output devices: {}", e))?;
+
+            let mut device_names = Vec::new();
+            for device in devices {
+                if let Ok(name) = device.name() {
+                    device_names.push(name);
+                }
+            }
+
+            Ok(device_names)
+        }
     }
 
     pub fn start_system_audio_capture(&self) -> Result<SystemAudioStream> {

@@ -25,8 +25,12 @@ pub fn sanitize_filename(name: &str) -> String {
 }
 
 /// Create a meeting folder with timestamp and return the path
-/// Creates structure: base_path/MeetingName_YYYY-MM-DD_HH-MM/
+/// Creates structure: base_path/MeetingName_YYYY-MM-DD_HH-MM-SS_<id>/
 ///                    ├── .checkpoints/  (for incremental saves, optional)
+///
+/// The folder is always new: a short random id makes same-name meetings started
+/// in the same second distinct, and `create_dir` (not `create_dir_all`) refuses
+/// to reuse an existing folder, so one meeting can never overwrite another.
 ///
 /// # Arguments
 /// * `base_path` - Base directory for meetings
@@ -37,13 +41,25 @@ pub fn create_meeting_folder(
     meeting_name: &str,
     create_checkpoints_dir: bool,
 ) -> Result<PathBuf> {
-    let timestamp = Utc::now().format("%Y-%m-%d_%H-%M").to_string();
-    let sanitized_name = sanitize_filename(meeting_name);
-    let folder_name = format!("{}_{}", sanitized_name, timestamp);
-    let meeting_folder = base_path.join(folder_name);
+    const MAX_ATTEMPTS: usize = 5;
 
-    // Create main meeting folder
-    std::fs::create_dir_all(&meeting_folder)?;
+    std::fs::create_dir_all(base_path)?;
+
+    let timestamp = Utc::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+    let sanitized_name = sanitize_filename(meeting_name);
+    let mut attempt = 0;
+    let meeting_folder = loop {
+        let short_id = uuid::Uuid::new_v4().simple().to_string();
+        let folder_name = format!("{}_{}_{}", sanitized_name, timestamp, &short_id[..8]);
+        let candidate = base_path.join(folder_name);
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt + 1 < MAX_ATTEMPTS => {
+                attempt += 1;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
 
     // Only create .checkpoints subdirectory if requested (when auto_save is true)
     if create_checkpoints_dir {
@@ -736,4 +752,24 @@ pub fn write_transcript_json_to_file(
     std::fs::write(&file_path, json_string)?;
 
     Ok(file_path.to_string_lossy().to_string())
+}
+
+#[cfg(test)]
+mod meeting_folder_tests {
+    use super::*;
+
+    #[test]
+    fn same_name_meetings_created_together_get_distinct_folders() {
+        let base = tempfile::tempdir().unwrap();
+        let base_path = base.path().join("recordings");
+
+        let first = create_meeting_folder(&base_path, "Standup", true).unwrap();
+        let second = create_meeting_folder(&base_path, "Standup", true).unwrap();
+
+        assert_ne!(first, second);
+        assert!(first.join(".checkpoints").is_dir());
+        assert!(second.join(".checkpoints").is_dir());
+        let name = first.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("Standup_"), "unexpected folder name {name}");
+    }
 }

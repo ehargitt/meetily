@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{Device, Stream, SupportedStreamConfig};
@@ -350,7 +351,77 @@ impl AudioStream {
         info!("Audio stream stopped and device reference dropped");
         Ok(())
     }
+
+    /// Stop the stream on a blocking thread, bounded by `STREAM_STOP_TIMEOUT`.
+    ///
+    /// Teardown can block (cpal joins its worker thread; a wedged sound server
+    /// can hang it) and can panic (cpal's ALSA `Drop` unwraps the worker join, so
+    /// a worker that panicked panics again here). Neither may abort a stop or a
+    /// rebuild: a panicked worker means the stream was already dead, and a hung
+    /// teardown thread is abandoned.
+    pub async fn stop_off_runtime(self) {
+        let name = self.device.name.clone();
+        run_teardown_off_runtime(&name, STREAM_STOP_TIMEOUT, move || self.stop()).await;
+    }
+
+    /// Synchronous counterpart of `stop_off_runtime` for `Drop`, which cannot
+    /// await: contains a teardown panic instead of letting it escape `drop`.
+    fn stop_contained(self) {
+        let name = self.device.name.clone();
+        run_teardown_contained(&name, move || self.stop());
+    }
 }
+
+/// How a contained teardown ended.
+#[derive(Debug, PartialEq, Eq)]
+enum TeardownOutcome {
+    Stopped,
+    Failed,
+    Panicked,
+    TimedOut,
+}
+
+async fn run_teardown_off_runtime<F>(name: &str, timeout: Duration, teardown: F) -> TeardownOutcome
+where
+    F: FnOnce() -> Result<()> + Send + 'static,
+{
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(teardown)).await {
+        Ok(Ok(Ok(()))) => TeardownOutcome::Stopped,
+        Ok(Ok(Err(e))) => {
+            warn!("Failed to stop audio stream '{}': {}", name, e);
+            TeardownOutcome::Failed
+        }
+        Ok(Err(join_error)) => {
+            warn!(
+                "Audio stream '{}' teardown {} (stream was already dead); continuing",
+                name,
+                if join_error.is_panic() { "panicked" } else { "was cancelled" }
+            );
+            TeardownOutcome::Panicked
+        }
+        Err(_) => {
+            warn!("Audio stream '{}' teardown still blocked after {:?}; abandoning it", name, timeout);
+            TeardownOutcome::TimedOut
+        }
+    }
+}
+
+fn run_teardown_contained<F: FnOnce() -> Result<()>>(name: &str, teardown: F) -> TeardownOutcome {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(teardown)) {
+        Ok(Ok(())) => TeardownOutcome::Stopped,
+        Ok(Err(e)) => {
+            error!("Failed to stop audio stream '{}': {}", name, e);
+            TeardownOutcome::Failed
+        }
+        Err(_) => {
+            warn!("Audio stream '{}' teardown panicked (stream was already dead)", name);
+            TeardownOutcome::Panicked
+        }
+    }
+}
+
+/// Upper bound on one stream teardown before it is abandoned.
+const STREAM_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Audio stream manager for handling multiple streams
 pub struct AudioStreamManager {
@@ -375,7 +446,7 @@ impl AudioStreamManager {
     pub async fn start_streams(
         &mut self,
         microphone_device: Option<Arc<AudioDevice>>,
-        system_device: Option<Arc<AudioDevice>>,
+        system_audio: std::result::Result<Arc<AudioDevice>, String>,
         recording_sender: Option<mpsc::UnboundedSender<super::recording_state::AudioChunk>>,
     ) -> Result<()> {
         use super::capture::get_current_backend;
@@ -389,6 +460,7 @@ impl AudioStreamManager {
                 Ok(stream) => {
                     self.state.set_microphone_device(mic_device);
                     self.microphone_stream = Some(stream);
+                    self.state.stream_health(DeviceType::Microphone).mark_running(Instant::now(), false);
                     info!("✅ Microphone stream created successfully");
                 }
                 Err(e) => {
@@ -400,72 +472,70 @@ impl AudioStreamManager {
             info!("ℹ️ No microphone device specified, skipping microphone stream");
         }
 
-        // Start system audio stream
-        if let Some(sys_device) = system_device {
-            info!("🔊 Creating system audio stream: {} (backend: {:?})", sys_device.name, backend);
-            match AudioStream::create(sys_device.clone(), self.state.clone(), DeviceType::System, recording_sender.clone()).await {
-                Ok(stream) => {
-                    self.state.set_system_device(sys_device);
-                    self.system_stream = Some(stream);
-                    info!("✅ System audio stream created with {:?} backend", backend);
-                }
-                Err(e) => {
-                    warn!("⚠️ Failed to create system audio stream: {}", e);
-                    // Don't fail if only system audio fails
+        // Start system audio stream. If it cannot start, record mic-only and
+        // say so once the streams have started. The start can still fail after
+        // this (e.g. the auto-save meeting-folder check in activate_recording),
+        // in which case the user also sees the start error.
+        let system_unavailable = match system_audio {
+            Ok(sys_device) => {
+                info!("🔊 Creating system audio stream: {} (backend: {:?})", sys_device.name, backend);
+                let created = AudioStream::create(sys_device.clone(), self.state.clone(), DeviceType::System, recording_sender.clone()).await;
+                // Recorded even on failure: the supervisor's retries reopen this device.
+                self.state.set_system_device(sys_device.clone());
+                match created {
+                    Ok(stream) => {
+                        self.system_stream = Some(stream);
+                        self.state.stream_health(DeviceType::System).mark_running(Instant::now(), false);
+                        info!("✅ System audio stream created with {:?} backend", backend);
+                        None
+                    }
+                    Err(e) => {
+                        warn!("⚠️ Failed to create system audio stream: {}", e);
+                        Some((Some(sys_device.name.clone()), e.to_string()))
+                    }
                 }
             }
-        } else {
-            info!("ℹ️ No system device specified, skipping system audio stream");
-        }
+            Err(reason) => Some((None, reason)),
+        };
 
         // Ensure at least one stream was created
         if self.microphone_stream.is_none() && self.system_stream.is_none() {
             return Err(anyhow::anyhow!("No audio streams could be created"));
         }
 
+        if let Some((device_name, reason)) = system_unavailable {
+            self.state.report_system_audio_unavailable(device_name, reason);
+        }
+
         Ok(())
     }
 
-    /// Stop all audio streams
-    pub fn stop_streams(&mut self) -> Result<()> {
+    /// Stop all audio streams (off the async runtime; see `AudioStream::stop_off_runtime`).
+    pub async fn stop_streams(&mut self) {
         info!("Stopping all audio streams");
-
-        let mut errors = Vec::new();
-
-        // Stop microphone stream
-        if let Some(mic_stream) = self.microphone_stream.take() {
-            if let Err(e) = mic_stream.stop() {
-                error!("Failed to stop microphone stream: {}", e);
-                errors.push(e);
-            }
+        for stream in [self.microphone_stream.take(), self.system_stream.take()].into_iter().flatten() {
+            stream.stop_off_runtime().await;
         }
+        info!("All audio streams stopped");
+    }
 
-        // Stop system stream
-        if let Some(sys_stream) = self.system_stream.take() {
-            if let Err(e) = sys_stream.stop() {
-                error!("Failed to stop system stream: {}", e);
-                errors.push(e);
-            }
-        }
-
-        if !errors.is_empty() {
-            Err(anyhow::anyhow!("Failed to stop some streams: {:?}", errors))
-        } else {
-            info!("All audio streams stopped successfully");
-            Ok(())
+    fn stream_slot(&mut self, device_type: DeviceType) -> &mut Option<AudioStream> {
+        match device_type {
+            DeviceType::Microphone => &mut self.microphone_stream,
+            DeviceType::System => &mut self.system_stream,
         }
     }
 
-    /// Take the microphone stream OUT of the manager, keeping system audio
-    /// running. The caller stops/drops it OUTSIDE any lock — a cpal teardown
-    /// of a dead BT device can stall and must not block a held mutex.
-    pub fn take_mic_stream(&mut self) -> Option<AudioStream> {
-        self.microphone_stream.take()
+    /// Take one stream OUT of the manager, leaving the other running. The
+    /// caller stops it OUTSIDE any lock — a cpal teardown of a dead device can
+    /// stall and must not block a held mutex.
+    pub fn take_stream(&mut self, device_type: DeviceType) -> Option<AudioStream> {
+        self.stream_slot(device_type).take()
     }
 
-    /// Set a new microphone stream (used after hot-swap creation).
-    pub fn set_mic_stream(&mut self, stream: AudioStream) {
-        self.microphone_stream = Some(stream);
+    /// Install a replacement stream (after a rebuild or hot-swap).
+    pub fn set_stream(&mut self, device_type: DeviceType, stream: AudioStream) {
+        *self.stream_slot(device_type) = Some(stream);
     }
 
     /// Get stream count
@@ -488,8 +558,45 @@ impl AudioStreamManager {
 
 impl Drop for AudioStreamManager {
     fn drop(&mut self) {
-        if let Err(e) = self.stop_streams() {
-            error!("Error stopping streams during drop: {}", e);
+        // Normally already stopped via `stop_streams`; this covers early exits.
+        for stream in [self.microphone_stream.take(), self.system_stream.take()].into_iter().flatten() {
+            stream.stop_contained();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_panicking_teardown_does_not_abort_the_caller() {
+        let outcome = run_teardown_off_runtime("mic", Duration::from_secs(5), || panic!("worker join failed")).await;
+        assert_eq!(outcome, TeardownOutcome::Panicked);
+    }
+
+    #[tokio::test]
+    async fn a_hung_teardown_is_abandoned_after_the_timeout() {
+        let started = std::time::Instant::now();
+        let outcome = run_teardown_off_runtime("mic", Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(500));
+            Ok(())
+        })
+        .await;
+        assert_eq!(outcome, TeardownOutcome::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(400));
+    }
+
+    #[tokio::test]
+    async fn teardown_errors_and_success_are_reported() {
+        let failed = run_teardown_off_runtime("mic", Duration::from_secs(5), || Err(anyhow::anyhow!("pause failed"))).await;
+        assert_eq!(failed, TeardownOutcome::Failed);
+        assert_eq!(run_teardown_off_runtime("mic", Duration::from_secs(5), || Ok(())).await, TeardownOutcome::Stopped);
+    }
+
+    #[test]
+    fn a_panicking_teardown_in_drop_is_contained() {
+        assert_eq!(run_teardown_contained("mic", || panic!("worker join failed")), TeardownOutcome::Panicked);
+        assert_eq!(run_teardown_contained("mic", || Ok(())), TeardownOutcome::Stopped);
     }
 }

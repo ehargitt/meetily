@@ -260,9 +260,29 @@ impl From<std::io::Error> for ParakeetEngineError {
     }
 }
 
+/// A loaded model, shared so inference can run on a blocking thread without
+/// holding `current_model`. ONNX sessions need `&mut` to run, so the inner
+/// mutex serializes inference on one model.
+type SharedModel = Arc<std::sync::Mutex<ParakeetModel>>;
+
+/// A previous inference on this model panicked, so its session state is unknown.
+#[derive(Debug, thiserror::Error)]
+#[error("the Parakeet model crashed during an earlier transcription and was discarded")]
+struct ModelPoisoned;
+
+/// Run `run` on the model behind `shared`, refusing a model whose mutex was
+/// poisoned by a panic mid-inference instead of reusing its unknown state.
+fn with_healthy_model<M, T>(
+    shared: &std::sync::Mutex<M>,
+    run: impl FnOnce(&mut M) -> T,
+) -> std::result::Result<T, ModelPoisoned> {
+    let mut model = shared.lock().map_err(|_| ModelPoisoned)?;
+    Ok(run(&mut model))
+}
+
 pub struct ParakeetEngine {
     models_dir: PathBuf,
-    current_model: Arc<RwLock<Option<ParakeetModel>>>,
+    current_model: Arc<RwLock<Option<SharedModel>>>,
     current_model_name: Arc<RwLock<Option<String>>>,
     model_lifecycle_lock: Mutex<()>,
     pub(crate) available_models: Arc<RwLock<HashMap<String, ModelInfo>>>,
@@ -485,7 +505,7 @@ impl ParakeetEngine {
                     anyhow!("Failed to load Parakeet model {}: {}", model_name, error)
                 })?;
 
-                *self.current_model.write().await = Some(model);
+                *self.current_model.write().await = Some(Arc::new(std::sync::Mutex::new(model)));
                 *self.current_model_name.write().await = Some(model_name.to_string());
 
                 log::info!(
@@ -540,10 +560,16 @@ impl ParakeetEngine {
     }
 
     /// Transcribe audio samples using the loaded Parakeet model
+    ///
+    /// Inference takes seconds of CPU/GPU time, so it runs on a blocking thread.
+    /// An unload during inference takes effect for later calls; the running
+    /// call keeps its model alive until it returns.
     pub async fn transcribe_audio(&self, audio_data: Vec<f32>) -> Result<String> {
-        let mut model_guard = self.current_model.write().await;
-        let model = model_guard
-            .as_mut()
+        let model = self
+            .current_model
+            .read()
+            .await
+            .clone()
             .ok_or_else(|| anyhow!("No Parakeet model loaded. Please load a model first."))?;
 
         let duration_seconds = audio_data.len() as f64 / 16000.0; // Assuming 16kHz
@@ -553,14 +579,42 @@ impl ParakeetEngine {
             duration_seconds
         );
 
-        // Transcribe using Parakeet model
-        let result = model
-            .transcribe_samples(audio_data)
-            .map_err(|e| anyhow!("Parakeet transcription failed: {}", e))?;
+        let shared = Arc::clone(&model);
+        let inference = tokio::task::spawn_blocking(move || {
+            with_healthy_model(&shared, |model| model.transcribe_samples(audio_data))
+        })
+        .await;
+        let result = match inference {
+            Ok(Ok(result)) => result,
+            Ok(Err(poisoned)) => {
+                self.discard_broken_model(&model).await;
+                return Err(anyhow!("Parakeet transcription failed: {}", poisoned));
+            }
+            Err(join_error) => {
+                // A panic inside ONNX poisons the model's mutex; drop the model now.
+                self.discard_broken_model(&model).await;
+                return Err(anyhow!("Parakeet inference task failed: {}", join_error));
+            }
+        }
+        .map_err(|e| anyhow!("Parakeet transcription failed: {}", e))?;
 
         log::debug!("Parakeet transcription result: '{}'", result.text);
 
         Ok(result.text)
+    }
+
+    /// Unload `broken` if it is still the loaded model, so callers see "no model
+    /// loaded" (live transcription reports that once) and the next recording
+    /// start loads a fresh one.
+    async fn discard_broken_model(&self, broken: &SharedModel) {
+        let _lifecycle_guard = self.model_lifecycle_lock.lock().await;
+        let mut current = self.current_model.write().await;
+        if current.as_ref().is_some_and(|loaded| Arc::ptr_eq(loaded, broken)) {
+            *current = None;
+            drop(current);
+            self.current_model_name.write().await.take();
+            log::error!("Parakeet model discarded after a crash during transcription; it will be reloaded when a recording starts");
+        }
     }
 
     /// Get the models directory path
@@ -1232,6 +1286,22 @@ impl ParakeetEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_poisoned_by_a_panicking_inference_is_refused() {
+        let shared = std::sync::Mutex::new(0u32);
+        assert_eq!(with_healthy_model(&shared, |calls| { *calls += 1; *calls }).unwrap(), 1);
+
+        let panicked = std::thread::scope(|scope| {
+            scope
+                .spawn(|| with_healthy_model(&shared, |_| panic!("ONNX crashed")))
+                .join()
+                .is_err()
+        });
+        assert!(panicked);
+
+        assert!(with_healthy_model(&shared, |calls| *calls).is_err(), "must not reuse the model");
+    }
     use crossbeam::queue::SegQueue;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

@@ -79,6 +79,17 @@ pub async fn parakeet_load_model<R: Runtime>(
     };
 
     if let Some(engine) = engine {
+        // Switching models unloads the one a recording (or its stop drain) is transcribing with.
+        if refuses_model_switch(
+            crate::audio::recording_commands::transcription_engine_in_use(),
+            engine.get_current_model().await.as_deref(),
+            &model_name,
+        ) {
+            return Err(crate::audio::recording_commands::engine_in_use_error(
+                "switch the transcription model",
+            ));
+        }
+
         // Emit model loading started event
         if let Err(e) = app_handle.emit(
             "parakeet-model-loading-started",
@@ -120,6 +131,12 @@ pub async fn parakeet_load_model<R: Runtime>(
     } else {
         Err("Parakeet engine not initialized".to_string())
     }
+}
+
+/// Loading a model other than the loaded one unloads it, so refuse that while
+/// the engine is in use. Re-loading the loaded model is a no-op and stays allowed.
+fn refuses_model_switch(engine_in_use: bool, loaded_model: Option<&str>, requested_model: &str) -> bool {
+    engine_in_use && loaded_model != Some(requested_model)
 }
 
 #[command]
@@ -574,4 +591,18 @@ pub async fn open_parakeet_models_folder() -> Result<(), String> {
 
     log::info!("Opened Parakeet models folder: {}", folder_path);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_switch_is_refused_only_while_the_engine_is_in_use() {
+        assert!(refuses_model_switch(true, Some("parakeet-a"), "parakeet-b"));
+        assert!(refuses_model_switch(true, None, "parakeet-a"));
+        assert!(!refuses_model_switch(true, Some("parakeet-a"), "parakeet-a"));
+        assert!(!refuses_model_switch(false, Some("parakeet-a"), "parakeet-b"));
+        assert!(!refuses_model_switch(false, None, "parakeet-a"));
+    }
 }

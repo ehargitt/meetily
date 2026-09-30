@@ -1,15 +1,19 @@
 use crate::database::repositories::{
     meeting::MeetingsRepository, setting::SettingsRepository, summary::SummaryProcessesRepository,
 };
+use crate::summary::context_budget::{ContextBudget, OLLAMA_FALLBACK_CONTEXT};
 use crate::summary::llm_client::LLMProvider;
 use crate::summary::language_detection::detect_summary_language;
 use crate::summary::metadata::read_detected_summary_language_from_metadata;
 use crate::summary::processor::{
     clean_llm_markdown_detailed, extract_meeting_name_from_markdown, generate_meeting_summary,
+    CachedEnglishSummary,
     language_name_from_code, require_visible_markdown,
 };
+use crate::summary::summary_engine::models;
 use crate::summary::templates::{self, Template};
 use crate::ollama::metadata::ModelMetadataCache;
+use crate::openrouter;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -65,7 +69,7 @@ struct SummaryCacheSource {
     custom_prompt_fingerprint: String,
     template_id: String,
     template_fingerprint: String,
-    token_threshold: usize,
+    context_budget: Option<ContextBudget>,
     model_provider: String,
     model_name: String,
     ollama_endpoint: Option<String>,
@@ -80,6 +84,10 @@ struct EnglishSummaryCache {
     markdown: String,
     source: SummaryCacheSource,
     output_language: Option<String>,
+    /// The English markdown was built from a cut-off combine (`combine_truncated`); a rerun
+    /// that reuses it must report that too. Rows written before this field read as false.
+    #[serde(default)]
+    combine_truncated: bool,
 }
 
 fn stable_text_fingerprint(text: &str) -> String {
@@ -100,7 +108,7 @@ fn build_summary_cache_source(
     custom_prompt: &str,
     template_id: &str,
     template_fingerprint: &str,
-    token_threshold: usize,
+    context_budget: Option<ContextBudget>,
     model_provider: &str,
     model_name: &str,
     ollama_endpoint: Option<&str>,
@@ -114,7 +122,7 @@ fn build_summary_cache_source(
         custom_prompt_fingerprint: stable_text_fingerprint(custom_prompt),
         template_id: template_id.to_string(),
         template_fingerprint: template_fingerprint.to_string(),
-        token_threshold,
+        context_budget,
         model_provider: model_provider.to_string(),
         model_name: model_name.to_string(),
         ollama_endpoint: ollama_endpoint.map(str::to_string),
@@ -145,6 +153,7 @@ fn build_summary_result_json(
     output_language: Option<&str>,
     reasoning_stripped: bool,
     normalization_fallback: bool,
+    combine_truncated: bool,
 ) -> Result<serde_json::Value, String> {
     let cleaned_final = clean_llm_markdown_detailed(final_markdown);
     require_visible_markdown("Final summary", &cleaned_final)?;
@@ -162,11 +171,13 @@ fn build_summary_result_json(
             markdown: cleaned_english.markdown,
             source,
             output_language: normalise_summary_language_for_cache(output_language),
+            combine_truncated,
         },
         "reasoning_stripped": reasoning_stripped
             || cleaned_final.reasoning_stripped
             || cleaned_english.reasoning_stripped,
         "normalization_fallback": normalization_fallback,
+        "combine_truncated": combine_truncated,
     }))
 }
 
@@ -177,7 +188,7 @@ fn extract_cached_english_markdown(
     raw: &str,
     expected_source: &SummaryCacheSource,
     requested_language: Option<&str>,
-) -> Result<Option<String>, serde_json::Error> {
+) -> Result<Option<CachedEnglishSummary>, serde_json::Error> {
     let requested_language = match normalise_summary_language_for_cache(requested_language) {
         Some(language) if language != "English" => language,
         _ => return Ok(None),
@@ -205,7 +216,10 @@ fn extract_cached_english_markdown(
     if markdown.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(cache.markdown))
+        Ok(Some(CachedEnglishSummary {
+            markdown: cache.markdown,
+            combine_truncated: cache.combine_truncated,
+        }))
     }
 }
 
@@ -429,51 +443,29 @@ impl SummaryService {
             api_key
         };
 
-        // Dynamically fetch context size based on provider and model
-        let token_threshold = if provider == LLMProvider::Ollama {
-            match METADATA_CACHE.get_or_fetch(&model_name, ollama_endpoint.as_deref()).await {
-                Ok(metadata) => {
-                    // Reserve 300 tokens for prompt overhead
-                    let optimal = metadata.context_size.saturating_sub(300);
-                    info!(
-                        "✓ Using dynamic context for {}: {} tokens (chunk size: {})",
-                        model_name, metadata.context_size, optimal
-                    );
-                    optimal
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to fetch context for {}: {}. Using default 4000",
-                        model_name, e
-                    );
-                    4000  // Fallback to safe default
-                }
+        // The context window the model runs with. Chunking and Ollama's num_ctx both come from it.
+        let context_budget = match Self::select_context_budget(
+            &provider,
+            &model_name,
+            ollama_endpoint.as_deref(),
+            openrouter::MODELS_URL,
+        )
+        .await
+        {
+            Ok(budget) => budget,
+            Err(err_msg) => {
+                Self::fail_and_cleanup(&pool, &meeting_id, started_at, &err_msg).await;
+                return;
             }
-        } else if provider == LLMProvider::BuiltInAI {
-            // Get model's context size from registry
-            use crate::summary::summary_engine::models;
-            let model = models::get_model_by_name(&model_name)
-                .ok_or_else(|| format!("Unknown model: {}", model_name));
-
-            match model {
-                Ok(model_def) => {
-                    // Reserve 300 tokens for prompt overhead
-                    let optimal = model_def.context_size.saturating_sub(300) as usize;
-                    info!(
-                        "✓ Using BuiltInAI context size: {} tokens (chunk size: {})",
-                        model_def.context_size, optimal
-                    );
-                    optimal
-                }
-                Err(e) => {
-                    warn!("{}, using default 2048", e);
-                    1748  // 2048 - 300 for overhead
-                }
-            }
-        } else {
-            // Cloud providers (OpenAI, Claude, Groq, CustomOpenAI) handle large contexts automatically
-            100000  // Effectively unlimited for single-pass processing
         };
+        if let Some(budget) = context_budget {
+            info!(
+                model = %model_name,
+                context_tokens = budget.context_tokens,
+                output_reserve_tokens = budget.output_reserve_tokens,
+                "Using summary context budget"
+            );
+        }
 
         // Get app data directory for BuiltInAI provider
         let app_data_dir = _app.path().app_data_dir().ok();
@@ -506,7 +498,7 @@ impl SummaryService {
             &custom_prompt,
             &template_id,
             &template_fingerprint,
-            token_threshold,
+            context_budget,
             &model_provider,
             &model_name,
             ollama_endpoint.as_deref(),
@@ -553,7 +545,7 @@ impl SummaryService {
             &custom_prompt,
             &template_id,
             &template,
-            token_threshold,
+            context_budget,
             ollama_endpoint.as_deref(),
             custom_openai_endpoint.as_deref(),
             custom_openai_max_tokens,
@@ -563,7 +555,7 @@ impl SummaryService {
             Some(&cancellation_token),
             summary_language.as_deref(),
             detected_summary_language.as_deref(),
-            cached_english.as_deref(),
+            cached_english.as_ref(),
         )
         .await;
 
@@ -582,6 +574,7 @@ impl SummaryService {
                     summary_language.as_deref(),
                     generated.reasoning_stripped,
                     generated.normalization_fallback,
+                    generated.combine_truncated,
                 ) {
                     Ok(result) => result,
                     Err(error) => {
@@ -643,6 +636,70 @@ impl SummaryService {
             }
         }
         Self::cleanup_cancellation_token(&meeting_id, started_at);
+    }
+
+    /// The context budget chunking should respect for `provider`/`model_name`, or `None` to
+    /// send the whole transcript in one request. `Err` only for an unknown built-in model.
+    ///
+    /// OpenRouter windows come from its catalogue at `openrouter_models_url`; when that cannot
+    /// be read the summary runs single-pass as before. OpenAI, Claude, Groq and custom
+    /// OpenAI-compatible servers stay single-pass: nothing in the app reports or configures
+    /// their context size (`CustomOpenAIConfig` has no such field).
+    async fn select_context_budget(
+        provider: &LLMProvider,
+        model_name: &str,
+        ollama_endpoint: Option<&str>,
+        openrouter_models_url: &str,
+    ) -> Result<Option<ContextBudget>, String> {
+        match provider {
+            LLMProvider::Ollama => {
+                let model_max_context =
+                    match METADATA_CACHE.get_or_fetch(model_name, ollama_endpoint).await {
+                        Ok(metadata) => metadata.context_size,
+                        Err(e) => {
+                            warn!(
+                                "Failed to fetch context for {}: {}. Using {} tokens",
+                                model_name, e, OLLAMA_FALLBACK_CONTEXT
+                            );
+                            OLLAMA_FALLBACK_CONTEXT
+                        }
+                    };
+                Ok(Some(ContextBudget::for_ollama(model_max_context)))
+            }
+            LLMProvider::BuiltInAI => models::get_model_by_name(model_name)
+                .map(|model_def| {
+                    Some(ContextBudget::for_builtin(
+                        model_def.context_size,
+                        models::DEFAULT_MAX_TOKENS,
+                    ))
+                })
+                .ok_or_else(|| format!("Unknown built-in model: {}", model_name)),
+            LLMProvider::OpenRouter => {
+                let client = reqwest::Client::new();
+                match openrouter::fetch_context_length(&client, openrouter_models_url, model_name)
+                    .await
+                {
+                    Ok(Some(context_length)) => {
+                        Ok(Some(ContextBudget::for_hosted_model(context_length as usize)))
+                    }
+                    Ok(None) => {
+                        warn!(
+                            "OpenRouter lists no context length for {}; summarizing in one request",
+                            model_name
+                        );
+                        Ok(None)
+                    }
+                    Err(e) => {
+                        warn!("{}; summarizing {} in one request", e, model_name);
+                        Ok(None)
+                    }
+                }
+            }
+            LLMProvider::OpenAI
+            | LLMProvider::Claude
+            | LLMProvider::Groq
+            | LLMProvider::CustomOpenAI => Ok(None),
+        }
     }
 
     /// Updates the summary process status to failed with error message
@@ -792,7 +849,7 @@ mod tests {
             "custom prompt",
             "standard_meeting",
             &template_fingerprint,
-            3700,
+            Some(ContextBudget::for_ollama(8192)),
             "ollama",
             "gemma3:1b",
             Some("http://localhost:11434"),
@@ -834,7 +891,7 @@ mod tests {
         .to_string();
 
         assert_eq!(
-            extract_cached_english_markdown(&raw, &sample_cache_source(), Some("de")).unwrap(),
+            extract_cached_english_markdown(&raw, &sample_cache_source(), Some("de")).unwrap().map(|cache| cache.markdown),
             None
         );
     }
@@ -849,12 +906,13 @@ mod tests {
             Some("fr"),
             false,
             false,
+            false,
         )
         .unwrap()
         .to_string();
 
         assert_eq!(
-            extract_cached_english_markdown(&raw, &source, Some("de")).unwrap(),
+            extract_cached_english_markdown(&raw, &source, Some("de")).unwrap().map(|cache| cache.markdown),
             Some("# Meeting\n## Points\nHello".to_string())
         );
     }
@@ -869,12 +927,13 @@ mod tests {
             Some("fr"),
             false,
             false,
+            false,
         )
         .unwrap()
         .to_string();
 
         assert_eq!(
-            extract_cached_english_markdown(&raw, &source, Some("fr")).unwrap(),
+            extract_cached_english_markdown(&raw, &source, Some("fr")).unwrap().map(|cache| cache.markdown),
             None
         );
     }
@@ -890,6 +949,7 @@ mod tests {
             Some("fr"),
             false,
             false,
+            false,
         )
         .unwrap()
         .to_string();
@@ -900,7 +960,7 @@ mod tests {
                 "custom prompt",
                 "standard_meeting",
                 &template_fingerprint,
-                3700,
+                Some(ContextBudget::for_ollama(8192)),
                 "ollama",
                 "gemma3:1b",
                 Some("http://localhost:11434"),
@@ -914,7 +974,7 @@ mod tests {
                 "changed prompt",
                 "standard_meeting",
                 &template_fingerprint,
-                3700,
+                Some(ContextBudget::for_ollama(8192)),
                 "ollama",
                 "gemma3:1b",
                 Some("http://localhost:11434"),
@@ -928,7 +988,7 @@ mod tests {
                 "custom prompt",
                 "daily_standup",
                 &template_fingerprint,
-                3700,
+                Some(ContextBudget::for_ollama(8192)),
                 "ollama",
                 "gemma3:1b",
                 Some("http://localhost:11434"),
@@ -942,7 +1002,7 @@ mod tests {
                 "custom prompt",
                 "standard_meeting",
                 &template_fingerprint,
-                3700,
+                Some(ContextBudget::for_ollama(8192)),
                 "openai",
                 "gemma3:1b",
                 Some("http://localhost:11434"),
@@ -956,7 +1016,7 @@ mod tests {
                 "custom prompt",
                 "standard_meeting",
                 &template_fingerprint,
-                3700,
+                Some(ContextBudget::for_ollama(8192)),
                 "ollama",
                 "qwen2.5:3b",
                 Some("http://localhost:11434"),
@@ -970,7 +1030,7 @@ mod tests {
                 "custom prompt",
                 "standard_meeting",
                 &template_fingerprint,
-                3700,
+                Some(ContextBudget::for_ollama(8192)),
                 "ollama",
                 "gemma3:1b",
                 Some("http://localhost:11500"),
@@ -984,7 +1044,7 @@ mod tests {
                 "custom prompt",
                 "standard_meeting",
                 &template_fingerprint,
-                3700,
+                Some(ContextBudget::for_ollama(8192)),
                 "ollama",
                 "gemma3:1b",
                 Some("http://localhost:11434"),
@@ -997,7 +1057,7 @@ mod tests {
 
         for changed_source in changed_sources {
             assert_eq!(
-                extract_cached_english_markdown(&raw, &changed_source, Some("de")).unwrap(),
+                extract_cached_english_markdown(&raw, &changed_source, Some("de")).unwrap().map(|cache| cache.markdown),
                 None
             );
         }
@@ -1013,6 +1073,7 @@ mod tests {
             Some("fr"),
             false,
             false,
+            false,
         )
         .unwrap()
         .to_string();
@@ -1023,13 +1084,13 @@ mod tests {
         };
 
         assert_eq!(
-            extract_cached_english_markdown(&raw, &changed_template, Some("de")).unwrap(),
+            extract_cached_english_markdown(&raw, &changed_template, Some("de")).unwrap().map(|cache| cache.markdown),
             None
         );
     }
 
     #[test]
-    fn test_changed_token_threshold_rejects_cache() {
+    fn test_changed_context_budget_rejects_cache() {
         let source = sample_cache_source();
         let raw = build_summary_result_json(
             "# Reunion\n## Points\nBonjour",
@@ -1038,17 +1099,42 @@ mod tests {
             Some("fr"),
             false,
             false,
+            false,
         )
         .unwrap()
         .to_string();
 
-        let changed_threshold = SummaryCacheSource {
-            token_threshold: 8192,
+        let changed_budget = SummaryCacheSource {
+            context_budget: Some(ContextBudget::for_ollama(16_384)),
             ..source
         };
 
         assert_eq!(
-            extract_cached_english_markdown(&raw, &changed_threshold, Some("de")).unwrap(),
+            extract_cached_english_markdown(&raw, &changed_budget, Some("de")).unwrap().map(|cache| cache.markdown),
+            None
+        );
+    }
+
+    #[test]
+    fn cache_rows_from_before_context_budgets_miss_for_ollama() {
+        // Rows written before budgets carried `token_threshold` (context minus 300) instead.
+        let source = sample_cache_source();
+        let mut raw = build_summary_result_json(
+            "# Reunion\n## Points\nBonjour",
+            "# Meeting\n## Points\nHello",
+            source.clone(),
+            Some("fr"),
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let legacy_source = raw["english_cache"]["source"].as_object_mut().unwrap();
+        legacy_source.remove("context_budget");
+        legacy_source.insert("token_threshold".to_string(), serde_json::json!(7892));
+
+        assert_eq!(
+            extract_cached_english_markdown(&raw.to_string(), &source, Some("de")).unwrap().map(|cache| cache.markdown),
             None
         );
     }
@@ -1060,6 +1146,7 @@ mod tests {
             "# English Title\n## Decisions\nDone",
             sample_cache_source(),
             Some("fr"),
+            false,
             false,
             false,
         )
@@ -1082,6 +1169,7 @@ mod tests {
                 None,
                 false,
                 false,
+                false,
             ),
             Err("Final summary contains no visible content after title removal".to_string())
         );
@@ -1096,6 +1184,7 @@ mod tests {
             None,
             true,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(result["reasoning_stripped"], true);
@@ -1103,8 +1192,113 @@ mod tests {
     }
 
     #[test]
+    fn result_json_records_a_cut_off_combine() {
+        let result = build_summary_result_json(
+            "# Title\nVisible",
+            "# Title\nVisible",
+            sample_cache_source(),
+            None,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(result["combine_truncated"], true);
+        assert_eq!(result["normalization_fallback"], false);
+    }
+
+    #[test]
+    fn a_cut_off_combine_survives_a_cached_english_rerun() {
+        let source = sample_cache_source();
+        let mut raw = build_summary_result_json(
+            "# Reunion\n## Points\nBonjour",
+            "# Meeting\n## Points\nHello",
+            source.clone(),
+            Some("fr"),
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let cached = extract_cached_english_markdown(&raw.to_string(), &source, Some("de"))
+            .unwrap()
+            .expect("cache hit");
+        assert!(cached.combine_truncated);
+
+        // Rows written before the flag existed read as not truncated.
+        raw["english_cache"].as_object_mut().unwrap().remove("combine_truncated");
+        let legacy = extract_cached_english_markdown(&raw.to_string(), &source, Some("de"))
+            .unwrap()
+            .expect("cache hit");
+        assert!(!legacy.combine_truncated);
+    }
+
+    #[test]
     fn test_extract_cached_english_from_malformed_json_errors() {
         let raw = r#"{ not valid json"#;
         assert!(extract_cached_english_markdown(raw, &sample_cache_source(), Some("de")).is_err());
+    }
+
+    #[tokio::test]
+    async fn openrouter_budget_comes_from_the_catalogue_context_length() {
+        use crate::summary::llm_client::test_http::{read_http_request, write_json_response};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/api/v1/models", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request(&mut stream).await;
+            let body = br#"{"data":[{"id":"mistralai/mistral-7b-instruct","context_length":32768,"top_provider":{"context_length":8192}}]}"#;
+            write_json_response(&mut stream, body).await;
+        });
+
+        let budget = SummaryService::select_context_budget(
+            &LLMProvider::OpenRouter,
+            "mistralai/mistral-7b-instruct",
+            None,
+            &url,
+        )
+        .await;
+        server.await.unwrap();
+
+        assert_eq!(budget, Ok(Some(ContextBudget::for_hosted_model(8192))));
+    }
+
+    #[tokio::test]
+    async fn openrouter_without_a_catalogue_and_other_cloud_providers_stay_single_pass() {
+        // Port 9 (discard) on localhost refuses the connection immediately.
+        let unreachable = "http://127.0.0.1:9/api/v1/models";
+        assert_eq!(
+            SummaryService::select_context_budget(&LLMProvider::OpenRouter, "any/model", None, unreachable)
+                .await,
+            Ok(None)
+        );
+        for provider in [
+            LLMProvider::OpenAI,
+            LLMProvider::Claude,
+            LLMProvider::Groq,
+            LLMProvider::CustomOpenAI,
+        ] {
+            assert_eq!(
+                SummaryService::select_context_budget(&provider, "model", None, unreachable).await,
+                Ok(None)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn builtin_budget_comes_from_the_model_registry() {
+        let unused = "http://127.0.0.1:9/";
+        assert_eq!(
+            SummaryService::select_context_budget(&LLMProvider::BuiltInAI, "qwen3.5:4b", None, unused)
+                .await,
+            Ok(Some(ContextBudget::for_builtin(32_768, models::DEFAULT_MAX_TOKENS)))
+        );
+        assert!(
+            SummaryService::select_context_budget(&LLMProvider::BuiltInAI, "nope", None, unused)
+                .await
+                .is_err()
+        );
     }
 }

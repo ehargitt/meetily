@@ -33,6 +33,7 @@ export interface TranscriptUpdate {
   audio_start_time: number; // Seconds from recording start
   audio_end_time: number;   // Seconds from recording start
   duration: number;          // Segment duration in seconds
+  session_id?: number;       // Transcription session that produced the segment
 }
 
 export interface Block {
@@ -84,6 +85,7 @@ export interface SummaryDataResponse {
   summary_json?: BlockNoteBlock[];
   reasoning_stripped?: boolean;
   normalization_fallback?: boolean;
+  combine_truncated?: boolean;
   // Legacy format fields
   MeetingName?: string;
   _section_order?: string[];

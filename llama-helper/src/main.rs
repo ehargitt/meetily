@@ -278,6 +278,53 @@ fn get_default_gpu_layers(model_path: &PathBuf, context_size: u32) -> u32 {
 // Model State Management
 // ============================================================================
 
+/// Most prompt tokens decoded per llama_decode call (llama.cpp's default n_batch). Longer
+/// prompts are decoded in several batches.
+const PROMPT_BATCH_TOKENS: u32 = 2048;
+
+/// One prompt token's place in a decode batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PromptSlot {
+    /// Index into the prompt, which is also its position in the sequence.
+    position: usize,
+    /// Only the prompt's last token requests logits; sampling reads them from the last slot
+    /// of the final batch (`batch.n_tokens() - 1`).
+    logits: bool,
+}
+
+/// Splits a `prompt_len`-token prompt into consecutive decode batches of at most `n_batch`.
+fn prompt_batch_plan(prompt_len: usize, n_batch: usize) -> Vec<Vec<PromptSlot>> {
+    (0..prompt_len)
+        .step_by(n_batch.max(1))
+        .map(|start| {
+            (start..(start + n_batch).min(prompt_len))
+                .map(|position| PromptSlot {
+                    position,
+                    logits: position + 1 == prompt_len,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// How many tokens may follow a `prompt_tokens`-long prompt: `max_tokens`, cut short so prompt
+/// and output together stay inside the `n_ctx` window. Fails when the prompt leaves no room.
+fn generation_limit(prompt_tokens: usize, n_ctx: u32, max_tokens: i32) -> Result<i32> {
+    let n_ctx = n_ctx as usize;
+    if prompt_tokens == 0 {
+        anyhow::bail!("prompt tokenized to nothing");
+    }
+    if prompt_tokens >= n_ctx {
+        anyhow::bail!(
+            "prompt is {} tokens but the context window is {} tokens",
+            prompt_tokens,
+            n_ctx
+        );
+    }
+    let room = (n_ctx - prompt_tokens).min(i32::MAX as usize) as i32;
+    Ok(room.min(max_tokens.max(0)))
+}
+
 struct ModelState {
     backend: LlamaBackend,
     model: Option<LlamaModel>,
@@ -364,40 +411,45 @@ impl ModelState {
             })
             .unwrap_or(2);
 
+        let n_batch = self.context_size.min(PROMPT_BATCH_TOKENS);
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(Some(
                 NonZeroU32::new(self.context_size).context("Invalid ctx size")?,
             ))
-            .with_n_batch(self.context_size)
+            .with_n_batch(n_batch)
             .with_n_threads(threads)
             .with_n_threads_batch(threads);
-
-        let mut ctx = model
-            .new_context(&self.backend, ctx_params)
-            .context("unable to create the llama_context")?;
 
         let tokens_list = model
             .str_to_token(&prompt, AddBos::Always)
             .with_context(|| "failed to tokenize prompt")?;
 
         eprintln!("📝 Tokenized prompt: {} tokens", tokens_list.len());
-
-        // Use context size for batch capacity to handle long prompts
-        let batch_size = self.context_size as usize;
-        let mut batch = LlamaBatch::new(batch_size, 1);
-
-        let last_index: i32 = (tokens_list.len() - 1) as i32;
-        for (i, token) in (0_i32..).zip(tokens_list.into_iter()) {
-            let is_last = i == last_index;
-            batch
-                .add(token, i, &[0], is_last)
-                .context("Failed to add token to batch")?;
+        let max_new_tokens = generation_limit(tokens_list.len(), self.context_size, max_tokens)?;
+        if max_new_tokens < max_tokens {
+            eprintln!(
+                "⚠️ Output limited to {} tokens by the {}-token context window",
+                max_new_tokens, self.context_size
+            );
         }
 
-        ctx.decode(&mut batch).context("llama_decode() failed")?;
+        let mut ctx = model
+            .new_context(&self.backend, ctx_params)
+            .context("unable to create the llama_context")?;
+
+        let mut batch = LlamaBatch::new(n_batch as usize, 1);
+        for prompt_batch in prompt_batch_plan(tokens_list.len(), n_batch as usize) {
+            batch.clear();
+            for slot in prompt_batch {
+                batch
+                    .add(tokens_list[slot.position], slot.position as i32, &[0], slot.logits)
+                    .context("Failed to add token to batch")?;
+            }
+            ctx.decode(&mut batch).context("llama_decode() failed")?;
+        }
         let prompt_time = start_time.elapsed();
 
-        let n_prompt_tokens = batch.n_tokens();
+        let n_prompt_tokens = tokens_list.len() as i32;
         let mut n_cur = n_prompt_tokens;
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut output = String::new();
@@ -449,8 +501,8 @@ impl ModelState {
 
         loop {
             // Check if we've generated enough tokens
-            if (n_cur - n_prompt_tokens) >= max_tokens {
-                eprintln!("✓ Reached max_tokens limit");
+            if (n_cur - n_prompt_tokens) >= max_new_tokens {
+                eprintln!("✓ Reached the output token limit ({})", max_new_tokens);
                 break;
             }
 
@@ -746,5 +798,46 @@ mod tests {
         assert_eq!(sampling.repeat_penalty, 1.05);
         assert_eq!(sampling.penalty_last_n, 256);
         assert!(sampling.uses_penalties());
+    }
+
+    #[test]
+    fn generation_stops_before_the_context_window_fills() {
+        assert_eq!(generation_limit(1000, 32_768, 4096).unwrap(), 4096);
+        assert_eq!(generation_limit(30_000, 32_768, 4096).unwrap(), 2768);
+        assert_eq!(generation_limit(32_767, 32_768, 4096).unwrap(), 1);
+    }
+
+    #[test]
+    fn prompt_batches_cover_every_position_once_with_logits_only_on_the_last() {
+        let plan = prompt_batch_plan(5000, 2048);
+
+        assert_eq!(plan.iter().map(Vec::len).collect::<Vec<_>>(), vec![2048, 2048, 904]);
+        let positions: Vec<usize> = plan.iter().flatten().map(|slot| slot.position).collect();
+        assert_eq!(positions, (0..5000).collect::<Vec<_>>());
+        let with_logits: Vec<PromptSlot> = plan.iter().flatten().copied().filter(|slot| slot.logits).collect();
+        assert_eq!(with_logits, vec![PromptSlot { position: 4999, logits: true }]);
+        // Sampling reads index n_tokens - 1 of the final batch: that must be the logits slot.
+        assert!(plan.last().unwrap().last().unwrap().logits);
+    }
+
+    #[test]
+    fn short_and_exact_multiple_prompts_plan_correctly() {
+        let single = prompt_batch_plan(3, 2048);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].iter().filter(|slot| slot.logits).count(), 1);
+        assert!(single[0][2].logits);
+
+        let exact = prompt_batch_plan(4096, 2048);
+        assert_eq!(exact.len(), 2);
+        assert!(exact[1][2047].logits);
+        assert!(!exact[0][2047].logits);
+    }
+
+    #[test]
+    fn prompts_that_fill_the_context_window_are_rejected() {
+        let error = generation_limit(32_768, 32_768, 4096).unwrap_err().to_string();
+        assert!(error.contains("32768 tokens"), "{error}");
+        assert!(generation_limit(40_000, 32_768, 4096).is_err());
+        assert!(generation_limit(0, 32_768, 4096).is_err());
     }
 }

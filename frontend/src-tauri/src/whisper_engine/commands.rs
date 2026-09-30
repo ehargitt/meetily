@@ -134,6 +134,15 @@ pub async fn whisper_load_model(
     };
 
     if let Some(engine) = engine {
+        // Switching models unloads the one a recording (or its stop drain) is transcribing with.
+        if crate::audio::recording_commands::transcription_engine_in_use()
+            && engine.get_current_model().await.as_deref() != Some(model_name.as_str())
+        {
+            return Err(crate::audio::recording_commands::engine_in_use_error(
+                "switch the transcription model",
+            ));
+        }
+
         // FIX 6: Emit model loading started event
         if let Err(e) = app_handle.emit(
             "model-loading-started",

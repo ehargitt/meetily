@@ -168,16 +168,6 @@ pub async fn generate_with_builtin(
         global_manager.clone().unwrap()
     };
 
-    // Ensure sidecar is running with this model
-    manager.ensure_running(model_path.clone()).await?;
-
-    // Check cancellation after sidecar startup
-    if let Some(token) = cancellation_token {
-        if token.is_cancelled() {
-            return Err(anyhow!("Generation cancelled during sidecar startup"));
-        }
-    }
-
     // Prepare generation request with model-specific sampling parameters
     let sampling = model_def.sampling.sanitize_for_llama_helper();
     let request = Request::Generate {
@@ -197,29 +187,16 @@ pub async fn generate_with_builtin(
 
     let request_json = serde_json::to_string(&request)?;
 
-    // Send request with timeout
+    // Send request with timeout; the sidecar is (re)spawned for this model as needed
     let timeout = Duration::from_secs(models::GENERATION_TIMEOUT_SECS);
 
     log::info!("Sending generation request to sidecar");
 
-    // Race between send_request and cancellation token
-    let response_json = if let Some(token) = cancellation_token {
-        tokio::select! {
-            result = manager.send_request(request_json, timeout) => {
-                result?
-            }
-            _ = token.cancelled() => {
-                log::warn!("Generation cancelled by user, shutting down sidecar");
-                // Shutdown sidecar to stop generation immediately
-                if let Err(e) = manager.shutdown().await {
-                    log::error!("Failed to shutdown sidecar during cancellation: {}", e);
-                }
-                return Err(anyhow!("Generation cancelled by user"));
-            }
-        }
-    } else {
-        manager.send_request(request_json, timeout).await?
-    };
+    // Cancellation stops only this request: the sidecar is shut down only if it was generating
+    // for it, not while it serves another summary ahead in the queue
+    let response_json = manager
+        .request(model_path, request_json, timeout, cancellation_token)
+        .await?;
 
     // Check cancellation before parsing response
     if let Some(token) = cancellation_token {

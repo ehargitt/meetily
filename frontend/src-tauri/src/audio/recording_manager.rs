@@ -9,7 +9,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use super::devices::AudioDevice;
 
-use super::recording_state::{RecordingState, AudioChunk};
+use super::recording_state::{RecordingState, AudioChunk, DeviceType as RecordingDeviceType};
 use super::pipeline::AudioPipelineManager;
 use super::stream::AudioStreamManager;
 use super::recording_saver::RecordingSaver;
@@ -223,15 +223,16 @@ impl RecordingManager {
     ///
     /// # Arguments
     /// * `microphone_device` - Optional microphone device to use
-    /// * `system_device` - Optional system audio device to use
+    /// * `system_device` - System audio device, or why none could be resolved
     /// * `auto_save` - Whether to save audio checkpoints (true) or just transcripts/metadata (false)
     pub(crate) async fn start_recording(
         &mut self,
         microphone_device: Option<Arc<AudioDevice>>,
-        system_device: Option<Arc<AudioDevice>>,
+        system_audio: std::result::Result<Arc<AudioDevice>, String>,
         auto_save: bool,
     ) -> std::result::Result<mpsc::UnboundedReceiver<AudioChunk>, RecordingStartError> {
         info!("Starting recording manager (auto_save: {})", auto_save);
+        let system_device = system_audio.as_ref().ok().cloned();
 
         // Set up transcription channel
         let (transcription_sender, transcription_receiver) = mpsc::unbounded_channel::<AudioChunk>();
@@ -287,7 +288,7 @@ impl RecordingManager {
 
         // Start audio streams - they send RAW unmixed chunks to pipeline for mixing
         // Pipeline handles mixing and distribution to both recording and transcription
-        self.stream_manager.start_streams(microphone_device.clone(), system_device.clone(), None).await?;
+        self.stream_manager.start_streams(microphone_device.clone(), system_audio, None).await?;
 
         // Start device monitoring to detect disconnects
         if let Some(ref mut monitor) = self.device_monitor {
@@ -318,9 +319,7 @@ impl RecordingManager {
         self.state.stop_recording();
 
         // Stop audio streams
-        if let Err(e) = self.stream_manager.stop_streams() {
-            error!("Error stopping audio streams: {}", e);
-        }
+        self.stream_manager.stop_streams().await;
 
         // Stop audio pipeline
         if let Err(e) = self.pipeline_manager.stop().await {
@@ -346,9 +345,7 @@ impl RecordingManager {
         self.state.stop_recording();
 
         // Stop audio streams immediately
-        if let Err(e) = self.stream_manager.stop_streams() {
-            error!("Error stopping audio streams: {}", e);
-        }
+        self.stream_manager.stop_streams().await;
 
         // CRITICAL: Force pipeline to flush ALL accumulated audio before stopping
         debug!("💨 Forcing pipeline to flush accumulated audio immediately");
@@ -402,9 +399,7 @@ impl RecordingManager {
         self.state.stop_recording();
 
         // Stop audio streams
-        if let Err(e) = self.stream_manager.stop_streams() {
-            error!("Error stopping audio streams: {}", e);
-        }
+        self.stream_manager.stop_streams().await;
 
         // Stop audio pipeline
         if let Err(e) = self.pipeline_manager.stop().await {
@@ -496,12 +491,12 @@ impl RecordingManager {
         self.stream_manager.active_stream_count()
     }
 
-    /// Set error callback for handling errors
-    pub fn set_error_callback<F>(&self, callback: F)
+    /// Set the callback that reports stream health changes to the frontend
+    pub fn set_health_callback<F>(&self, callback: F)
     where
-        F: Fn(&super::recording_state::AudioError) + Send + Sync + 'static,
+        F: Fn(super::recording_state::StreamHealthEvent) + Send + Sync + 'static,
     {
-        self.state.set_error_callback(callback);
+        self.state.set_health_callback(callback);
     }
 
     /// Check if there's a fatal error
@@ -545,9 +540,7 @@ impl RecordingManager {
             self.state.stop_recording();
 
             // Stop audio streams
-            if let Err(e) = self.stream_manager.stop_streams() {
-                error!("Error stopping audio streams during cleanup: {}", e);
-            }
+            self.stream_manager.stop_streams().await;
 
             // Stop audio pipeline
             if let Err(e) = self.pipeline_manager.stop().await {
@@ -568,34 +561,40 @@ impl RecordingManager {
         self.device_event_receiver.take()
     }
 
-    /// Take the mic stream OUT for hot-swap (Phase 1) so the caller can tear it
-    /// down without holding RECORDING_MANAGER. System audio continues uninterrupted.
-    pub fn take_mic_stream_for_swap(&mut self) -> Option<super::stream::AudioStream> {
-        self.stream_manager.take_mic_stream()
+    /// Take a stream OUT for a rebuild or hot-swap (Phase 1) so the caller can
+    /// tear it down without holding RECORDING_MANAGER. The other stream
+    /// continues uninterrupted.
+    pub fn take_stream_for_rebuild(
+        &mut self,
+        device_type: RecordingDeviceType,
+    ) -> Option<super::stream::AudioStream> {
+        self.stream_manager.take_stream(device_type)
     }
 
-    /// Set new mic stream and update device state after hot-swap (Phase 3).
-    pub fn set_mic_stream_after_swap(
+    /// Install a rebuilt stream and update device state (Phase 3).
+    pub fn install_rebuilt_stream(
         &mut self,
+        device_type: RecordingDeviceType,
         stream: super::stream::AudioStream,
         device: Arc<AudioDevice>,
-        system_name: Option<String>,
     ) {
-        self.stream_manager.set_mic_stream(stream);
-        // Notify the device monitor so it tracks the new mic (and updated
-        // system output) instead of the dead ones (M8 fix). BT devices like
-        // AirPods are often both mic AND speaker — when they disconnect, both
-        // monitor entries go stale. `system_name` is the *current* default
-        // output, resolved lock-free in Phase 2 by the caller (do_mic_swap)
-        // so a CoreAudio stall can't happen under the RECORDING_MANAGER lock;
-        // `state.get_system_device()` still holds the pre-swap
-        // reference (e.g. AirPods) because we don't mutate system_device
-        // during a mic-only hot-swap, which would leave the monitor tracking
-        // the dead name and spamming "missing for N checks".
-        if let Some(ref monitor) = self.device_monitor {
-            monitor.notify_mic_swapped(device.name.clone(), system_name);
+        self.stream_manager.set_stream(device_type, stream);
+        match device_type {
+            RecordingDeviceType::Microphone => {
+                // Tell the device monitor to track the new mic instead of the dead
+                // one (M8 fix). The system entry is re-sent unchanged: a mic swap
+                // does not touch the system stream.
+                if let Some(ref monitor) = self.device_monitor {
+                    let system_name = self.state.get_system_device().map(|d| d.name.clone());
+                    monitor.notify_mic_swapped(device.name.clone(), system_name);
+                }
+                self.state.set_microphone_device(device);
+            }
+            RecordingDeviceType::System => self.state.set_system_device(device),
         }
-        self.state.set_microphone_device(device);
+        self.state
+            .stream_health(device_type)
+            .mark_running(std::time::Instant::now(), true);
     }
 
     /// Get reference to recording state for external access

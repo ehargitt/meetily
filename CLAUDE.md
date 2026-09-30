@@ -94,7 +94,7 @@ Raw Audio (Mic + System)
     RecordingSaver.save()      WhisperEngine.transcribe()
 ```
 
-**Key Insight**: The pipeline performs **professional audio mixing** (RMS-based ducking, clipping prevention) for recording, while simultaneously applying **Voice Activity Detection (VAD)** to send only speech segments to Whisper for transcription.
+**Key Insight**: The pipeline performs **professional audio mixing** (mic and system summed without ducking, samples clamped to ±1.0) for recording, while simultaneously applying **Voice Activity Detection (VAD)** to send only speech segments to Whisper for transcription.
 
 ### Audio Device Modularization (Recently Completed)
 
@@ -196,8 +196,8 @@ pub async fn load_model(&self, model_name: &str) -> Result<()> {
 
 **Ring Buffer Mixing** (pipeline.rs):
 - Mic and system audio arrive asynchronously at different rates
-- Ring buffer accumulates samples until both streams have aligned windows (50ms)
-- Professional mixing applies RMS-based ducking to prevent system audio from drowning out microphone
+- Ring buffer (`pipeline/mixer_ring_buffer.rs`) places both streams on one capture-time timeline and mixes a 600ms window only when both streams hold a full window; a stream is padded with silence only when it is starved (nothing delivered for >500ms while the other stream captured audio — i.e. stalled, dead, or absent). Chunks are placed by continuity; a lateness that persists for 150ms is treated as a real capture gap and silence is inserted retroactively where the samples went missing, so a backlog delivered after a capture-thread stall loses no audio. A stream that starts late or resumes after a stall is re-anchored by capture time, and drift or residual misalignment that stays beyond a 5ms deadband for 2s is corrected (down to within 1ms) by at most 1ms per chunk (the stream running ahead drops samples, the lagging one repeats the first sample of its incoming chunk), so mic and system audio stay aligned without audible cuts
+- Mixing sums mic and system samples (no ducking) and clamps any sample above ±1.0 to prevent clipping
 - Uses `VecDeque` for efficient windowed processing
 
 ### 2. Thread Safety and Async Boundaries
@@ -274,7 +274,7 @@ macro_rules! perf_debug {
 
 Key components:
 - `AudioMixerRingBuffer`: Manages mic + system audio synchronization
-- `ProfessionalAudioMixer`: RMS-based ducking and mixing
+- `ProfessionalAudioMixer`: sums mic + system, clamping samples to ±1.0 (no ducking)
 - `AudioPipelineManager`: Orchestrates VAD, mixing, and distribution
 
 **Testing Audio Changes**:
@@ -368,7 +368,7 @@ $env:RUST_LOG="debug"; ./clean_run_windows.bat
    - Windows: WASAPI exclusive mode can conflict with other apps
    - System audio requires virtual device (BlackHole on macOS, WASAPI loopback on Windows)
 
-3. **Whisper Model Loading**: Models are loaded once and cached. Changing models requires app restart or manual unload/reload.
+3. **Whisper Model Loading**: Models are loaded once and cached. Changing models requires app restart or manual unload/reload. While a recording is live, stopping, or its transcription is still draining in the background (`transcription_engine_in_use()` in `audio/recording_commands.rs`), changing the transcription model or provider, re-transcribing and importing audio are refused with an error, and the model unload after a batch job is skipped.
 
 4. **No Separate Backend Dependency**: Meeting persistence, transcription, and LLM features are handled by the Tauri app. Do not reintroduce the archived FastAPI backend as a supported requirement.
 

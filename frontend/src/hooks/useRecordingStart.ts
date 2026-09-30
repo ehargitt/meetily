@@ -4,6 +4,7 @@ import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useConfig } from '@/contexts/ConfigContext';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
+import { cancelPostSaveNavigation } from '@/hooks/useRecordingStop';
 import { recordingService } from '@/services/recordingService';
 import Analytics from '@/lib/analytics';
 import { showRecordingNotification } from '@/lib/recordingNotification';
@@ -152,8 +153,16 @@ export function useRecordingStart(
       const randomTitle = generateMeetingTitle();
       setMeetingTitle(randomTitle);
 
+      // Only a start that passed the model check drops the pending
+      // navigation to the meeting just saved.
+      cancelPostSaveNavigation();
+
       // Set STARTING status before initiating backend recording
       setStatus(RecordingStatus.STARTING, 'Initializing recording...');
+
+      // Clear before the backend starts: segments can arrive before the
+      // start call resolves, and clearing afterwards would drop them.
+      clearTranscripts();
 
       // Start the actual backend recording
       console.log('Starting backend recording with meeting:', randomTitle);
@@ -168,7 +177,6 @@ export function useRecordingStart(
       // Note: RECORDING status will be set by RecordingStateContext event listener
       console.log('Setting isRecordingState to true');
       setIsRecording(true); // This will also update the sidebar via the useEffect
-      clearTranscripts(); // Clear previous transcripts when starting new recording
       setIsMeetingActive(true);
       Analytics.trackButtonClick('start_recording', 'home_page');
 
@@ -245,8 +253,10 @@ export function useRecordingStart(
             // Generate meeting title
             const generatedMeetingTitle = generateMeetingTitle();
 
+            cancelPostSaveNavigation(); // Model check passed: this start proceeds
             // Set STARTING status before initiating backend recording
             setStatus(RecordingStatus.STARTING, 'Initializing recording...');
+            clearTranscripts(); // Before start: early segments must not be wiped
 
             console.log('Auto-starting backend recording with meeting:', generatedMeetingTitle);
             const result = await recordingService.startRecordingWithDevices(
@@ -260,7 +270,6 @@ export function useRecordingStart(
             // Note: RECORDING status will be set by RecordingStateContext event listener
             setMeetingTitle(generatedMeetingTitle);
             setIsRecording(true);
-            clearTranscripts();
             setIsMeetingActive(true);
             Analytics.trackButtonClick('start_recording', 'sidebar_auto');
 
@@ -343,8 +352,10 @@ export function useRecordingStart(
         // Generate meeting title
         const generatedMeetingTitle = generateMeetingTitle();
 
+        cancelPostSaveNavigation(); // Model check passed: this start proceeds
         // Set STARTING status before initiating backend recording
         setStatus(RecordingStatus.STARTING, 'Initializing recording...');
+        clearTranscripts(); // Before start: early segments must not be wiped
 
         console.log('Starting backend recording with meeting:', generatedMeetingTitle);
         const result = await recordingService.startRecordingWithDevices(
@@ -358,7 +369,6 @@ export function useRecordingStart(
         // Note: RECORDING status will be set by RecordingStateContext event listener
         setMeetingTitle(generatedMeetingTitle);
         setIsRecording(true);
-        clearTranscripts();
         setIsMeetingActive(true);
         Analytics.trackButtonClick('start_recording', 'sidebar_direct');
 

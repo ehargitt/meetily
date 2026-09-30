@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use anyhow::Result;
@@ -9,7 +8,7 @@ use super::batch_processor::AudioMetricsBatcher;
 use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
 use super::devices::AudioDevice;
-use super::recording_state::{AudioChunk, AudioError, RecordingState, DeviceType};
+use super::recording_state::{AudioChunk, AudioError, ChunkSendError, RecordingState, DeviceType};
 use super::audio_processing::{audio_to_mono, LoudnessNormalizer, NoiseSuppressionProcessor, HighPassFilter};
 use super::vad::{ContinuousVadProcessor};
 
@@ -22,138 +21,12 @@ use super::vad::{ContinuousVadProcessor};
 /// length. The live path cannot: with continuous audio (e.g. a podcast played
 /// as system audio) a 2000ms redemption keeps one VAD segment open
 /// indefinitely, withholds live transcript emission, and overruns the
-/// accumulated-speech-buffer warning threshold. Bounded live segmentation
-/// during continuous speech is tracked separately in #756.
+/// accumulated-speech-buffer warning threshold. Continuous speech that never
+/// pauses is cut by the VAD itself at 30 s (#756).
 const VAD_REDEMPTION_TIME_MS: u32 = 500;
 
-/// Ring buffer for synchronized audio mixing
-/// Accumulates samples from mic and system streams until we have aligned windows
-struct AudioMixerRingBuffer {
-    mic_buffer: VecDeque<f32>,
-    system_buffer: VecDeque<f32>,
-    window_size_samples: usize,  // Fixed mixing window (e.g., 50ms)
-    max_buffer_size: usize,  // Safety limit (e.g., 100ms)
-}
-
-impl AudioMixerRingBuffer {
-    fn new(sample_rate: u32) -> Self {
-        // Use 50ms windows for mixing
-        let window_ms = 600.0;
-        let window_size_samples = (sample_rate as f32 * window_ms / 1000.0) as usize;
-
-        // CRITICAL FIX: Increase max buffer to 400ms for system audio stability
-        // System audio (especially Core Audio on macOS) can have significant jitter
-        // due to sample-by-sample streaming → batching → channel transmission
-        // Accounts for: RNNoise buffering + Core Audio jitter + processing delays
-        let max_buffer_size = window_size_samples * 8;  // 400ms (was 200ms)
-
-        info!("🔊 Ring buffer initialized: window={}ms ({} samples), max={}ms ({} samples)",
-              window_ms, window_size_samples,
-              window_ms * 8.0, max_buffer_size);
-
-        Self {
-            mic_buffer: VecDeque::with_capacity(max_buffer_size),
-            system_buffer: VecDeque::with_capacity(max_buffer_size),
-            window_size_samples,
-            max_buffer_size,
-        }
-    }
-
-    fn add_samples(&mut self, device_type: DeviceType, samples: Vec<f32>) {
-        // Log buffer health periodically for diagnostics
-        static mut SAMPLE_COUNTER: u64 = 0;
-        unsafe {
-            SAMPLE_COUNTER += 1;
-            if SAMPLE_COUNTER % 200 == 0 {
-                debug!("📊 Ring buffer status: mic={} samples, sys={} samples (max={})",
-                       self.mic_buffer.len(), self.system_buffer.len(), self.max_buffer_size);
-            }
-        }
-
-        match device_type {
-            DeviceType::Microphone => self.mic_buffer.extend(samples),
-            DeviceType::System => self.system_buffer.extend(samples),
-        }
-
-        // CRITICAL FIX: Add warnings before dropping samples
-        // This helps diagnose timing issues in production
-        if self.mic_buffer.len() > self.max_buffer_size {
-            warn!("⚠️ Microphone buffer overflow: {} > {} samples, dropping oldest {} samples",
-                  self.mic_buffer.len(), self.max_buffer_size,
-                  self.mic_buffer.len() - self.max_buffer_size);
-        }
-        if self.system_buffer.len() > self.max_buffer_size {
-            error!("🔴 SYSTEM AUDIO BUFFER OVERFLOW: {} > {} samples, dropping {} samples - THIS CAUSES DISTORTION!",
-                  self.system_buffer.len(), self.max_buffer_size,
-                  self.system_buffer.len() - self.max_buffer_size);
-        }
-
-        // Safety: prevent buffer overflow (keep only last 200ms)
-        while self.mic_buffer.len() > self.max_buffer_size {
-            self.mic_buffer.pop_front();
-        }
-        while self.system_buffer.len() > self.max_buffer_size {
-            self.system_buffer.pop_front();
-        }
-    }
-
-    fn can_mix(&self) -> bool {
-        self.mic_buffer.len() >= self.window_size_samples ||
-        self.system_buffer.len() >= self.window_size_samples
-    }
-
-    fn extract_window(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
-        if !self.can_mix() {
-            return None;
-        }
-
-        // Extract mic window with zero-padding for incomplete buffers
-        // Zero-padding (silence) is preferred over last-sample-hold to prevent artifacts
-
-        // Extract mic window (or pad with zeros if insufficient data)
-        let mic_window = if self.mic_buffer.len() >= self.window_size_samples {
-            // Enough mic data - drain window
-            self.mic_buffer.drain(0..self.window_size_samples).collect()
-        } else if !self.mic_buffer.is_empty() {
-            // Some mic data but not enough - consume all + pad with zeros
-            let available: Vec<f32> = self.mic_buffer.drain(..).collect();
-            let mut padded = Vec::with_capacity(self.window_size_samples);
-            padded.extend_from_slice(&available);
-
-            // Use zero-padding (silence) to prevent repetition artifacts
-            // Zero-padding is inaudible at 48kHz sample rate
-            padded.resize(self.window_size_samples, 0.0);
-
-            padded
-        } else {
-            // No mic data - return silence
-            vec![0.0; self.window_size_samples]
-        };
-
-        // Extract system window (or pad with zeros if insufficient data)
-        let sys_window = if self.system_buffer.len() >= self.window_size_samples {
-            // Enough system data - drain window
-            self.system_buffer.drain(0..self.window_size_samples).collect()
-        } else if !self.system_buffer.is_empty() {
-            // Some system data but not enough - consume all + pad with zeros
-            let available: Vec<f32> = self.system_buffer.drain(..).collect();
-            let mut padded = Vec::with_capacity(self.window_size_samples);
-            padded.extend_from_slice(&available);
-
-            // Use zero-padding (silence) to prevent repetition artifacts
-            // Zero-padding is inaudible at 48kHz sample rate
-            padded.resize(self.window_size_samples, 0.0);
-
-            padded
-        } else {
-            // No system data - return silence
-            vec![0.0; self.window_size_samples]
-        };
-
-        Some((mic_window, sys_window))
-    }
-
-}
+mod mixer_ring_buffer;
+use mixer_ring_buffer::AudioMixerRingBuffer;
 
 /// Simple audio mixer without aggressive ducking
 /// Combines mic + system audio with basic clipping prevention
@@ -397,6 +270,8 @@ impl AudioCapture {
 
     /// Process audio data directly from callback
     pub fn process_audio_data(&self, data: &[f32]) {
+        self.state.note_stream_callback(self.device_type);
+
         // Check if still recording
         if !self.state.is_recording() {
             return;
@@ -615,8 +490,9 @@ impl AudioCapture {
         //     }
         // }
 
-        // Use global recording timestamp for proper synchronization
-        let timestamp = self.state.get_recording_duration().unwrap_or(0.0);
+        // Capture time on the session's active (pause-excluded) clock, shared by
+        // both streams; the mixer aligns them on it.
+        let timestamp = self.state.get_active_recording_duration().unwrap_or(0.0);
 
         // RAW AUDIO CHUNK: No gain applied - will be mixed and gained downstream
         // Use 48kHz if we resampled, otherwise use original rate
@@ -634,34 +510,21 @@ impl AudioCapture {
         // Individual raw streams go only to the transcription pipeline below
 
         // Send to processing pipeline for transcription
-        if let Err(e) = self.state.send_audio_chunk(audio_chunk) {
-            // Check if this is the "pipeline not ready" error
-            if e.to_string().contains("Audio pipeline not ready") {
-                // This is expected during initialization, just log it as debug
-                debug!("Audio pipeline not ready yet, skipping chunk {}", chunk_id);
-                return;
-            }
-
-            warn!("Failed to send audio chunk: {}", e);
-            // More specific error handling based on failure reason
-            let error = if e.to_string().contains("channel closed") {
-                AudioError::ChannelClosed
-            } else if e.to_string().contains("full") {
-                AudioError::BufferOverflow
-            } else {
-                AudioError::ProcessingFailed
-            };
-            self.state.report_error(error);
-        } else {
-            debug!("Sent audio chunk {} ({} samples)", chunk_id, data.len());
+        match self.state.send_audio_chunk(audio_chunk) {
+            Ok(()) => debug!("Sent audio chunk {} ({} samples)", chunk_id, data.len()),
+            // Expected while the pipeline starts or after stop detached it
+            Err(ChunkSendError::NotReady) => debug!("Audio pipeline not ready yet, skipping chunk {}", chunk_id),
+            // Logged with a rate limit and reported to the UI once
+            Err(ChunkSendError::PipelineClosed) => self.state.report_pipeline_closed(),
         }
     }
 
-    /// Handle stream errors with enhanced disconnect detection
+    /// Handle a cpal stream error. Logging is rate-limited and a stream with
+    /// persistent errors is handed to the session supervisor for rebuilding;
+    /// the recording itself is never stopped from here.
     pub fn handle_stream_error(&self, error: cpal::StreamError) {
-        error!("Audio stream error for {}: {}", self.device.name, error);
-
-        let error_str = error.to_string().to_lowercase();
+        let detail = error.to_string();
+        let error_str = detail.to_lowercase();
 
         // Enhanced error detection for device disconnection
         let audio_error = if error_str.contains("device is no longer available")
@@ -671,22 +534,24 @@ impl AudioCapture {
             || error_str.contains("device unavailable")
             || error_str.contains("device removed")
         {
-            warn!("🔌 Device disconnect detected for: {}", self.device.name);
             AudioError::DeviceDisconnected
         } else if error_str.contains("permission") || error_str.contains("access denied") {
             AudioError::PermissionDenied
-        } else if error_str.contains("channel closed") {
-            AudioError::ChannelClosed
-        } else if error_str.contains("stream") && error_str.contains("failed") {
-            AudioError::StreamFailed
         } else {
-            warn!("Unknown audio error: {}", error);
             AudioError::StreamFailed
         };
 
-        self.state.report_error(audio_error);
+        let outcome = self.state.report_stream_error(self.device_type, &self.device.name, audio_error, &detail);
+        if outcome.already_dead {
+            // cpal's ALSA worker re-polls a broken PCM in a tight loop and calls
+            // this again immediately. Throttle the spin until the rebuild drops it.
+            std::thread::sleep(DEAD_STREAM_ERROR_BACKOFF);
+        }
     }
 }
+
+/// How long the error callback of an already-dead stream sleeps per call.
+const DEAD_STREAM_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// VAD-driven audio processing pipeline
 /// Uses Voice Activity Detection to segment speech in real-time and send only speech to Whisper
@@ -707,6 +572,8 @@ pub struct AudioPipeline {
     mixer: ProfessionalAudioMixer,
     // Recording sender for pre-mixed audio
     recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
+    // Capture time of the latest chunk, stamped on the audio flushed at stop
+    last_chunk_timestamp: f64,
 }
 
 impl AudioPipeline {
@@ -753,8 +620,7 @@ impl AudioPipeline {
         // batch value (2000ms, `import.rs`/`retranscription.rs`) was tried here
         // first, but under continuous system audio it kept a VAD segment open
         // indefinitely and withheld live transcript emission, so live and batch
-        // deliberately diverge. Bounded live segments under continuous speech
-        // are tracked in #756.
+        // deliberately diverge. Continuous speech is cut at 30 s by the VAD (#756).
         let vad_processor =
             ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS)?;
         info!(
@@ -785,6 +651,7 @@ impl AudioPipeline {
             ring_buffer,
             mixer,
             recording_sender_for_mixed: None,  // Will be set by manager
+            last_chunk_timestamp: 0.0,
         })
     }
 
@@ -842,66 +709,14 @@ impl AudioPipeline {
                     // STEP 1: Add raw audio to ring buffer for mixing
                     // Microphone audio is already normalized at capture level (AudioCapture)
                     // System audio remains raw
-                    self.ring_buffer.add_samples(chunk.device_type.clone(), chunk.data);
+                    self.ring_buffer.add_samples(chunk.device_type, &chunk.data, chunk.timestamp);
+                    self.last_chunk_timestamp = chunk.timestamp;
 
                     // STEP 2: Mix audio in fixed windows when both streams have sufficient data
-                    while self.ring_buffer.can_mix() {
-                        if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
-                            // Simple mixing without aggressive ducking
-                            let mixed_clean = self.mixer.mix_window(&mic_window, &sys_window);
-
-                            // NO POST-GAIN NEEDED: Microphone already normalized by EBU R128 to -23 LUFS
-                            // This is broadcast-standard loudness (Netflix/YouTube/Spotify level)
-                            // System audio at natural levels
-                            // Previous 2x gain was causing excessive limiting/distortion
-                            let mixed_with_gain = mixed_clean;
-
-                            // STEP 3: Send mixed audio for transcription (VAD + Whisper)
-                            match self.vad_processor.process_audio(&mixed_with_gain) {
-                                Ok(speech_segments) => {
-                                    for segment in speech_segments {
-                                        let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
-
-                                        if segment.samples.len() >= 800 {  // Minimum 50ms at 16kHz - matches Parakeet capability
-                                            info!("📤 Sending VAD segment: {:.1}ms, {} samples",
-                                                  duration_ms, segment.samples.len());
-
-                                            let transcription_chunk = AudioChunk {
-                                                data: segment.samples,
-                                                sample_rate: 16000,
-                                                timestamp: segment.start_timestamp_ms / 1000.0,
-                                                chunk_id: self.chunk_id_counter,
-                                                device_type: DeviceType::Microphone,  // Mixed audio
-                                            };
-
-                                            if let Err(e) = self.transcription_sender.send(transcription_chunk) {
-                                                warn!("Failed to send VAD segment: {}", e);
-                                            } else {
-                                                self.chunk_id_counter += 1;
-                                            }
-                                        } else {
-                                            debug!("⏭️ Dropping short VAD segment: {:.1}ms ({} samples < 800)",
-                                                   duration_ms, segment.samples.len());
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("⚠️ VAD error: {}", e);
-                                }
-                            }
-
-                            // STEP 4: Send mixed audio for recording (WAV file)
-                            if let Some(ref sender) = self.recording_sender_for_mixed {
-                                let recording_chunk = AudioChunk {
-                                    data: mixed_with_gain.clone(),
-                                    sample_rate: self.sample_rate,
-                                    timestamp: chunk.timestamp,
-                                    chunk_id: self.chunk_id_counter,
-                                    device_type: DeviceType::Microphone,  // Mixed audio
-                                };
-                                let _ = sender.send(recording_chunk);
-                            }
-                        }
+                    while let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
+                        // Simple mixing without aggressive ducking
+                        let mixed = self.mixer.mix_window(&mic_window, &sys_window);
+                        self.dispatch_mixed(mixed, chunk.timestamp);
                     }
                 }
                 Ok(None) => {
@@ -922,8 +737,68 @@ impl AudioPipeline {
         Ok(())
     }
 
+    /// Send one mixed window to transcription (VAD) and to the recording.
+    fn dispatch_mixed(&mut self, mixed: Vec<f32>, timestamp: f64) {
+        // NO POST-GAIN: the microphone is already normalized by EBU R128 to -23 LUFS
+        // and system audio stays at natural levels.
+
+        // Send mixed audio for transcription (VAD + Whisper)
+        match self.vad_processor.process_audio(&mixed) {
+            Ok(speech_segments) => {
+                for segment in speech_segments {
+                    let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
+
+                    if segment.samples.len() >= 800 {  // Minimum 50ms at 16kHz - matches Parakeet capability
+                        info!("📤 Sending VAD segment: {:.1}ms, {} samples",
+                              duration_ms, segment.samples.len());
+
+                        let transcription_chunk = AudioChunk {
+                            data: segment.samples,
+                            sample_rate: 16000,
+                            timestamp: segment.start_timestamp_ms / 1000.0,
+                            chunk_id: self.chunk_id_counter,
+                            device_type: DeviceType::Microphone,  // Mixed audio
+                        };
+
+                        if let Err(e) = self.transcription_sender.send(transcription_chunk) {
+                            warn!("Failed to send VAD segment: {}", e);
+                        } else {
+                            self.chunk_id_counter += 1;
+                        }
+                    } else {
+                        debug!("⏭️ Dropping short VAD segment: {:.1}ms ({} samples < 800)",
+                               duration_ms, segment.samples.len());
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("⚠️ VAD error: {}", e);
+            }
+        }
+
+        // Send mixed audio for recording
+        if let Some(ref sender) = self.recording_sender_for_mixed {
+            let recording_chunk = AudioChunk {
+                data: mixed,
+                sample_rate: self.sample_rate,
+                timestamp,
+                chunk_id: self.chunk_id_counter,
+                device_type: DeviceType::Microphone,  // Mixed audio
+            };
+            let _ = sender.send(recording_chunk);
+        }
+    }
+
     fn flush_remaining_audio(&mut self) -> Result<()> {
         info!("Flushing remaining audio from pipeline (processed {} chunks)", self.processed_chunks);
+
+        // The last partial window (< 600 ms) never fills once capture stops;
+        // mix it now so the recording and the final VAD segment include it.
+        if let Some((mic_tail, sys_tail)) = self.ring_buffer.drain_remaining() {
+            debug!("Flushing {} buffered samples from the mix ring buffer", mic_tail.len());
+            let mixed = self.mixer.mix_window(&mic_tail, &sys_tail);
+            self.dispatch_mixed(mixed, self.last_chunk_timestamp);
+        }
 
         // Flush any remaining audio from VAD processor and send segments to transcription
         match self.vad_processor.flush() {
@@ -1107,9 +982,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_dead_pipeline_is_reported_once_without_stopping_capture() {
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        state.set_health_callback(move |event| sink.lock().unwrap().push(event));
+        let (sender, receiver) = mpsc::unbounded_channel();
+        state.set_audio_sender(sender);
+        drop(receiver); // the pipeline task died
+
+        let device = Arc::new(AudioDevice::new("mic".into(), super::super::devices::DeviceType::Input));
+        let capture = AudioCapture::new(device, state.clone(), 48_000, 1, DeviceType::System, None);
+        for _ in 0..100 {
+            capture.process_audio_data(&[0.0; 480]);
+        }
+
+        assert!(state.is_recording());
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "one recording-error, not one per buffer");
+        assert!(matches!(events[0], super::super::recording_state::StreamHealthEvent::CaptureFailed { .. }));
+    }
+
+    #[test]
     fn test_live_vad_redemption_matches_pro_policy() {
-        // Live uses the established 500ms pause policy; it does not bound
-        // uninterrupted speech. Batch import/retranscription use 2000ms.
+        // Live uses the established 500ms pause policy; uninterrupted speech is
+        // bounded separately by the VAD's 30 s cut. Batch import/retranscription use 2000ms.
         // See #679 and #756.
         assert_eq!(VAD_REDEMPTION_TIME_MS, 500);
     }

@@ -263,6 +263,13 @@ pub async fn start_import<R: Runtime>(
     // Acquire guard - ensures flag is cleared even on panic/early return
     let _guard = ImportGuard::acquire().map_err(|e| anyhow!(e))?;
 
+    // Re-checked here: a recording may have started since the command returned.
+    if super::recording_commands::transcription_engine_in_use() {
+        let error = super::recording_commands::engine_in_use_error("import audio");
+        let _ = app.emit("import-error", ImportError { error: error.clone() });
+        return Err(anyhow!(error));
+    }
+
     // Reset cancellation flag
     IMPORT_CANCELLED.store(false, Ordering::SeqCst);
 
@@ -974,6 +981,11 @@ pub async fn start_import_audio_command<R: Runtime>(
     // Check if import is already in progress (guard will be acquired in start_import)
     if IMPORT_IN_PROGRESS.load(Ordering::SeqCst) {
         return Err("Import already in progress".to_string());
+    }
+
+    // Loading its model would swap or unload the one a recording is transcribing with.
+    if super::recording_commands::transcription_engine_in_use() {
+        return Err(super::recording_commands::engine_in_use_error("import audio"));
     }
 
     // Spawn import in background

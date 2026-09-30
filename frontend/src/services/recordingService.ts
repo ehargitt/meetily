@@ -14,12 +14,50 @@ export interface RecordingState {
   is_active: boolean;
   recording_duration: number | null;
   active_duration: number | null;
+  /** Highest transcription session id issued in this app process; absent from older backends. */
+  last_session_id?: number | null;
 }
 
 export interface RecordingStoppedPayload {
   message: string;
   folder_path?: string;
   meeting_name?: string;
+}
+
+export interface RecordingStartedPayload {
+  message: string;
+  /** Transcription session of this recording; tags its transcript-update events. */
+  session_id?: number;
+}
+
+export type AudioStreamType = 'microphone' | 'system';
+
+export interface AudioStreamDegradedPayload {
+  device_type: AudioStreamType;
+  device_name: string;
+  reason: string;
+}
+
+export interface AudioStreamRecoveredPayload {
+  device_type: AudioStreamType;
+  device_name: string;
+}
+
+export interface SystemAudioUnavailablePayload {
+  device_name: string | null;
+  reason: string;
+}
+
+export interface RecordingStoppingPayload {
+  source: 'tray' | 'ui' | 'internal';
+}
+
+export interface RecordingStopFailedPayload {
+  message: string;
+}
+
+export interface RecordingSaveErrorPayload {
+  message: string;
 }
 
 // Bound the start invoke: > ~40s Bluetooth mic cold-start and ~90s worst-case
@@ -133,8 +171,10 @@ export class RecordingService {
    * @param callback - Function to call when recording starts
    * @returns Promise that resolves to unlisten function
    */
-  async onRecordingStarted(callback: () => void): Promise<UnlistenFn> {
-    return listen('recording-started', callback);
+  async onRecordingStarted(callback: (payload: RecordingStartedPayload) => void): Promise<UnlistenFn> {
+    return listen<RecordingStartedPayload>('recording-started', (event) => {
+      callback(event.payload);
+    });
   }
 
   /**
@@ -237,6 +277,84 @@ export class RecordingService {
    */
   async onMicRecoveryExhausted(callback: (payload: { device_name: string }) => void): Promise<UnlistenFn> {
     return listen<{ device_name: string }>('mic-recovery-exhausted', (event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for recording-stopping event (a backend stop has begun, from any source)
+   * @param callback - Function to call when a stop starts
+   * @returns Promise that resolves to unlisten function
+   */
+  async onRecordingStopping(callback: (payload: RecordingStoppingPayload) => void): Promise<UnlistenFn> {
+    return listen<RecordingStoppingPayload>('recording-stopping', (event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for recording-stop-failed event (the stop that emitted recording-stopping failed)
+   * @param callback - Function to call with the failure
+   * @returns Promise that resolves to unlisten function
+   */
+  async onRecordingStopFailed(callback: (payload: RecordingStopFailedPayload) => void): Promise<UnlistenFn> {
+    return listen<RecordingStopFailedPayload>('recording-stop-failed', (event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for recording-error event (no audio can be captured any more; the
+   * backend leaves the session open so the normal stop/save can run)
+   * @param callback - Function to call with the user-facing error message
+   * @returns Promise that resolves to unlisten function
+   */
+  async onRecordingError(callback: (message: string) => void): Promise<UnlistenFn> {
+    return listen<string>('recording-error', (event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for audio-stream-degraded event (a stream errored or stalled and is being rebuilt)
+   * @param callback - Function to call with the affected stream
+   * @returns Promise that resolves to unlisten function
+   */
+  async onAudioStreamDegraded(callback: (payload: AudioStreamDegradedPayload) => void): Promise<UnlistenFn> {
+    return listen<AudioStreamDegradedPayload>('audio-stream-degraded', (event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for audio-stream-recovered event (a rebuilt stream is delivering audio again)
+   * @param callback - Function to call with the recovered stream
+   * @returns Promise that resolves to unlisten function
+   */
+  async onAudioStreamRecovered(callback: (payload: AudioStreamRecoveredPayload) => void): Promise<UnlistenFn> {
+    return listen<AudioStreamRecoveredPayload>('audio-stream-recovered', (event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for system-audio-unavailable event (recording continues microphone-only)
+   * @param callback - Function to call with the failed device and reason
+   * @returns Promise that resolves to unlisten function
+   */
+  async onSystemAudioUnavailable(callback: (payload: SystemAudioUnavailablePayload) => void): Promise<UnlistenFn> {
+    return listen<SystemAudioUnavailablePayload>('system-audio-unavailable', (event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for recording-save-error event (an audio checkpoint or finalize write failed)
+   * @param callback - Function to call with the failure
+   * @returns Promise that resolves to unlisten function
+   */
+  async onRecordingSaveError(callback: (payload: RecordingSaveErrorPayload) => void): Promise<UnlistenFn> {
+    return listen<RecordingSaveErrorPayload>('recording-save-error', (event) => {
       callback(event.payload);
     });
   }
