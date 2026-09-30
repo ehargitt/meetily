@@ -123,10 +123,15 @@ export default function Home() {
       const result = await recoverMeeting(meetingId);
 
       if (result.success) {
-        toast.success('Meeting recovered successfully!', {
-          description: result.audioRecoveryStatus?.status === 'success'
+        const audioStatus = result.audioRecoveryStatus?.status;
+        // A failed audio merge keeps the checkpoint files: they are the only copy.
+        const notify = audioStatus === 'failed' ? toast.warning : toast.success;
+        notify(audioStatus === 'failed' ? 'Meeting recovered without its audio' : 'Meeting recovered successfully!', {
+          description: audioStatus === 'success'
             ? 'Transcripts and audio recovered'
-            : 'Transcripts recovered (no audio available)',
+            : audioStatus === 'failed'
+              ? 'The audio could not be rebuilt. Its checkpoint files were kept in the meeting folder.'
+              : 'Transcripts recovered (no audio available)',
           action: result.meetingId ? {
             label: 'View Meeting',
             onClick: () => {
