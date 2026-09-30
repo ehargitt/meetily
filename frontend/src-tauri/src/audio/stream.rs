@@ -128,17 +128,19 @@ impl AudioStream {
             recording_sender,
         );
 
-        // Build the appropriate stream based on sample format
-        let stream = Self::build_stream(&cpal_device, &config, capture.clone())?;
-
-        // Start the stream
-        stream.play()?;
+        // Building and starting the stream block inside cpal and can hang (a
+        // Bluetooth device mid-transition on macOS), so both run on a blocking
+        // thread that is abandoned after STREAM_OPEN_TIMEOUT. A hang here would
+        // otherwise hold the rebuild/swap guard of this stream type forever.
+        let backend = run_blocking_bounded(&device.name, STREAM_OPEN_TIMEOUT, move || {
+            let stream = Self::build_stream(&cpal_device, &config, capture)?;
+            stream.play()?;
+            Ok(StreamBackend::Cpal(stream))
+        })
+        .await?;
         info!("CPAL stream started for device: {}", device.name);
 
-        Ok(Self {
-            device,
-            backend: StreamBackend::Cpal(stream),
-        })
+        Ok(Self { device, backend })
     }
 
     /// Create a Core Audio stream (macOS only)
@@ -186,6 +188,7 @@ impl AudioStream {
         info!("🔊 Stream: Spawning tokio task to poll Core Audio stream...");
         let task = tokio::spawn({
             let capture = capture.clone();
+            let state = state.clone();
             let mut stream = core_stream;
 
             async move {
@@ -221,6 +224,18 @@ impl AudioStream {
                 }
 
                 info!("⚠️ Stream: Core Audio processing task ended for {}", device_name);
+
+                // The stream ended on its own (e.g. it shut itself down after
+                // its ring buffer kept overflowing). An intentional stop aborts
+                // this task at the await above and never reaches this line.
+                if state.is_recording() {
+                    state.report_stream_error(
+                        device_type,
+                        &device_name,
+                        super::recording_state::AudioError::DeviceDisconnected,
+                        "Core Audio stream ended",
+                    );
+                }
             }
         });
 
@@ -423,6 +438,27 @@ fn run_teardown_contained<F: FnOnce() -> Result<()>>(name: &str, teardown: F) ->
 /// Upper bound on one stream teardown before it is abandoned.
 const STREAM_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound on building and starting one cpal stream before it is abandoned.
+const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run blocking `work` on a blocking thread and wait at most `timeout` for it.
+/// On timeout the thread is abandoned (it cannot be cancelled); whatever it
+/// returns later is dropped there, which for a stream stops it.
+async fn run_blocking_bounded<T, F>(name: &str, timeout: Duration, work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(work)).await {
+        Ok(joined) => joined.map_err(|e| anyhow::anyhow!("Opening audio stream '{}' failed: {}", name, e))?,
+        Err(_) => Err(anyhow::anyhow!(
+            "Timed out after {:?} opening audio stream '{}' (audio driver not responding)",
+            timeout,
+            name
+        )),
+    }
+}
+
 /// Audio stream manager for handling multiple streams
 pub struct AudioStreamManager {
     microphone_stream: Option<AudioStream>,
@@ -592,6 +628,28 @@ mod tests {
         let failed = run_teardown_off_runtime("mic", Duration::from_secs(5), || Err(anyhow::anyhow!("pause failed"))).await;
         assert_eq!(failed, TeardownOutcome::Failed);
         assert_eq!(run_teardown_off_runtime("mic", Duration::from_secs(5), || Ok(())).await, TeardownOutcome::Stopped);
+    }
+
+    #[tokio::test]
+    async fn a_hung_stream_open_is_abandoned_after_the_timeout() {
+        let started = std::time::Instant::now();
+        let opened = run_blocking_bounded("mic", Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(500));
+            Ok(())
+        })
+        .await;
+        let error = opened.expect_err("a hung open must not wait for the driver");
+        assert!(error.to_string().contains("Timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_millis(400));
+    }
+
+    #[tokio::test]
+    async fn a_stream_open_that_fails_or_panics_is_an_error() {
+        let failed = run_blocking_bounded::<(), _>("mic", Duration::from_secs(5), || Err(anyhow::anyhow!("busy"))).await;
+        assert_eq!(failed.unwrap_err().to_string(), "busy");
+        let panicked = run_blocking_bounded::<(), _>("mic", Duration::from_secs(5), || panic!("driver")).await;
+        assert!(panicked.is_err());
+        assert_eq!(run_blocking_bounded("mic", Duration::from_secs(5), || Ok(7)).await.unwrap(), 7);
     }
 
     #[test]
