@@ -5,6 +5,7 @@ import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useConfig } from '@/contexts/ConfigContext';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
 import { cancelPostSaveNavigation } from '@/hooks/useRecordingStop';
+import { isPreviousMeetingSaving, notifyPreviousMeetingSaving } from '@/lib/postStopFlow';
 import { recordingService } from '@/services/recordingService';
 import Analytics from '@/lib/analytics';
 import { showRecordingNotification } from '@/lib/recordingNotification';
@@ -55,7 +56,7 @@ export function useRecordingStart(
   const { clearTranscripts, setMeetingTitle } = useTranscripts();
   const { setIsMeetingActive } = useSidebar();
   const { selectedDevices } = useConfig();
-  const { setStatus } = useRecordingState();
+  const { status, setStatus } = useRecordingState();
 
   // Generate meeting title with timestamp
   const generateMeetingTitle = useCallback(() => {
@@ -120,6 +121,10 @@ export function useRecordingStart(
   const handleRecordingStart = useCallback(async () => {
     if (isStartingRef.current) {
       console.log('handleRecordingStart ignored - start already in progress');
+      return;
+    }
+    if (isPreviousMeetingSaving(status)) {
+      notifyPreviousMeetingSaving();
       return;
     }
     isStartingRef.current = true;
@@ -213,7 +218,7 @@ export function useRecordingStart(
     } finally {
       isStartingRef.current = false;
     }
-  }, [generateMeetingTitle, setMeetingTitle, setIsRecording, clearTranscripts, setIsMeetingActive, checkModelReady, checkIfModelDownloading, selectedDevices, showModal, setStatus]);
+  }, [generateMeetingTitle, setMeetingTitle, setIsRecording, clearTranscripts, setIsMeetingActive, checkModelReady, checkIfModelDownloading, selectedDevices, showModal, status, setStatus]);
 
   // Check for autoStartRecording flag and start recording automatically
   useEffect(() => {
@@ -221,6 +226,14 @@ export function useRecordingStart(
       if (typeof window !== 'undefined') {
         const shouldAutoStart = sessionStorage.getItem('autoStartRecording');
         if (shouldAutoStart === 'true' && !isRecording && !isAutoStarting) {
+          // Starts are refused before the flag is set; this catches a save
+          // that began after that check. Drop the flag so it can't start a
+          // recording on some later visit to this page.
+          if (isPreviousMeetingSaving(status)) {
+            sessionStorage.removeItem('autoStartRecording');
+            notifyPreviousMeetingSaving();
+            return;
+          }
           console.log('Auto-starting recording from navigation...');
           setIsAutoStarting(true);
           sessionStorage.removeItem('autoStartRecording'); // Clear the flag
@@ -311,6 +324,7 @@ export function useRecordingStart(
     checkModelReady,
     checkIfModelDownloading,
     showModal,
+    status,
     setStatus,
   ]);
 
@@ -319,6 +333,10 @@ export function useRecordingStart(
     const handleDirectStart = async () => {
       if (isRecording || isAutoStarting) {
         console.log('Recording already in progress, ignoring direct start event');
+        return;
+      }
+      if (isPreviousMeetingSaving(status)) {
+        notifyPreviousMeetingSaving();
         return;
       }
 
@@ -412,6 +430,7 @@ export function useRecordingStart(
     checkModelReady,
     checkIfModelDownloading,
     showModal,
+    status,
     setStatus,
   ]);
 

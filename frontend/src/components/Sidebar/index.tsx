@@ -14,6 +14,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from 'sonner';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
+import { isPreviousMeetingSaving } from '@/lib/postStopFlow';
 import { useImportDialog } from '@/contexts/ImportDialogContext';
 import { useConfig } from '@/contexts/ConfigContext';
 
@@ -58,7 +59,9 @@ const Sidebar: React.FC = () => {
   } = useSidebar();
 
   // Get recording state from RecordingStateContext (single source of truth)
-  const { isRecording } = useRecordingState();
+  const { isRecording, status } = useRecordingState();
+  const isSavingPreviousMeeting = !isRecording && isPreviousMeetingSaving(status);
+  const isStartDisabled = isRecording || isSavingPreviousMeeting;
   const { openImportDialog } = useImportDialog();
   const { betaFeatures } = useConfig();
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['meetings']));
@@ -475,8 +478,8 @@ const Sidebar: React.FC = () => {
             <TooltipTrigger asChild>
               <button
                 onClick={handleRecordingToggle}
-                disabled={isRecording}
-                className={`p-2 ${isRecording ? 'bg-red-500 cursor-not-allowed' : 'bg-red-500 hover:bg-red-600'} rounded-full transition-colors duration-150 shadow-sm`}
+                disabled={isStartDisabled}
+                className={`p-2 ${isStartDisabled ? 'bg-red-500 cursor-not-allowed' : 'bg-red-500 hover:bg-red-600'} rounded-full transition-colors duration-150 shadow-sm`}
               >
                 {isRecording ? (
                   <Square className="w-5 h-5 text-white" />
@@ -486,7 +489,7 @@ const Sidebar: React.FC = () => {
               </button>
             </TooltipTrigger>
             <TooltipContent side="right">
-              <p>{isRecording ? "Recording in progress..." : "Start Recording"}</p>
+              <p>{isRecording ? "Recording in progress..." : isSavingPreviousMeeting ? "Saving the previous meeting..." : "Start Recording"}</p>
             </TooltipContent>
           </Tooltip>
 
@@ -776,8 +779,8 @@ const Sidebar: React.FC = () => {
           <div className="flex-shrink-0 p-2 border-t border-gray-100">
             <button
               onClick={handleRecordingToggle}
-              disabled={isRecording}
-              className={`w-full flex items-center justify-center px-3 py-2 text-sm font-medium text-white ${isRecording ? 'bg-red-300 cursor-not-allowed' : 'bg-red-500 hover:bg-red-600'} rounded-lg transition-colors shadow-sm`}
+              disabled={isStartDisabled}
+              className={`w-full flex items-center justify-center px-3 py-2 text-sm font-medium text-white ${isStartDisabled ? 'bg-red-300 cursor-not-allowed' : 'bg-red-500 hover:bg-red-600'} rounded-lg transition-colors shadow-sm`}
             >
               {isRecording ? (
                 <>
@@ -787,7 +790,7 @@ const Sidebar: React.FC = () => {
               ) : (
                 <>
                   <Mic className="w-4 h-4 mr-2" />
-                  <span>Start Recording</span>
+                  <span>{isSavingPreviousMeeting ? 'Saving previous meeting...' : 'Start Recording'}</span>
                 </>
               )}
             </button>

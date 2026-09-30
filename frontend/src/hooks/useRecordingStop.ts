@@ -6,6 +6,7 @@ import { toast } from 'sonner';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
+import { isPostStopInProgress, setPostStopInProgress } from '@/lib/postStopFlow';
 import { storageService } from '@/services/storageService';
 import { transcriptService } from '@/services/transcriptService';
 import Analytics from '@/lib/analytics';
@@ -34,16 +35,6 @@ function showSpeakerModelsHintOnce() {
     description: 'Settings → Recordings → Speaker Identification',
     duration: 10000,
   });
-}
-
-// Module scope, not per hook instance: the home page and
-// RecordingPostProcessingProvider each mount this hook, and a UI stop and a
-// tray stop must not both run the post-stop save.
-let stopInProgress = false;
-
-/** Whether a post-stop flow (transcription wait, save, navigation) is running. */
-export function isPostStopInProgress() {
-  return stopInProgress;
 }
 
 // Pending "navigate to the saved meeting" timer (status COMPLETED meanwhile).
@@ -172,11 +163,11 @@ export function useRecordingStop(
     }
 
     // Guard: prevent duplicate/concurrent stop calls
-    if (stopInProgress) {
+    if (isPostStopInProgress()) {
       console.log('handleRecordingStop ignored - another stop is already processing');
       return;
     }
-    stopInProgress = true;
+    setPostStopInProgress(true);
 
     // Set status to STOPPING immediately
     setStatus(RecordingStatus.STOPPING);
@@ -493,7 +484,7 @@ export function useRecordingStop(
       setIsRecordingDisabled(false);
     } finally {
       // Always reset the guard flag when done
-      stopInProgress = false;
+      setPostStopInProgress(false);
     }
   }, [
     setIsRecording,

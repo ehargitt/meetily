@@ -11,7 +11,7 @@ import Analytics from '@/lib/analytics';
 import { useRecordingState, RecordingStatus, STOP_FLOW_STATUSES } from '@/contexts/RecordingStateContext';
 import type { TranscriptionErrorPayload } from '@/services/transcriptService';
 import { stopBackendRecording, isStillRecordingAfterFailedStop } from '@/lib/stopBackendRecording';
-import { isPostStopInProgress } from '@/hooks/useRecordingStop';
+import { isPostStopInProgress } from '@/lib/postStopFlow';
 
 interface RecordingControlsProps {
   isRecording: boolean;

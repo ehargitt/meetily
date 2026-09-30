@@ -3,7 +3,8 @@
 import React, { useEffect, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
-import { useRecordingStop, isPostStopInProgress } from '@/hooks/useRecordingStop';
+import { useRecordingStop } from '@/hooks/useRecordingStop';
+import { isPostStopInProgress } from '@/lib/postStopFlow';
 import { useRecordingState, RecordingStatus, STOP_FLOW_STATUSES } from '@/contexts/RecordingStateContext';
 import { recordingService } from '@/services/recordingService';
 import { stopBackendRecording, isStillRecordingAfterFailedStop } from '@/lib/stopBackendRecording';
