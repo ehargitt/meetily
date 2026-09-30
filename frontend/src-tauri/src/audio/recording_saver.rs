@@ -19,6 +19,10 @@ const TRANSCRIPT_FLUSH_DEBOUNCE: Duration = Duration::from_secs(2);
 const SAVE_ERROR_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 /// Bound on waiting for the accumulator to drain after the pipeline stopped.
 const ACCUMULATOR_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on the stop-time checkpoint of unsaved audio (up to 600 s of it
+/// after write failures), so a hung disk cannot hold the stop before the
+/// transcription wait.
+const UNSAVED_AUDIO_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Structured transcript segment for JSON export
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -471,6 +475,10 @@ impl RecordingSaver {
     /// without this a quit or crash in that wait would lose the tail.
     /// A failure here is retried by `stop_and_save`.
     pub async fn checkpoint_unsaved_audio(&mut self) {
+        self.checkpoint_unsaved_audio_within(UNSAVED_AUDIO_WRITE_TIMEOUT).await;
+    }
+
+    async fn checkpoint_unsaved_audio_within(&mut self, write_timeout: Duration) {
         let Some(saver) = self.incremental_saver.clone() else { return };
         if !self.wait_for_accumulator().await {
             warn!(
@@ -479,10 +487,19 @@ impl RecordingSaver {
             );
             return;
         }
-        match tokio::task::spawn_blocking(move || saver.blocking_lock().write_pending_checkpoint()).await {
-            Ok(Ok(())) => info!("Unsaved audio written to a checkpoint"),
-            Ok(Err(e)) => warn!("Failed to checkpoint unsaved audio; retrying when the recording is saved: {}", e),
-            Err(e) => warn!("Unsaved audio checkpoint task failed; retrying when the recording is saved: {}", e),
+        // The write holds the saver lock from taking the buffered audio until
+        // the checkpoint count is updated. A write abandoned at the timeout
+        // keeps running with the lock, so `stop_and_save` waits for it and
+        // finalizes from whatever it left: written, or back in the buffer.
+        let write = tokio::task::spawn_blocking(move || saver.blocking_lock().write_pending_checkpoint());
+        match tokio::time::timeout(write_timeout, write).await {
+            Ok(Ok(Ok(()))) => info!("Unsaved audio written to a checkpoint"),
+            Ok(Ok(Err(e))) => warn!("Failed to checkpoint unsaved audio; retrying when the recording is saved: {}", e),
+            Ok(Err(e)) => warn!("Unsaved audio checkpoint task failed; retrying when the recording is saved: {}", e),
+            Err(_) => warn!(
+                "Checkpointing unsaved audio took over {}s; continuing the stop, the recording is saved once it finishes",
+                write_timeout.as_secs()
+            ),
         }
     }
 
@@ -745,6 +762,49 @@ mod tests {
         assert_eq!(guard.unsaved_seconds(), 0.0);
         let tail = std::fs::metadata(folder.join(".checkpoints/audio_chunk_001.wav")).unwrap();
         assert_eq!(tail.len(), 44 + 48000 * 5 * 2);
+    }
+
+    #[tokio::test]
+    async fn a_slow_unsaved_audio_checkpoint_does_not_hold_the_stop_or_write_twice() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("meeting");
+        std::fs::create_dir_all(folder.join(".checkpoints")).unwrap();
+
+        let mut saver = RecordingSaver::new();
+        saver.incremental_saver = Some(Arc::new(AsyncMutex::new(
+            IncrementalAudioSaver::new(folder.clone(), 48000).unwrap(),
+        )));
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let incremental = saver.incremental_saver.clone().unwrap();
+        saver.start_accumulation(true, receiver);
+        for i in 0..70 {  // 35 s: one checkpoint, 5 s buffered
+            sender
+                .send(AudioChunk {
+                    data: vec![0.2; 24000],
+                    sample_rate: 48000,
+                    timestamp: i as f64 * 0.5,
+                    chunk_id: i,
+                    device_type: DeviceType::Microphone,
+                })
+                .unwrap();
+        }
+        drop(sender);
+        assert!(saver.wait_for_accumulator().await);
+
+        // Holding the saver lock stands in for a disk that does not return.
+        let hung_disk = incremental.lock().await;
+        let started = Instant::now();
+        saver.checkpoint_unsaved_audio_within(Duration::from_millis(50)).await;
+        assert!(started.elapsed() < Duration::from_secs(5), "the stop moved on");
+        drop(hung_disk);
+
+        // What stop_and_save does next: wait for the saver, then write what is left.
+        let mut guard = incremental.lock().await;
+        guard.write_pending_checkpoint().unwrap();
+        assert_eq!(guard.get_checkpoint_count(), 2, "the abandoned write finished once");
+        assert_eq!(guard.unsaved_seconds(), 0.0);
+        let files = std::fs::read_dir(folder.join(".checkpoints")).unwrap().count();
+        assert_eq!(files, 2, "no duplicate or temp checkpoint");
     }
 
     #[tokio::test]
