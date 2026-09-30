@@ -284,6 +284,9 @@ pub struct ParakeetEngine {
     models_dir: PathBuf,
     current_model: Arc<RwLock<Option<SharedModel>>>,
     current_model_name: Arc<RwLock<Option<String>>>,
+    /// The model `discard_broken_model` last dropped, until it is reloaded or
+    /// another model is loaded or unloaded.
+    discarded_model_name: RwLock<Option<String>>,
     model_lifecycle_lock: Mutex<()>,
     pub(crate) available_models: Arc<RwLock<HashMap<String, ModelInfo>>>,
     active_downloads: Arc<Mutex<ActiveDownloadState>>,
@@ -328,6 +331,7 @@ impl ParakeetEngine {
             models_dir,
             current_model: Arc::new(RwLock::new(None)),
             current_model_name: Arc::new(RwLock::new(None)),
+            discarded_model_name: RwLock::new(None),
             model_lifecycle_lock: Mutex::new(()),
             available_models: Arc::new(RwLock::new(HashMap::new())),
             active_downloads: Arc::new(Mutex::new(ActiveDownloadState::default())),
@@ -546,6 +550,7 @@ impl ParakeetEngine {
             log::info!("Parakeet model unloaded");
         }
         self.current_model_name.write().await.take();
+        self.discarded_model_name.write().await.take();
         unloaded
     }
 
@@ -604,17 +609,41 @@ impl ParakeetEngine {
     }
 
     /// Unload `broken` if it is still the loaded model, so callers see "no model
-    /// loaded" (live transcription reports that once) and the next recording
-    /// start loads a fresh one.
+    /// loaded". Live transcription then calls `reload_discarded_model` once per
+    /// recording; otherwise the next recording start loads a fresh one.
     async fn discard_broken_model(&self, broken: &SharedModel) {
         let _lifecycle_guard = self.model_lifecycle_lock.lock().await;
         let mut current = self.current_model.write().await;
         if current.as_ref().is_some_and(|loaded| Arc::ptr_eq(loaded, broken)) {
             *current = None;
             drop(current);
-            self.current_model_name.write().await.take();
-            log::error!("Parakeet model discarded after a crash during transcription; it will be reloaded when a recording starts");
+            let discarded = self.current_model_name.write().await.take();
+            *self.discarded_model_name.write().await = discarded;
+            log::error!("Parakeet model discarded after a crash during transcription");
         }
+    }
+
+    /// Load a fresh copy of the model `discard_broken_model` dropped, if no model
+    /// has been loaded or unloaded since. Returns the reloaded model's name, or
+    /// `None` when there was nothing to reload. The discarded name is consumed
+    /// either way, so a failed reload is not retried.
+    pub async fn reload_discarded_model(&self) -> Result<Option<String>> {
+        let Some(model_name) = self.discarded_model_name.write().await.take() else {
+            return Ok(None);
+        };
+        log::info!("Reloading Parakeet model {} after a crash during transcription", model_name);
+        self.load_model(&model_name).await?;
+        Ok(Some(model_name))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_discarded_model_for_test(&self, model_name: &str) {
+        *self.discarded_model_name.write().await = Some(model_name.to_string());
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn discarded_model_for_test(&self) -> Option<String> {
+        self.discarded_model_name.read().await.clone()
     }
 
     /// Get the models directory path
@@ -1442,6 +1471,28 @@ mod tests {
             .expect("test model remains registered")
             .status
             .clone()
+    }
+
+    #[tokio::test]
+    async fn a_discarded_model_is_reloaded_at_most_once_and_forgotten_on_unload() {
+        let (_temp_dir, engine, _model_dir) = test_engine().await;
+        assert!(engine.reload_discarded_model().await.unwrap().is_none());
+
+        // The test model is not downloaded, so the reload fails before ONNX is involved.
+        engine.set_discarded_model_for_test(TEST_MODEL_NAME).await;
+        let error = engine.reload_discarded_model().await.unwrap_err();
+        assert!(error.to_string().contains("not downloaded"), "{error}");
+        assert!(
+            engine.reload_discarded_model().await.unwrap().is_none(),
+            "a failed reload is not retried"
+        );
+
+        engine.set_discarded_model_for_test(TEST_MODEL_NAME).await;
+        engine.unload_model().await;
+        assert!(
+            engine.reload_discarded_model().await.unwrap().is_none(),
+            "an unload since the crash cancels the reload"
+        );
     }
 
     #[tokio::test]

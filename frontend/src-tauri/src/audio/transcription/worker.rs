@@ -304,7 +304,12 @@ pub fn start_transcription_task<R: Runtime>(
             }
         };
 
-        let session = WorkerSession { failures, cancel: task_cancel, session_id };
+        let session = WorkerSession {
+            failures,
+            cancel: task_cancel,
+            session_id,
+            model_reload_attempted: Arc::new(AtomicBool::new(false)),
+        };
         run_transcription(engine, transcription_receiver, app, task_progress, session).await;
     });
 
@@ -317,6 +322,9 @@ struct WorkerSession {
     failures: Arc<ActiveFailureLatch>,
     cancel: CancellationToken,
     session_id: u64,
+    /// Set once this recording has tried to reload a crashed model, so a model
+    /// that keeps crashing is not reloaded for every chunk.
+    model_reload_attempted: Arc<AtomicBool>,
 }
 
 /// Dispatch chunks from the pipeline to the worker until the pipeline closes the channel.
@@ -462,7 +470,7 @@ async fn process_chunk<E: TranscriptionEvents>(
     session: &WorkerSession,
 ) -> ChunkOutcome {
     let failures = &session.failures;
-    if !engine.is_model_loaded().await {
+    if !engine.is_model_loaded().await && !reload_crashed_model(engine, session).await {
         failures.report(events, ActiveFailure::ModelUnavailable, "No transcription model is loaded");
         return ChunkOutcome::Skipped;
     }
@@ -534,6 +542,31 @@ async fn process_chunk<E: TranscriptionEvents>(
     }
 
     ChunkOutcome::Transcribed
+}
+
+/// Reload a Parakeet model discarded after an inference crash, at most once per
+/// recording. Returns true when a model is loaded again.
+async fn reload_crashed_model(engine: &TranscriptionEngine, session: &WorkerSession) -> bool {
+    let TranscriptionEngine::Parakeet(parakeet) = engine else {
+        return false;
+    };
+    if session.model_reload_attempted.load(Ordering::SeqCst) {
+        return false;
+    }
+    // Chunks are processed serially, so nothing else sets the latch between the check and here.
+    let reloaded = match parakeet.reload_discarded_model().await {
+        Ok(None) => return false,
+        Ok(Some(model_name)) => {
+            info!("Reloaded Parakeet model '{}' after a crash; live transcription continues", model_name);
+            true
+        }
+        Err(e) => {
+            warn!("Could not reload the crashed Parakeet model: {}", e);
+            false
+        }
+    };
+    session.model_reload_attempted.store(true, Ordering::SeqCst);
+    reloaded
 }
 
 /// Transcribe audio chunk using the appropriate provider (Whisper, Parakeet, or trait-based)
@@ -718,6 +751,7 @@ mod tests {
             failures: Arc::new(ActiveFailureLatch::default()),
             cancel: CancellationToken::new(),
             session_id: 42,
+            model_reload_attempted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -858,6 +892,51 @@ mod tests {
         assert_eq!(snapshot.completed, 0);
         assert_eq!(snapshot.skipped, 3);
         assert_eq!(events.named("transcription-error").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_crashed_parakeet_model_gets_one_reload_attempt_per_recording() {
+        let models_dir = tempfile::tempdir().unwrap();
+        let parakeet = Arc::new(
+            crate::parakeet_engine::ParakeetEngine::new_with_models_dir(Some(
+                models_dir.path().to_path_buf(),
+            ))
+            .unwrap(),
+        );
+        let engine = TranscriptionEngine::Parakeet(Arc::clone(&parakeet));
+        let events = RecordedEvents::default();
+        let session = test_session();
+
+        let outcome = process_chunk(&engine, chunk(SPEECH, 0), &events, &session).await;
+        assert_eq!(outcome, ChunkOutcome::Skipped);
+        assert!(
+            !session.model_reload_attempted.load(Ordering::SeqCst),
+            "with nothing discarded there is no reload to spend the attempt on"
+        );
+
+        // This model is not on disk, so the reload fails without touching ONNX.
+        parakeet.set_discarded_model_for_test("crashed-model").await;
+        let outcome = process_chunk(&engine, chunk(SPEECH, 1), &events, &session).await;
+        assert_eq!(outcome, ChunkOutcome::Skipped);
+        assert_eq!(parakeet.discarded_model_for_test().await, None, "the reload was attempted");
+
+        parakeet.set_discarded_model_for_test("crashed-model").await;
+        let outcome = process_chunk(&engine, chunk(SPEECH, 2), &events, &session).await;
+        assert_eq!(outcome, ChunkOutcome::Skipped);
+        assert_eq!(
+            parakeet.discarded_model_for_test().await.as_deref(),
+            Some("crashed-model"),
+            "a second crash in the same recording is not reloaded"
+        );
+        assert_eq!(events.named("transcription-error").len(), 1, "model loss is reported once");
+
+        let next_recording = test_session();
+        process_chunk(&engine, chunk(SPEECH, 3), &events, &next_recording).await;
+        assert_eq!(
+            parakeet.discarded_model_for_test().await,
+            None,
+            "the next recording gets its own attempt"
+        );
     }
 
     #[tokio::test]
