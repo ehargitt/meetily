@@ -51,6 +51,24 @@ function seedSessionFilter(session: TranscriptSessionFilter, lastSessionId: numb
   }
 }
 
+/** Display order: recording time, then sequence_id for segments that start together. */
+function compareTranscripts(a: Transcript, b: Transcript): number {
+  const chunkTimeDiff = (a.chunk_start_time || 0) - (b.chunk_start_time || 0);
+  if (chunkTimeDiff !== 0) return chunkTimeDiff;
+  return (a.sequence_id || 0) - (b.sequence_id || 0);
+}
+
+/**
+ * Merges the backend's transcript history into the segments already shown.
+ * Segments emitted after the backend read its history exist only in `shown`,
+ * so replacing the state with the history would drop them.
+ */
+function mergeTranscriptHistory(shown: Transcript[], history: Transcript[]): Transcript[] {
+  const historySequenceIds = new Set(history.map(t => t.sequence_id));
+  const shownOnly = shown.filter(t => !historySequenceIds.has(t.sequence_id));
+  return [...history, ...shownOnly].sort(compareTranscripts);
+}
+
 export function TranscriptProvider({ children }: { children: ReactNode }) {
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
   const [meetingTitle, setMeetingTitle] = useState('+ New Call');
@@ -74,7 +92,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   // recording (from recording-started). Clearing for a new recording retires
   // every session seen so far (`minimum`), so a previous meeting's lingering
   // drain can't append to the new one before its own session id arrives.
-  // A webview reload (tray Start or Settings) resets it; it is then seeded
+  // A webview reload resets it; it is then seeded
   // from the backend on mount. An older backend reports no session, and every
   // update is accepted until recording-started names one.
   const transcriptSessionRef = useRef<TranscriptSessionFilter>({ current: null, minimum: 0, highest: 0 });
@@ -456,11 +474,12 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   }, [recordingState.isRecording, currentMeetingId]);
 
   // Sync transcript history and meeting name from backend on reload
-  // This fixes the issue where reloading during active recording causes state desync
+  // This fixes the issue where reloading during active recording causes state desync.
+  // Merged rather than gated on an empty list: segments that arrive live before
+  // the history do not stand in for it.
   useEffect(() => {
     const syncFromBackend = async () => {
-      // If recording is active and we have no local transcripts, sync from backend
-      if (recordingState.isRecording && transcripts.length === 0) {
+      if (recordingState.isRecording) {
         try {
           console.log('[Reload Sync] Recording active after reload, syncing transcript history...');
 
@@ -482,7 +501,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             duration: segment.duration,
           }));
 
-          setTranscripts(formattedTranscripts);
+          setTranscripts(prev => mergeTranscriptHistory(prev, formattedTranscripts));
           console.log('[Reload Sync] ✅ Transcript history synced successfully');
 
           // Fetch meeting name from backend
