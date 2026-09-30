@@ -29,6 +29,16 @@ export interface TranscriptChunkLossPayload {
   message: string;
 }
 
+/** Sent by the live transcription worker each time it finishes a chunk. */
+export interface TranscriptionProgressPayload {
+  worker_id: number;
+  chunks_completed: number;
+  chunks_processed: number;  // transcribed, failed or skipped
+  chunks_queued: number;
+  progress_percentage: number;
+  message: string;
+}
+
 export interface ModelDownloadCompletePayload {
   modelName: string;
 }
@@ -116,6 +126,17 @@ export class TranscriptService {
    */
   async onTranscriptChunkLossDetected(callback: (payload: TranscriptChunkLossPayload) => void): Promise<UnlistenFn> {
     return listen<TranscriptChunkLossPayload>('transcript-chunk-loss-detected', (event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for transcription-progress event (a live chunk was handled)
+   * @param callback - Function to call with the queue counts
+   * @returns Promise that resolves to unlisten function
+   */
+  async onTranscriptionProgress(callback: (payload: TranscriptionProgressPayload) => void): Promise<UnlistenFn> {
+    return listen<TranscriptionProgressPayload>('transcription-progress', (event) => {
       callback(event.payload);
     });
   }
