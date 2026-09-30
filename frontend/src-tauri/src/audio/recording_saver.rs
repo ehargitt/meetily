@@ -793,9 +793,12 @@ mod tests {
 
         // Holding the saver lock stands in for a disk that does not return.
         let hung_disk = incremental.lock().await;
-        let started = Instant::now();
-        saver.checkpoint_unsaved_audio_within(Duration::from_millis(50)).await;
-        assert!(started.elapsed() < Duration::from_secs(5), "the stop moved on");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            saver.checkpoint_unsaved_audio_within(Duration::from_millis(50)),
+        )
+        .await
+        .expect("the stop moved on");
         drop(hung_disk);
 
         // What stop_and_save does next: wait for the saver, then write what is left.
