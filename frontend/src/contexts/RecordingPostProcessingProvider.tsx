@@ -3,7 +3,8 @@
 import React, { useEffect, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
-import { useRecordingStop, isPostStopInProgress } from '@/hooks/useRecordingStop';
+import { useRecordingStop } from '@/hooks/useRecordingStop';
+import { isPostStopInProgress } from '@/lib/postStopFlow';
 import { useRecordingState, RecordingStatus, STOP_FLOW_STATUSES } from '@/contexts/RecordingStateContext';
 import { recordingService } from '@/services/recordingService';
 import { stopBackendRecording, isStillRecordingAfterFailedStop } from '@/lib/stopBackendRecording';
@@ -60,7 +61,6 @@ export function RecordingPostProcessingProvider({ children }: { children: React.
       }
 
       latest.setStatus(RecordingStatus.STOPPING, 'Stopping recording...');
-      let callApi = true;
       try {
         const result = await stopBackendRecording();
         if (result === 'in-progress') {
@@ -71,6 +71,7 @@ export function RecordingPostProcessingProvider({ children }: { children: React.
           if (!isPostStopInProgress()) latestRef.current.setStatus(RecordingStatus.IDLE);
           return;
         }
+        // The stop emitted recording-stop-complete, whose listener below saves.
         toast.error(message, {
           id: RECORDING_ERROR_TOAST_ID,
           description: 'Recording stopped. Saving what was recorded so far.',
@@ -82,9 +83,8 @@ export function RecordingPostProcessingProvider({ children }: { children: React.
           latestRef.current.setStatus(RecordingStatus.RECORDING);
           return;
         }
-        callApi = false;
+        await latestRef.current.handleRecordingStop(false);
       }
-      await latestRef.current.handleRecordingStop(callApi);
     };
 
     const setupListeners = async () => {

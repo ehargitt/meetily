@@ -8,14 +8,18 @@ import { transcriptService } from '@/services/transcriptService';
 // tell the user without burying the screen.
 const TRANSCRIPTION_WARNING_TOAST_INTERVAL_MS = 30000;
 
+// Live speech segments run about 3.5-4 s (VAD cuts at pauses), so this many
+// waiting is roughly a minute of speech the transcript is behind.
+const TRANSCRIPTION_BACKLOG_WARNING_CHUNKS = 15;
+
 const streamLabel = (deviceType: AudioStreamType) =>
   deviceType === 'microphone' ? 'Microphone' : 'System audio';
 
 /**
  * Surfaces backend recording-health events as toasts on whichever page is open:
  * audio streams that degrade, recover or are unavailable, failed audio saves,
- * and transcription failures or lost chunks. Notification only — none of these
- * events stops the recording.
+ * transcription failures or lost chunks, and a transcription backlog.
+ * Notification only — none of these events stops the recording.
  *
  * @param isRecordingRef - current recording flag; stream degrade/recover
  *   toasts are dropped once the session has ended (teardown noise).
@@ -27,6 +31,7 @@ export function useRecordingHealthNotifications(isRecordingRef: MutableRefObject
     let cancelled = false;
     const unlisteners: UnlistenFn[] = [];
     let lastWarningToastAt = 0;
+    let backlogWarnedThisRecording = false;
 
     const register = async (subscription: Promise<UnlistenFn>) => {
       const unlisten = await subscription;
@@ -40,6 +45,23 @@ export function useRecordingHealthNotifications(isRecordingRef: MutableRefObject
     const setup = async () => {
       try {
         await Promise.all([
+          register(recordingService.onRecordingStarted(() => {
+            backlogWarnedThisRecording = false;
+          })),
+          // Once per recording: a backlog changes slowly, so repeating the
+          // toast would only bury the screen.
+          register(transcriptService.onTranscriptionProgress(({ chunks_queued, chunks_processed }) => {
+            const waiting = chunks_queued - chunks_processed;
+            if (backlogWarnedThisRecording || !isRecordingRef.current) return;
+            if (waiting < TRANSCRIPTION_BACKLOG_WARNING_CHUNKS) return;
+            backlogWarnedThisRecording = true;
+            console.warn('[RecordingHealth] transcription backlog →', waiting, 'chunks waiting');
+            toast.warning('Transcription is falling behind', {
+              id: 'transcription-backlog',
+              description: `${waiting} speech segments are waiting to be transcribed. Audio is still being recorded, and the transcript will catch up.`,
+              duration: 15000,
+            });
+          })),
           register(recordingService.onAudioStreamDegraded(({ device_type, device_name, reason }) => {
             console.warn('[RecordingHealth] audio-stream-degraded →', device_type, device_name, reason);
             if (!isRecordingRef.current) return;

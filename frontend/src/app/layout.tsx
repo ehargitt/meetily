@@ -11,6 +11,7 @@ import "sonner/dist/styles.css"
 import { useState, useEffect, useCallback } from 'react'
 import { listen, UnlistenFn } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
+import { useRouter } from 'next/navigation'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { RecordingStateProvider } from '@/contexts/RecordingStateContext'
 import { OllamaDownloadProvider } from '@/contexts/OllamaDownloadContext'
@@ -75,6 +76,7 @@ export default function RootLayout({
   const [showDropOverlay, setShowDropOverlay] = useState(false)
   const [showImportDialog, setShowImportDialog] = useState(false)
   const [importFilePath, setImportFilePath] = useState<string | null>(null)
+  const router = useRouter()
 
   useEffect(() => {
     // Check onboarding status first
@@ -116,9 +118,9 @@ export default function RootLayout({
           description: "You need to finish onboarding before you can start recording."
         });
       } else {
-        // If in main app, forward to useRecordingStart via window event
-        console.log('[Layout] Forwarding to start-recording-from-sidebar');
-        window.dispatchEvent(new CustomEvent('start-recording-from-sidebar'));
+        // SidebarProvider starts it like the sidebar button, from any page.
+        console.log('[Layout] Forwarding to start-recording-from-tray');
+        window.dispatchEvent(new CustomEvent('start-recording-from-tray'));
       }
     });
 
@@ -126,6 +128,17 @@ export default function RootLayout({
       unlisten.then(fn => fn());
     };
   }, [showOnboarding]);
+
+  useEffect(() => {
+    const unlisten = listen('open-settings-from-tray', () => {
+      console.log('[Layout] Opening settings from tray');
+      router.push('/settings');
+    });
+
+    return () => {
+      unlisten.then(fn => fn());
+    };
+  }, [router]);
 
   // Handle file drop for audio import
   const handleFileDrop = useCallback((paths: string[]) => {

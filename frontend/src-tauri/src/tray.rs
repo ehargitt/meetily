@@ -13,6 +13,10 @@ use crate::audio::recording_commands::{StopSource, STOP_IN_PROGRESS_ERROR};
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Longest Quit then waits for the frontend to save the stopped meeting.
 const QUIT_SAVE_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long after tray Start the menu is rebuilt from the real recording state,
+/// so a start the frontend declined (setup incomplete, no model, or the previous
+/// meeting still saving) does not leave it on "Starting".
+const START_REQUEST_MENU_RESYNC: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub enum RecordingState {
@@ -52,8 +56,10 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, item_id: &str) {
         "open_window" => focus_main_window(app),
         "settings" => {
             focus_main_window(app);
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.eval("window.location.assign('/settings')");
+            // Client-side navigation: reloading the webview would cut short
+            // the frontend's save of a meeting that was just stopped.
+            if let Err(e) = app.emit("open-settings-from-tray", ()) {
+                log::error!("Tray: Failed to request the settings page: {}", e);
             }
         }
         "check_updates" => check_updates_handler(app),
@@ -75,11 +81,15 @@ fn toggle_recording_handler<R: Runtime>(app: &AppHandle<R>) {
             // Immediately show starting state
             set_tray_state(&app_clone, RecordingState::Starting);
 
+            // The frontend starts the recording like its own Start button,
+            // without a webview reload that would cut short the save of a
+            // meeting stopped moments ago; it refuses a start while that runs.
             log::info!("Emitting start recording event from tray");
-            if let Some(window) = app_clone.get_webview_window("main") {
-                let _ = window.eval("sessionStorage.setItem('autoStartRecording', 'true')"); // Set the flag to start recording automatically
-                let _ = window.eval("window.location.assign('/')");
+            if let Err(e) = app_clone.emit("request-recording-toggle", ()) {
+                log::error!("Tray: Failed to request a recording start: {}", e);
             }
+            tokio::time::sleep(START_REQUEST_MENU_RESYNC).await;
+            update_tray_menu_async(&app_clone).await;
         }
     });
 }

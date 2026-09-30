@@ -11,7 +11,7 @@ import Analytics from '@/lib/analytics';
 import { useRecordingState, RecordingStatus, STOP_FLOW_STATUSES } from '@/contexts/RecordingStateContext';
 import type { TranscriptionErrorPayload } from '@/services/transcriptService';
 import { stopBackendRecording, isStillRecordingAfterFailedStop } from '@/lib/stopBackendRecording';
-import { isPostStopInProgress } from '@/hooks/useRecordingStop';
+import { isPostStopInProgress } from '@/lib/postStopFlow';
 
 interface RecordingControlsProps {
   isRecording: boolean;
@@ -157,7 +157,8 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
       console.log('stop_recording command completed successfully');
       // Track successful transcription
       Analytics.trackTranscriptionSuccess();
-      onRecordingStop(true);
+      // No save here: the stop emits recording-stop-complete and
+      // RecordingPostProcessingProvider saves on it, even after a reload.
     } catch (error) {
       if (await isStillRecordingAfterFailedStop(error)) {
         setRecordingStatus(RecordingStatus.RECORDING);

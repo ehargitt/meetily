@@ -5,6 +5,7 @@ import { usePathname, useRouter } from 'next/navigation';
 import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
+import { isPreviousMeetingSaving, notifyPreviousMeetingSaving } from '@/lib/postStopFlow';
 import type { SummaryProcessResponse } from '@/types';
 
 
@@ -88,7 +89,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const summaryPollsRef = React.useRef(new Map<string, SummaryPoll>());
 
   // Use recording state from RecordingStateContext (single source of truth)
-  const { isRecording } = useRecordingState();
+  const { isRecording, status } = useRecordingState();
 
   const pathname = usePathname();
   const router = useRouter();
@@ -154,9 +155,14 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     setSidebarItems(baseItems);
   }, [meetings]);
 
-  // Function to handle recording toggle from sidebar
-  const handleRecordingToggle = () => {
+  // Starts a recording from the sidebar or the tray. The home page runs the
+  // start itself, so elsewhere this navigates there with the auto-start flag.
+  const requestRecordingStart = (source: 'sidebar' | 'tray') => {
     if (!isRecording) {
+      if (isPreviousMeetingSaving(status)) {
+        notifyPreviousMeetingSaving();
+        return;
+      }
       // Check if already on home page
       if (pathname === '/') {
         // Already on home - trigger recording directly via custom event
@@ -169,11 +175,22 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         router.push('/');
       }
 
-      // Track recording initiation from sidebar
-      Analytics.trackButtonClick('start_recording', 'sidebar');
+      Analytics.trackButtonClick('start_recording', source);
     }
     // The actual recording start/stop is handled in the Home component
   };
+
+  const handleRecordingToggle = () => requestRecordingStart('sidebar');
+
+  // Tray Start, forwarded by the root layout once setup is complete. The
+  // listener registers once and calls the latest closure through the ref.
+  const requestRecordingStartRef = React.useRef(requestRecordingStart);
+  requestRecordingStartRef.current = requestRecordingStart;
+  useEffect(() => {
+    const handleTrayStart = () => requestRecordingStartRef.current('tray');
+    window.addEventListener('start-recording-from-tray', handleTrayStart);
+    return () => window.removeEventListener('start-recording-from-tray', handleTrayStart);
+  }, []);
 
   // Function to search through meeting transcripts
   const searchTranscripts = async (query: string) => {
