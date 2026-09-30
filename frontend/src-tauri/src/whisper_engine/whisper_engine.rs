@@ -522,27 +522,44 @@ impl WhisperEngine {
         final_text
     }
 
-    // Check for obviously meaningless patterns
+    /// True when the whole output is a known Whisper hallucination rather than speech:
+    /// only non-speech tags such as "[Music]" or "(applause)", and sentences that are each
+    /// a stock phrase or a run of fillers. A chunk that merely mentions "applause" is kept,
+    /// because blanking it would drop up to 30 s of real transcript.
     fn is_meaningless_output(text: &str) -> bool {
-        let text_lower = text.to_lowercase();
-
-        // Check for common meaningless patterns
-        let meaningless_patterns = [
+        const HALLUCINATION_PHRASES: [&str; 6] = [
             "thank you for watching",
             "thanks for watching",
             "like and subscribe",
             "music playing",
             "applause",
             "laughter",
-            "um um um",
-            "uh uh uh",
-            "ah ah ah",
         ];
+        const FILLER_WORDS: [&str; 3] = ["um", "uh", "ah"];
+        const MIN_FILLER_RUN: usize = 3;
 
-        for pattern in &meaningless_patterns {
-            if text_lower.contains(pattern) {
-                return true;
-            }
+        let is_hallucinated_sentence = |sentence: &str| {
+            let words: Vec<String> = sentence
+                .split_whitespace()
+                .map(|word| {
+                    word.chars()
+                        .filter(|c| c.is_alphanumeric() || *c == '\'')
+                        .flat_map(char::to_lowercase)
+                        .collect::<String>()
+                })
+                .filter(|word| !word.is_empty())
+                .collect();
+            words.is_empty()
+                || HALLUCINATION_PHRASES.contains(&words.join(" ").as_str())
+                || (words.len() >= MIN_FILLER_RUN
+                    && words.iter().all(|word| FILLER_WORDS.contains(&word.as_str())))
+        };
+        let speech = Self::strip_non_speech_tags(text);
+        if speech
+            .split(|c| matches!(c, '.' | '!' | '?'))
+            .all(is_hallucinated_sentence)
+        {
+            return true;
         }
 
         // Check if text is mostly the same character or very short repetitive patterns
@@ -552,6 +569,29 @@ impl WhisperEngine {
         }
 
         false
+    }
+
+    /// Remove bracketed or parenthesised annotations such as "[Music]" or "(laughs)".
+    /// An unclosed bracket is kept as speech rather than swallowing the rest of the text.
+    fn strip_non_speech_tags(text: &str) -> String {
+        let mut speech = String::with_capacity(text.len());
+        let mut open_tag: Option<(char, usize)> = None;
+        for (index, c) in text.char_indices() {
+            match (open_tag, c) {
+                (None, '[') => open_tag = Some((']', index)),
+                (None, '(') => open_tag = Some((')', index)),
+                (None, _) => speech.push(c),
+                (Some((close, _)), _) if c == close => {
+                    open_tag = None;
+                    speech.push(' ');
+                }
+                (Some(_), _) => {}
+            }
+        }
+        if let Some((_, start)) = open_tag {
+            speech.push_str(&text[start..]);
+        }
+        speech
     }
 
     // Enhanced word repetition removal
@@ -1339,6 +1379,41 @@ mod tests {
             .unwrap()
             .set_len(68 * 1024 * 1024)
             .unwrap();
+    }
+
+    #[test]
+    fn real_speech_that_mentions_a_hallucination_phrase_is_kept() {
+        for speech in [
+            "So the demo got a round of applause from the board, and we are shipping it next week as planned.",
+            "There was a lot of laughter in the room when she said that.",
+            "Thank you for watching the build with me, now let's look at the logs.",
+            "I think um um um we should ship it.",
+            "[Music] So the demo went well.",
+            "(laughs) Yeah, that's right.",
+            "The value [in brackets is left open",
+        ] {
+            assert!(!WhisperEngine::is_meaningless_output(speech), "{speech}");
+            assert!(!WhisperEngine::clean_repetitive_text(speech).is_empty(), "{speech}");
+        }
+    }
+
+    #[test]
+    fn output_that_is_only_a_hallucination_is_blanked() {
+        for hallucination in [
+            "Thank you for watching!",
+            "thanks for watching.",
+            "Applause",
+            "(Applause)",
+            "[Music]",
+            "[Laughter] (applause)",
+            "[Music] Thanks for watching! Like and subscribe.",
+            "Music playing.",
+            "Um, um, um.",
+            "uh uh uh",
+        ] {
+            assert!(WhisperEngine::is_meaningless_output(hallucination), "{hallucination}");
+            assert_eq!(WhisperEngine::clean_repetitive_text(hallucination), "", "{hallucination}");
+        }
     }
 
     fn tiny_model(models: &[ModelInfo]) -> &ModelInfo {
