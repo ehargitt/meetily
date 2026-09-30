@@ -1,10 +1,18 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 
 const invokeMock = mock(async () => null);
 
 mock.module("@tauri-apps/api/core", () => ({
   invoke: invokeMock,
 }));
+
+// The window stubs below hold only localStorage; put back whatever window other
+// suites run with (bun shares globals between test files).
+const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+afterAll(() => {
+  if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
+  else delete globalThis.window;
+});
 
 function installLocalStorage() {
   const values = new Map();

@@ -12,9 +12,21 @@ type BackendState = {
 const idle: BackendState = { is_recording: false, is_paused: false, is_active: false, recording_duration: null, active_duration: null };
 const live: BackendState = { ...idle, is_recording: true, is_active: true, recording_duration: 12, active_duration: 12 };
 let backendState: BackendState;
+// While set, state reads wait until the test releases them, as a slow IPC reply would.
+let holdStateReads = false;
+const heldStateReads: Array<() => void> = [];
+type HistorySegment = {
+  id: string; text: string; display_time: string; sequence_id: number;
+  audio_start_time: number; audio_end_time: number; duration: number; confidence: number;
+};
+let transcriptHistory: () => Promise<HistorySegment[]>;
 const invoke = mock(async (command: string): Promise<unknown> => {
-  if (command === 'get_recording_state') return backendState;
-  if (command === 'get_transcript_history') return [];
+  if (command === 'get_recording_state') {
+    if (!holdStateReads) return backendState;
+    const answer = backendState;
+    return new Promise(resolve => heldStateReads.push(() => resolve(answer)));
+  }
+  if (command === 'get_transcript_history') return transcriptHistory();
   if (command === 'get_recording_meeting_name') return null;
   throw new Error(`Unexpected command: ${command}`);
 });
@@ -87,6 +99,9 @@ const stateCalls = () => invoke.mock.calls.filter(([command]) => command === 'ge
 
 beforeEach(() => {
   backendState = idle;
+  holdStateReads = false;
+  heldStateReads.length = 0;
+  transcriptHistory = async () => [];
   invoke.mockClear(); toastError.mockClear(); saveTranscript.mockClear();
   sessionStorage.removeItem('indexeddb_current_meeting_id');
 });
@@ -181,7 +196,7 @@ describe('transcript updates from another transcription session', () => {
   });
 });
 
-describe('the session filter after a webview reload (tray Start or Settings)', () => {
+describe('the session filter after a webview reload', () => {
   // Both providers read get_recording_state on mount; the second read seeds the filter.
   const seeded = () => until(() => stateCalls() >= 2, 'the mount state reads');
 
@@ -216,5 +231,61 @@ describe('the session filter after a webview reload (tray Start or Settings)', (
     await act(async () => { transcripts.clearTranscripts(); });
     await emit('transcript-update', transcriptUpdate(1, 5, 'live meeting'));
     await until(() => shownTexts().includes('live meeting'), 'the live session');
+  });
+});
+
+describe('a state poll that resolves after recording-stopped', () => {
+  test('its stale is_recording does not bring the recording back', async () => {
+    backendState = live;
+    await mount();
+    await until(() => recording.status === RecordingStatus.RECORDING && recording.isRecording, 'RECORDING');
+
+    // A poll reads "recording" just before the stop, and its reply lands after the event.
+    holdStateReads = true;
+    await until(() => heldStateReads.length > 0, 'a poll in flight');
+    await emit('recording-stopped', { message: 'stopped' });
+    expect(recording.isRecording).toBe(false);
+
+    await act(async () => { heldStateReads.splice(0).forEach(release => release()); });
+    await act(() => new Promise(resolve => setTimeout(resolve, 20)));
+    expect(recording.isRecording).toBe(false);
+  });
+});
+
+describe('transcript history synced after a webview reload', () => {
+  const historySegment = (sequenceId: number, text: string): HistorySegment => ({
+    id: `seg_${sequenceId}`, text, display_time: '00:12', sequence_id: sequenceId,
+    audio_start_time: sequenceId, audio_end_time: sequenceId + 1, duration: 1, confidence: 0.9,
+  });
+
+  test('a live segment that arrives while the history is read is kept', async () => {
+    let releaseHistory: (segments: HistorySegment[]) => void = () => {};
+    transcriptHistory = () => new Promise(resolve => { releaseHistory = resolve; });
+    backendState = live;
+    await mount();
+    await until(() => invoke.mock.calls.some(([command]) => command === 'get_transcript_history'), 'the history read');
+
+    // Emitted after the backend read its history, so the history lacks it.
+    await emit('transcript-update', transcriptUpdate(3, 1, 'live after the read'));
+    await until(() => shownTexts().includes('live after the read'), 'the live segment');
+    await act(async () => { releaseHistory([historySegment(1, 'first'), historySegment(2, 'second')]); });
+
+    await until(() => shownTexts().length === 3, 'the merged transcript');
+    expect(shownTexts()).toEqual(['first', 'second', 'live after the read']);
+  });
+
+  test('a segment in both the history and live state is shown once', async () => {
+    let releaseHistory: (segments: HistorySegment[]) => void = () => {};
+    transcriptHistory = () => new Promise(resolve => { releaseHistory = resolve; });
+    backendState = live;
+    await mount();
+    await until(() => invoke.mock.calls.some(([command]) => command === 'get_transcript_history'), 'the history read');
+
+    await emit('transcript-update', transcriptUpdate(2, 1, 'second'));
+    await until(() => shownTexts().includes('second'), 'the live segment');
+    await act(async () => { releaseHistory([historySegment(1, 'first'), historySegment(2, 'second')]); });
+
+    await until(() => shownTexts().includes('first'), 'the history');
+    expect(shownTexts()).toEqual(['first', 'second']);
   });
 });

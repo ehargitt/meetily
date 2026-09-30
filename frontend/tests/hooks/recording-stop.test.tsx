@@ -15,7 +15,9 @@ const originalPath = { ...await import('@tauri-apps/api/path') };
 const originalConfig = { ...await import('../../src/contexts/ConfigContext') };
 const originalRecordingNotification = { ...await import('../../src/lib/recordingNotification') };
 const originalTooltip = { ...await import('../../src/components/ui/tooltip') };
+const originalIndexedDB = { ...await import('../../src/services/indexedDBService') };
 afterAll(() => {
+  mock.module('../../src/services/indexedDBService', () => originalIndexedDB);
   mock.module('../../src/components/ui/tooltip', () => originalTooltip);
   mock.module('@tauri-apps/api/path', () => originalPath);
   mock.module('../../src/contexts/ConfigContext', () => originalConfig);
@@ -41,13 +43,30 @@ const resetRecordingState = () => Object.assign(recordingState, {
 resetRecordingState();
 mock.module('../../src/contexts/RecordingStateContext', () => recordingStateModule(recordingState));
 
-const transcript = { id: 't1', text: 'Hello there', timestamp: '00:00', audio_start_time: 0, audio_end_time: 2 };
+const transcript = {
+  id: 't1', text: 'Hello there', timestamp: '00:00', sequence_id: 3, chunk_start_time: 30, audio_start_time: 30, audio_end_time: 32,
+};
 const markMeetingAsSaved = mock(async () => { calls.push('marked saved'); });
+let currentMeetingId: string | null;
 mock.module('../../src/contexts/TranscriptContext', () => ({
   useTranscripts: () => ({
-    transcriptsRef: { current: [transcript] }, flushBuffer() {}, clearTranscripts() {},
-    meetingTitle: 'Standup', markMeetingAsSaved, setMeetingTitle() {},
+    transcriptsRef: { current: [transcript] }, flushBuffer() {}, clearTranscripts() { calls.push('clear transcripts'); },
+    meetingTitle: 'Standup', markMeetingAsSaved, setMeetingTitle() {}, currentMeetingId,
   }),
+}));
+
+// The IndexedDB recovery copy: records are the live TranscriptUpdates as received.
+type StoredRecord = Record<string, unknown>;
+let storedTranscripts: StoredRecord[];
+let recoveryMetadata: { meetingId: string; title: string; folderPath?: string } | null;
+const getStoredTranscripts = mock(async (_meetingId: string) => storedTranscripts);
+const markRecoveredMeetingSaved = mock(async (_meetingId: string) => {});
+mock.module('../../src/services/indexedDBService', () => ({
+  indexedDBService: {
+    getTranscripts: getStoredTranscripts,
+    getMeetingMetadata: async () => recoveryMetadata,
+    markMeetingSaved: markRecoveredMeetingSaved,
+  },
 }));
 
 type TranscriptionStatus = { is_processing: boolean; chunks_in_queue: number; last_activity_ms: number };
@@ -78,13 +97,14 @@ const toastInfo = mock((..._args: unknown[]) => {});
 type ToastCall = (message: string, options?: Record<string, unknown>) => void;
 const toastWarning = mock<ToastCall>(() => {});
 const toastError = mock<ToastCall>(() => {});
-const notify = mock(() => {});
+const notify = mock((..._args: unknown[]) => {});
 mock.module('sonner', () => ({ toast: { info: toastInfo, error: toastError, success: notify, warning: toastWarning } }));
 
 let startIdentification: () => Promise<StartSpeakerIdResult>;
 let backendRecording: boolean | (() => never);
 let transcriptionModelReady: boolean;
 let stopRecordingResult: () => Promise<void>;
+let recoverAudioResult: () => Promise<{ status: string }>;
 const invoke = mock(async (command: string, args?: Record<string, unknown>): Promise<unknown> => {
   if (command === 'api_get_meetings') return [];
   if (command === 'is_recording') return typeof backendRecording === 'function' ? backendRecording() : backendRecording;
@@ -99,6 +119,14 @@ const invoke = mock(async (command: string, args?: Record<string, unknown>): Pro
   if (command === 'stop_recording') {
     calls.push('stop_recording');
     return stopRecordingResult();
+  }
+  if (command === 'recover_audio_from_checkpoints') {
+    calls.push('recover audio');
+    return recoverAudioResult();
+  }
+  if (command === 'cleanup_checkpoints') {
+    calls.push(`cleanup ${JSON.stringify(args)}`);
+    return null;
   }
   if (command === 'start_speaker_identification') {
     calls.push(`identify ${JSON.stringify(args)}`);
@@ -128,8 +156,12 @@ const Passthrough = ({ children }: { children?: React.ReactNode }) => <>{childre
 mock.module('../../src/components/ui/tooltip', () => ({
   ...originalTooltip, Tooltip: Passthrough, TooltipTrigger: Passthrough, TooltipProvider: Passthrough, TooltipContent: () => null,
 }));
+/** Delivers a backend event to the registered listeners. */
+function dispatch(name: string, payload: unknown) {
+  eventHandlers.get(name)?.forEach(handler => handler({ payload }));
+}
 async function emit(name: string, payload: unknown) {
-  await act(async () => { eventHandlers.get(name)?.forEach(handler => handler({ payload })); });
+  await act(async () => dispatch(name, payload));
 }
 
 const { SidebarProvider } = await import('../../src/components/Sidebar/SidebarProvider');
@@ -140,6 +172,8 @@ const { stopBackendRecording } = await import('../../src/lib/stopBackendRecordin
 const { useRecordingStart } = await import('../../src/hooks/useRecordingStart');
 const { RecordingControls } = await import('../../src/components/RecordingControls');
 const { Square } = await import('lucide-react');
+const { setPostStopInProgress } = await import('../../src/lib/postStopFlow');
+const { useTranscriptRecovery } = await import('../../src/hooks/useTranscriptRecovery');
 
 // The hook uses browser storage and window; bun provides neither, and other suites may have
 // installed their own window, so every global is put back as it was.
@@ -152,7 +186,8 @@ class MemoryStorage {
 }
 let localStorageImpl: Pick<MemoryStorage, 'getItem' | 'setItem'>;
 const browserGlobals: Record<string, PropertyDescriptor> = {
-  window: { configurable: true, writable: true, value: { addEventListener() {}, removeEventListener() {} } },
+  // An EventTarget, so the sidebar and tray start events reach their listeners.
+  window: { configurable: true, writable: true, value: new EventTarget() },
   sessionStorage: { configurable: true, writable: true, value: new MemoryStorage() },
   localStorage: { configurable: true, get: () => localStorageImpl },
 };
@@ -178,7 +213,16 @@ beforeEach(() => {
   saveMeetingResult = async () => ({ meeting_id: 'meeting-new' });
   backendRecording = true;
   transcriptionModelReady = true;
-  stopRecordingResult = async () => {};
+  // Like the backend: a successful stop emits recording-stop-complete before it replies.
+  stopRecordingResult = async () => { dispatch('recording-stop-complete', true); };
+  recoverAudioResult = async () => ({ status: 'success' });
+  currentMeetingId = null;
+  storedTranscripts = [];
+  recoveryMetadata = null;
+  getStoredTranscripts.mockReset(); markRecoveredMeetingSaved.mockClear();
+  getStoredTranscripts.mockImplementation(async () => storedTranscripts);
+  sessionStorage.clear();
+  setPostStopInProgress(false);
   resetRecordingState();
   localStorageImpl = new MemoryStorage();
   mock.module('@tauri-apps/api/core', () => ({ ...originalCore, invoke }));
@@ -360,6 +404,8 @@ describe('recording-error runs the Stop button flow', () => {
     await renderProvider(liveRecording);
     await emit('recording-error', 'No audio can be captured');
     await until(() => calls.includes('saveMeeting'), 'the save');
+    await settle();
+    expect(saveMeeting).toHaveBeenCalledTimes(1);
     expect(calls.indexOf('stop_recording')).toBeLessThan(calls.indexOf('saveMeeting'));
     expect(toastError.mock.calls.at(-1)).toEqual(['No audio can be captured', expect.objectContaining({
       description: 'Recording stopped. Saving what was recorded so far.',
@@ -476,10 +522,14 @@ describe('the Stop button', () => {
     Object.assign(recordingState, { isRecording: true, status: RecordingStatus.RECORDING });
     await act(async () => {
       renderer = create(
-        <RecordingControls
-          isRecording barHeights={['4px']} onRecordingStop={onRecordingStop} onRecordingStart={() => {}}
-          onTranscriptReceived={() => {}} isRecordingDisabled={false} isParentProcessing={false}
-        />,
+        <SidebarProvider>
+          <RecordingPostProcessingProvider>
+            <RecordingControls
+              isRecording barHeights={['4px']} onRecordingStop={onRecordingStop} onRecordingStart={() => {}}
+              onTranscriptReceived={() => {}} isRecordingDisabled={false} isParentProcessing={false}
+            />
+          </RecordingPostProcessingProvider>
+        </SidebarProvider>,
       );
     });
     const stopButton = renderer!.root.find(node => node.type === 'button' && node.findAllByType(Square).length > 0);
@@ -495,11 +545,202 @@ describe('the Stop button', () => {
     expect(onRecordingStop).not.toHaveBeenCalled();
   });
 
-  test('a live backend is stopped and the post-stop save runs', async () => {
+  test('a live backend is stopped and saved once, from recording-stop-complete', async () => {
     await clickStop();
-    await until(() => onRecordingStop.mock.calls.length > 0, 'the post-stop call');
-    expect(calls).toContain('stop_recording');
-    expect(onRecordingStop).toHaveBeenCalledWith(true);
-    expect(calls).not.toContain(`status ${RecordingStatus.IDLE}`);
+    await until(() => calls.includes('saveMeeting'), 'the save');
+    await settle();
+    expect(calls.indexOf('stop_recording')).toBeLessThan(calls.indexOf('saveMeeting'));
+    expect(saveMeeting).toHaveBeenCalledTimes(1);
+    // The button leaves the save to the event, which also runs after a webview reload.
+    expect(onRecordingStop).not.toHaveBeenCalled();
+  });
+
+  test('a stop whose event never arrives is not saved by the button', async () => {
+    stopRecordingResult = async () => {};
+    await clickStop();
+    await until(() => calls.includes('stop_recording'), 'the stop');
+    await settle();
+    expect(saveMeeting).not.toHaveBeenCalled();
+    expect(onRecordingStop).not.toHaveBeenCalled();
+  });
+});
+
+describe('the save driven by recording-stop-complete', () => {
+  async function renderProvider() {
+    await act(async () => {
+      renderer = create(<SidebarProvider><RecordingPostProcessingProvider>{null}</RecordingPostProcessingProvider></SidebarProvider>);
+    });
+  }
+  const savedTranscripts = () => (saveMeeting.mock.calls[0] as unknown[])[1] as Array<{ text: string; sequence_id?: number }>;
+
+  test('the event alone saves, and a second one during that save is ignored', async () => {
+    await renderProvider();
+    await act(async () => {
+      dispatch('recording-stop-complete', true);
+      dispatch('recording-stop-complete', true);
+    });
+    await until(() => calls.includes(`status ${RecordingStatus.COMPLETED}`), 'the save');
+    expect(saveMeeting).toHaveBeenCalledTimes(1);
+  });
+
+  test('segments shown before a webview reload are saved from the recovery copy', async () => {
+    // After a reload during the stop, memory holds only the segment that arrived since.
+    sessionStorage.setItem('indexeddb_current_meeting_id', 'meeting-local');
+    storedTranscripts = [
+      { id: 1, meetingId: 'meeting-local', text: 'Before the reload', timestamp: '00:10', sequence_id: 1,
+        chunk_start_time: 10, audio_start_time: 10, audio_end_time: 12, duration: 2, confidence: 0.9, storedAt: 1 },
+      { id: 2, meetingId: 'meeting-local', text: 'Hello there', timestamp: '00:00', sequence_id: 3,
+        chunk_start_time: 30, audio_start_time: 30, audio_end_time: 32, duration: 2, confidence: 0.9, storedAt: 2 },
+    ];
+    await renderProvider();
+    await emit('recording-stop-complete', true);
+    await until(() => calls.includes('saveMeeting'), 'the save');
+
+    expect(getStoredTranscripts).toHaveBeenCalledWith('meeting-local');
+    expect(savedTranscripts().map(t => [t.sequence_id, t.text])).toEqual([[1, 'Before the reload'], [3, 'Hello there']]);
+    await until(() => notify.mock.calls.length > 0, 'the success toast');
+    expect(notify.mock.calls[0]).toEqual(['Recording saved successfully!',
+      expect.objectContaining({ description: '2 transcript segments saved.' })]);
+  });
+
+  test('the live meeting id is preferred, and an unreadable copy still saves what is in memory', async () => {
+    currentMeetingId = 'meeting-live';
+    getStoredTranscripts.mockImplementationOnce(async () => { throw new Error('IndexedDB unavailable'); });
+    await renderProvider();
+    await emit('recording-stop-complete', true);
+    await until(() => calls.includes('saveMeeting'), 'the save');
+    expect(getStoredTranscripts).toHaveBeenCalledWith('meeting-live');
+    expect(savedTranscripts().map(t => t.text)).toEqual(['Hello there']);
+  });
+});
+
+const PREVIOUS_MEETING_SAVING = 'Finishing saving the previous meeting…';
+const refusedAsSaving = () => toastInfo.mock.calls.some(call => call[0] === PREVIOUS_MEETING_SAVING);
+
+describe('starting while the previous meeting is still being saved', () => {
+  let start: ReturnType<typeof useRecordingStart>;
+  function Starter() {
+    start = useRecordingStart(false, () => {}, () => {});
+    return null;
+  }
+  async function renderStarter(status: string) {
+    Object.assign(recordingState, { status });
+    await act(async () => { renderer = create(<SidebarProvider><Starter /></SidebarProvider>); });
+  }
+  const dispatchWindowEvent = (name: string) =>
+    act(async () => { window.dispatchEvent(new CustomEvent(name)); });
+
+  test.each([RecordingStatus.STOPPING, RecordingStatus.PROCESSING_TRANSCRIPTS, RecordingStatus.SAVING])(
+    'the Home start is refused during %s', async (status) => {
+      await renderStarter(status);
+      await act(async () => { await start.handleRecordingStart(); });
+      expect(calls).not.toContain('start_recording');
+      expect(calls).not.toContain('clear transcripts');
+      expect(refusedAsSaving()).toBe(true);
+    });
+
+  test('a post-stop flow still running refuses a start until COMPLETED', async () => {
+    setPostStopInProgress(true);
+    await renderStarter(RecordingStatus.IDLE);
+    await act(async () => { await start.handleRecordingStart(); });
+    expect(calls).not.toContain('start_recording');
+    expect(refusedAsSaving()).toBe(true);
+
+    // After COMPLETED only analytics and the cancellable navigation remain.
+    await act(async () => renderer!.unmount());
+    await renderStarter(RecordingStatus.COMPLETED);
+    await act(async () => { await start.handleRecordingStart(); });
+    expect(calls).toContain('start_recording');
+  });
+
+  test('the sidebar and tray start is refused before it reaches the home page', async () => {
+    // No home page mounted: the refusal must come from the sidebar provider itself.
+    Object.assign(recordingState, { status: RecordingStatus.SAVING });
+    await act(async () => { renderer = create(<SidebarProvider>{null}</SidebarProvider>); });
+    await dispatchWindowEvent('start-recording-from-tray');
+    await settle();
+    expect(calls).not.toContain('start_recording');
+    expect(refusedAsSaving()).toBe(true);
+  });
+
+  test('a direct start event is refused', async () => {
+    await renderStarter(RecordingStatus.SAVING);
+    await dispatchWindowEvent('start-recording-from-sidebar');
+    await settle();
+    expect(calls).not.toContain('start_recording');
+    expect(refusedAsSaving()).toBe(true);
+  });
+
+  test('a pending auto-start is dropped, not left for a later visit', async () => {
+    sessionStorage.setItem('autoStartRecording', 'true');
+    await renderStarter(RecordingStatus.SAVING);
+    await settle();
+    expect(calls).not.toContain('start_recording');
+    expect(sessionStorage.getItem('autoStartRecording')).toBeNull();
+    expect(refusedAsSaving()).toBe(true);
+  });
+
+  test('a direct start while another start is running does not clear its transcripts', async () => {
+    await renderStarter(RecordingStatus.STARTING);
+    await dispatchWindowEvent('start-recording-from-sidebar');
+    await settle();
+    expect(calls).not.toContain('clear transcripts');
+    expect(calls).not.toContain('start_recording');
+  });
+
+  test('with no save running, a tray start on the home page starts recording', async () => {
+    await renderStarter(RecordingStatus.IDLE);
+    await dispatchWindowEvent('start-recording-from-tray');
+    await until(() => calls.includes('start_recording'), 'the start');
+    expect(refusedAsSaving()).toBe(false);
+  });
+});
+
+describe('recovering an interrupted meeting', () => {
+  let recovery: ReturnType<typeof useTranscriptRecovery>;
+  function Recoverer() {
+    recovery = useTranscriptRecovery();
+    return null;
+  }
+  async function recover(folderPath?: string) {
+    recoveryMetadata = { meetingId: 'meeting-crashed', title: 'Crashed meeting', folderPath };
+    storedTranscripts = [{ id: 1, meetingId: 'meeting-crashed', text: 'Recovered words', timestamp: '00:01',
+      sequence_id: 1, confidence: 0.9, storedAt: 1 }];
+    await act(async () => { renderer = create(<Recoverer />); });
+    let result: Awaited<ReturnType<typeof recovery.recoverMeeting>> | undefined;
+    await act(async () => { result = await recovery.recoverMeeting('meeting-crashed'); });
+    return result!;
+  }
+  const cleanupCall = `cleanup ${JSON.stringify({ meetingFolder: '/meetings/crashed' })}`;
+
+  test('checkpoints are deleted once the audio was rebuilt from them', async () => {
+    const result = await recover('/meetings/crashed');
+    expect(result.audioRecoveryStatus?.status).toBe('success');
+    expect(calls).toContain(cleanupCall);
+    expect(calls.indexOf('saveMeeting')).toBeLessThan(calls.indexOf(cleanupCall));
+  });
+
+  test('a failed audio merge keeps the checkpoints, the only copy of the audio', async () => {
+    recoverAudioResult = async () => ({ status: 'failed' });
+    const result = await recover('/meetings/crashed');
+    expect(result.success).toBe(true);
+    expect(result.audioRecoveryStatus?.status).toBe('failed');
+    expect(calls).toContain('saveMeeting');
+    expect(calls.some(call => call.startsWith('cleanup'))).toBe(false);
+  });
+
+  test('a recovery command that throws keeps the checkpoints', async () => {
+    recoverAudioResult = async () => { throw new Error('ffmpeg missing'); };
+    const result = await recover('/meetings/crashed');
+    expect(result.audioRecoveryStatus?.status).toBe('failed');
+    expect(calls.some(call => call.startsWith('cleanup'))).toBe(false);
+  });
+
+  test('without a stored folder the live recording\'s folder is not used', async () => {
+    const result = await recover(undefined);
+    expect(result.audioRecoveryStatus?.status).toBe('none');
+    expect(invoke.mock.calls.map(([command]) => command)).not.toContain('get_meeting_folder_path');
+    expect(calls).not.toContain('recover audio');
+    expect(calls.some(call => call.startsWith('cleanup'))).toBe(false);
   });
 });
