@@ -9,6 +9,12 @@ use super::platform;
 
 /// List all available audio devices on the system
 pub async fn list_audio_devices() -> Result<Vec<AudioDevice>> {
+    list_audio_devices_blocking()
+}
+
+/// `list_audio_devices` without the async wrapper. It blocks (cpal talks to
+/// the sound server), so a caller that polls it runs it on a blocking thread.
+pub fn list_audio_devices_blocking() -> Result<Vec<AudioDevice>> {
     let host = cpal::default_host();
 
     // cpal's ALSA enumeration opens every PCM, so Linux lists devices from

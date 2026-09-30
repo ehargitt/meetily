@@ -15,7 +15,7 @@ use serde::Serialize;
 
 use crate::audio::devices::{AudioDevice, DeviceType as DeviceKind};
 use crate::audio::recording_state::{
-    DeviceType, RecordingState, StreamFault, StreamHealthEvent, StreamStatus,
+    AudioError, DeviceType, RecordingState, StreamFault, StreamHealthEvent, StreamStatus,
 };
 
 /// How often the supervisor checks for stalls, recoveries and failed streams.
@@ -99,16 +99,23 @@ pub(super) fn claim_rebuild<H: SupervisorHost>(
     now: Instant,
 ) -> Option<RebuildTicket> {
     let health = session.stream_health(request.device_type);
+    // Checked before the guard so a running stream never takes it: the mic
+    // guard is shared with the device-monitor fallback.
+    if !matches!(health.status(), StreamStatus::Dead | StreamStatus::Failed) {
+        return None;
+    }
+    let flag = host.rebuild_flag(request.device_type);
+    if flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return None;
+    }
+    let guard = FlagReset(flag);
+    // `retry_due` consumes the retry, so it is asked only once the guard is held.
     let retry_of_failed = match health.status() {
         StreamStatus::Dead => false,
         StreamStatus::Failed if health.retry_due(now) => true,
         _ => return None,
     };
-    let flag = host.rebuild_flag(request.device_type);
-    if flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-        return None;
-    }
-    let ticket = RebuildTicket { _guard: FlagReset(flag), retry_of_failed };
+    let ticket = RebuildTicket { _guard: guard, retry_of_failed };
 
     if !retry_of_failed && health.should_emit_degraded(now) {
         session.emit_health_event(StreamHealthEvent::Degraded {
@@ -165,8 +172,20 @@ fn rebuild_attempts(
     attempts
 }
 
+/// How the device lookup words "this device does not exist" (Linux's ALSA name
+/// hints in `platform::linux`; the cpal lookups in `devices::configuration`
+/// and `platform::windows`). A stream error does not always say the device
+/// went away (cpal's ALSA `POLLERR` does not), but reopening it does.
+const DEVICE_GONE_ERRORS: [&str; 2] = ["is not known to ALSA", "Device not found"];
+
+fn is_device_gone(error: &str) -> bool {
+    DEVICE_GONE_ERRORS.iter().any(|marker| error.contains(marker))
+}
+
 /// Rebuild a claimed stream. Gives up on it (see [`fail_stream`]) when every
 /// attempt fails; a periodic retry of an already-failed stream fails quietly.
+/// Once reopening its own device says the device is gone, the remaining
+/// same-device attempts are skipped in favour of the fallback, if any.
 pub(super) async fn rebuild_stream<H: SupervisorHost>(
     host: &H,
     session: &Arc<RecordingState>,
@@ -205,7 +224,12 @@ pub(super) async fn rebuild_stream<H: SupervisorHost>(
         keeps_dying,
         ticket.retry_of_failed,
     );
+    let has_fallback = attempts.iter().any(|attempt| attempt.is_fallback);
+    let mut own_device_gone = false;
     for attempt in attempts {
+        if own_device_gone && !attempt.is_fallback {
+            continue;
+        }
         host.sleep(attempt.delay).await;
         if !host.session_live() {
             return;
@@ -220,6 +244,8 @@ pub(super) async fn rebuild_stream<H: SupervisorHost>(
             }
             Err(e) => {
                 warn!("[STREAM_REBUILD] {:?} on '{}' failed: {}", device_type, attempt.device.name, e);
+                // Retrying a device that no longer exists only delays the fallback.
+                own_device_gone |= has_fallback && !attempt.is_fallback && is_device_gone(&e);
                 last_error = e;
             }
         }
@@ -266,6 +292,19 @@ pub(super) fn fail_stream<H: SupervisorHost>(
                 .to_string(),
         );
     }
+}
+
+/// A swap took the session's stream of `device_type` out but could not install
+/// a new one, so none is left. If its health still says running, it is marked
+/// dead and handed to the supervisor (as a disconnect), so it keeps being
+/// rebuilt; a dead or failed stream is the supervisor's already.
+pub(super) fn stream_lost_in_swap(
+    session: &RecordingState,
+    device_type: DeviceType,
+    device_name: &str,
+    error: &str,
+) {
+    session.report_stream_error(device_type, device_name, AudioError::DeviceDisconnected, error);
 }
 
 /// Watchdog tick: mark stalled streams dead and announce recoveries. Returns
@@ -734,6 +773,93 @@ mod tests {
         deliver_audio(&state, DeviceType::System);
         watchdog_tick(&state, Instant::now());
         assert_eq!(event_names(&events), vec!["system-audio-unavailable", "audio-stream-recovered"]);
+    }
+
+    #[test]
+    fn a_busy_guard_does_not_use_up_a_failed_streams_retry() {
+        let (state, _) = session(true);
+        let host = FakeHost::new(state.clone(), vec![]);
+        state.stream_health(DeviceType::System).mark_failed(Instant::now());
+        let req = request(DeviceType::System, false);
+        let due = Instant::now() + Duration::from_secs(31);
+
+        host.rebuild_flag(DeviceType::System).store(true, Ordering::SeqCst);
+        assert!(claim_rebuild(&host, &state, &req, due).is_none(), "another rebuild holds the guard");
+        host.rebuild_flag(DeviceType::System).store(false, Ordering::SeqCst);
+        assert!(claim_rebuild(&host, &state, &req, due).is_some(), "the retry is still due");
+    }
+
+    #[test]
+    fn a_running_stream_never_takes_the_guard() {
+        let (state, _) = session(true);
+        let host = FakeHost::new(state.clone(), vec![]);
+        assert!(claim_rebuild(&host, &state, &request(DeviceType::Microphone, false), Instant::now()).is_none());
+        assert!(!host.rebuild_flag(DeviceType::Microphone).load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_mic_whose_device_is_gone_skips_to_the_default_input() {
+        let (state, _) = session(true);
+        let gone = "Failed to create Microphone stream: Audio device 'USB mic' is not known to ALSA";
+        let mut host = FakeHost::new(state.clone(), vec![Err(gone.into()), Ok(())]);
+        host.default_input = Some("default".into());
+        kill(&state, DeviceType::Microphone);
+        run(&host, request(DeviceType::Microphone, false)).await;
+
+        assert_eq!(host.swapped_to(), vec!["USB mic", "default"]);
+        assert_eq!(*host.app_events.lock().unwrap(), vec!["mic-device-switched:default"]);
+    }
+
+    #[tokio::test]
+    async fn a_gone_device_without_a_fallback_keeps_its_retries() {
+        let (state, _) = session(true);
+        let gone: Result<(), String> = Err("Device not found: monitor".into());
+        let host = FakeHost::new(state.clone(), vec![gone; REBUILD_BACKOFF_MS.len()]);
+        kill(&state, DeviceType::System);
+        run(&host, request(DeviceType::System, false)).await;
+
+        assert_eq!(host.swapped_to().len(), REBUILD_BACKOFF_MS.len());
+    }
+
+    #[test]
+    fn device_gone_errors_are_recognised_on_every_platform() {
+        assert!(is_device_gone("Audio device 'hw:1' is not known to ALSA"));
+        assert!(is_device_gone("Device not found: MacBook Pro Microphone"));
+        assert!(is_device_gone("Device not found or no compatible configuration available: Headset"));
+        assert!(!is_device_gone("Timed out after 10s opening audio stream 'USB mic'"));
+        assert!(!is_device_gone("The requested stream configuration is not supported"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_swap_that_removed_a_running_stream_hands_it_to_the_supervisor() {
+        let (state, _) = session(true);
+        let (faults, mut fault_rx) = tokio::sync::mpsc::unbounded_channel();
+        state.set_fault_sender(faults);
+        let mut host = FakeHost::new(state.clone(), vec![Ok(())]);
+        host.default_input = Some("default".into());
+
+        // The device-monitor fallback took the mic stream out, then could not
+        // open the default input.
+        stream_lost_in_swap(&state, DeviceType::Microphone, "USB mic", "Failed to create Microphone stream");
+        assert_eq!(state.stream_health(DeviceType::Microphone).status(), StreamStatus::Dead);
+        let fault = fault_rx.try_recv().expect("the supervisor is asked to rebuild");
+        assert!(fault.disconnected);
+
+        run(&host, fault.into()).await;
+        assert_eq!(host.swapped_to(), vec!["default"]);
+        assert_eq!(state.stream_health(DeviceType::Microphone).status(), StreamStatus::Running);
+    }
+
+    #[test]
+    fn a_failed_swap_of_a_stream_already_being_rebuilt_changes_nothing() {
+        let (state, _) = session(true);
+        let (faults, mut fault_rx) = tokio::sync::mpsc::unbounded_channel();
+        state.set_fault_sender(faults);
+        kill(&state, DeviceType::System);
+
+        stream_lost_in_swap(&state, DeviceType::System, "monitor", "Failed to create System stream");
+        assert_eq!(state.stream_health(DeviceType::System).status(), StreamStatus::Dead);
+        assert!(fault_rx.try_recv().is_err(), "no second rebuild request");
     }
 
     #[tokio::test]
