@@ -27,6 +27,11 @@ export enum RecordingStatus {
   ERROR = 'error'                         // Error occurred
 }
 
+// recording-stop-complete follows recording-stopped within milliseconds and
+// moves STOPPING on at once. STOPPING that outlasts this means that event was
+// missed (a webview reload between the two), and nothing else would clear it.
+const STOPPED_WITHOUT_SAVE_TIMEOUT_MS = 15000;
+
 /** Statuses between a stop starting and its post-processing finishing. */
 export const STOP_FLOW_STATUSES: readonly RecordingStatus[] = [
   RecordingStatus.STOPPING,
@@ -79,6 +84,11 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
   });
 
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const stoppedWithoutSaveTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Bumped by the start, stop and stop-failed events. A poll issued before one
+  // of them can resolve after it; its stale is_recording would undo the event.
+  const syncEpochRef = useRef(0);
 
   // NEW: Status setter with logging
   const setStatus = useCallback((status: RecordingStatus, message?: string) => {
@@ -96,8 +106,13 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
    * Called on mount (fixes refresh desync) and periodically while recording
    */
   const syncWithBackend = async (): Promise<BackendRecordingState | null> => {
+    const epoch = syncEpochRef.current;
     try {
       const backendState = await recordingService.getRecordingState();
+      if (epoch !== syncEpochRef.current) {
+        console.log('[RecordingStateContext] Dropping backend state read before a recording event');
+        return null;
+      }
 
       setState(prev => ({
         ...prev,
@@ -140,6 +155,13 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
     }
   };
 
+  const clearStoppedWithoutSaveTimer = () => {
+    if (stoppedWithoutSaveTimerRef.current) {
+      clearTimeout(stoppedWithoutSaveTimerRef.current);
+      stoppedWithoutSaveTimerRef.current = null;
+    }
+  };
+
   /**
    * Set up event listeners for backend state changes
    */
@@ -153,6 +175,8 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
         // Recording started
         const unlistenStarted = await recordingService.onRecordingStarted(() => {
           console.log('[RecordingStateContext] Recording started event');
+          syncEpochRef.current += 1;
+          clearStoppedWithoutSaveTimer();
           setState(prev => ({
             ...prev,
             isRecording: true,
@@ -189,6 +213,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
         // RECORDING if the backend session is still live, otherwise IDLE.
         const unlistenStopFailed = await recordingService.onRecordingStopFailed(async ({ message }) => {
           console.error('[RecordingStateContext] Recording stop failed:', message);
+          syncEpochRef.current += 1;
           toast.error('Recording could not be stopped', {
             id: STOP_FAILED_TOAST_ID,
             description: message,
@@ -212,6 +237,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
         // Recording stopped
         const unlistenStopped = await recordingService.onRecordingStopped((payload) => {
           console.log('[RecordingStateContext] Recording stopped event:', payload);
+          syncEpochRef.current += 1;
           setState(prev => {
             // Set status to STOPPING if not already in stop flow
             // This ensures smooth UI transition for tray/keyboard stops
@@ -231,6 +257,16 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
             };
           });
           stopPolling();
+
+          clearStoppedWithoutSaveTimer();
+          stoppedWithoutSaveTimerRef.current = setTimeout(() => {
+            stoppedWithoutSaveTimerRef.current = null;
+            setState(prev => {
+              if (prev.status !== RecordingStatus.STOPPING) return prev;
+              console.warn('[RecordingStateContext] No save followed the stop; leaving STOPPING');
+              return { ...prev, status: RecordingStatus.IDLE, statusMessage: undefined };
+            });
+          }, STOPPED_WITHOUT_SAVE_TIMEOUT_MS);
         });
         unsubscribers.push(unlistenStopped);
 
@@ -287,6 +323,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
       cancelled = true;
       unsubscribers.forEach(unsub => unsub());
       stopPolling();
+      clearStoppedWithoutSaveTimer();
     };
   }, []);
 

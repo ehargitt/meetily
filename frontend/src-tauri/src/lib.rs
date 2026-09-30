@@ -60,7 +60,7 @@ use audio::{list_audio_devices, AudioDevice};
 use log::{error as log_error, info as log_info};
 use notifications::commands::NotificationManagerState;
 use std::sync::Arc;
-use tauri::{AppHandle, Manager, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::sync::RwLock;
 
 static RECORDING_FLAG: AtomicBool = AtomicBool::new(false);
@@ -212,6 +212,13 @@ async fn stop_recording<R: Runtime>(app: AppHandle<R>, args: RecordingArgs) -> R
         Ok(_) => {
             RECORDING_FLAG.store(false, Ordering::SeqCst);
             tray::update_tray_menu(&app);
+
+            // The frontend saves the meeting on this event, as for a tray stop.
+            // An event rather than this command's reply, so the save still
+            // runs if the webview reloaded while the stop was running.
+            if let Err(e) = app.emit("recording-stop-complete", true) {
+                log_error!("Failed to emit recording-stop-complete event: {}", e);
+            }
 
             // Create the save directory if it doesn't exist
             if let Some(parent) = std::path::Path::new(&args.save_path).parent() {

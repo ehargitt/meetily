@@ -157,7 +157,8 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
       console.log('stop_recording command completed successfully');
       // Track successful transcription
       Analytics.trackTranscriptionSuccess();
-      onRecordingStop(true);
+      // No save here: the stop emits recording-stop-complete and
+      // RecordingPostProcessingProvider saves on it, even after a reload.
     } catch (error) {
       if (await isStillRecordingAfterFailedStop(error)) {
         setRecordingStatus(RecordingStatus.RECORDING);

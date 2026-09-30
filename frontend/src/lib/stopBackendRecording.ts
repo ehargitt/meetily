@@ -3,7 +3,9 @@ import { toast } from 'sonner';
 import { recordingService } from '@/services/recordingService';
 
 /**
- * - `stopped`: this call ran the backend stop; the caller runs the post-stop save.
+ * - `stopped`: this call ran the backend stop, which emits
+ *   `recording-stop-complete`; RecordingPostProcessingProvider runs the
+ *   post-stop save on that event, so the caller must not run it again.
  * - `in-progress`: another stop holds the backend stop guard; its own flow
  *   (`recording-stopped` / `recording-stop-complete`) saves — do nothing.
  * - `not-recording`: the backend was not recording, so there is nothing to
@@ -21,7 +23,8 @@ const errorText = (error: unknown) => (error instanceof Error ? error.message : 
 
 /**
  * Stops the backend recording the same way the Stop button does. Only the
- * backend stop — the caller runs the post-stop save (`handleRecordingStop`).
+ * backend stop — the post-stop save (`handleRecordingStop`) follows from the
+ * `recording-stop-complete` event it emits.
  *
  * @throws the backend error for a stop that failed
  */
