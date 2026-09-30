@@ -10,7 +10,9 @@ import { isPostStopInProgress, setPostStopInProgress } from '@/lib/postStopFlow'
 import { storageService } from '@/services/storageService';
 import { transcriptService } from '@/services/transcriptService';
 import Analytics from '@/lib/analytics';
-import { StartSpeakerIdResult } from '@/types';
+import { StartSpeakerIdResult, Transcript } from '@/types';
+import { indexedDBService } from '@/services/indexedDBService';
+import { mergeTranscripts, storedToTranscript } from '@/lib/transcriptMerge';
 import {
   applyPinnedSummaryLanguageToMeeting,
   detectAndCacheSummaryLanguage,
@@ -35,6 +37,22 @@ function showSpeakerModelsHintOnce() {
     description: 'Settings → Recordings → Speaker Identification',
     duration: 10000,
   });
+}
+
+/**
+ * The meeting's IndexedDB recovery copy, which holds every segment this page
+ * accepted. After a webview reload during the stop, memory holds only the
+ * segments that arrived since, and the backend no longer serves the history.
+ */
+async function loadRecoveryCopy(meetingId: string | null): Promise<Transcript[]> {
+  const id = meetingId ?? sessionStorage.getItem('indexeddb_current_meeting_id');
+  if (!id) return [];
+  try {
+    return (await indexedDBService.getTranscripts(id)).map(storedToTranscript);
+  } catch (error) {
+    console.warn('Could not read the recovery copy of the transcript; saving what is in memory:', error);
+    return [];
+  }
 }
 
 // Pending "navigate to the saved meeting" timer (status COMPLETED meanwhile).
@@ -95,6 +113,7 @@ export function useRecordingStop(
     clearTranscripts,
     meetingTitle,
     markMeetingAsSaved,
+    currentMeetingId,
   } = useTranscripts();
 
   const {
@@ -181,9 +200,9 @@ export function useRecordingStop(
         current_transcript_count: transcriptsRef.current.length
       });
 
-      // Note: stop_recording is already called by RecordingControls.stopRecordingAction
-      // This function only handles post-stop processing (transcription wait, API call, navigation)
-      console.log('Recording already stopped by RecordingControls, processing transcription...');
+      // The backend stop has finished (recording-stop-complete, or a failed stop
+      // for callApi=false); this is only the post-stop processing.
+      console.log('Recording already stopped by the backend, processing transcription...');
 
       // Wait for transcription to complete
       setStatus(RecordingStatus.PROCESSING_TRANSCRIPTS, 'Waiting for transcription...');
@@ -287,8 +306,12 @@ export function useRecordingStop(
 
         setStatus(RecordingStatus.SAVING, 'Saving meeting to database...');
 
-        // Get fresh transcript state (ALL transcripts including late ones)
-        const freshTranscripts = [...transcriptsRef.current];
+        // Fresh transcript state (including late segments), completed from the
+        // recovery copy in case the webview reloaded during the stop.
+        const freshTranscripts = mergeTranscripts(
+          [...transcriptsRef.current],
+          await loadRecoveryCopy(currentMeetingId),
+        );
 
         // Get folder_path and meeting_name from recording-stopped event
         const folderPath = sessionStorage.getItem('last_recording_folder_path');
@@ -495,6 +518,7 @@ export function useRecordingStop(
     clearTranscripts,
     meetingTitle,
     markMeetingAsSaved,
+    currentMeetingId,
     refetchMeetings,
     setCurrentMeeting,
     setMeetings,

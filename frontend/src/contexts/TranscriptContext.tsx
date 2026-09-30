@@ -7,6 +7,7 @@ import { useRecordingState } from './RecordingStateContext';
 import { transcriptService } from '@/services/transcriptService';
 import { recordingService } from '@/services/recordingService';
 import { indexedDBService } from '@/services/indexedDBService';
+import { mergeTranscripts } from '@/lib/transcriptMerge';
 
 interface TranscriptContextType {
   transcripts: Transcript[];
@@ -49,24 +50,6 @@ function seedSessionFilter(session: TranscriptSessionFilter, lastSessionId: numb
   } else {
     session.minimum = Math.max(session.minimum, lastSessionId + 1);
   }
-}
-
-/** Display order: recording time, then sequence_id for segments that start together. */
-function compareTranscripts(a: Transcript, b: Transcript): number {
-  const chunkTimeDiff = (a.chunk_start_time || 0) - (b.chunk_start_time || 0);
-  if (chunkTimeDiff !== 0) return chunkTimeDiff;
-  return (a.sequence_id || 0) - (b.sequence_id || 0);
-}
-
-/**
- * Merges the backend's transcript history into the segments already shown.
- * Segments emitted after the backend read its history exist only in `shown`,
- * so replacing the state with the history would drop them.
- */
-function mergeTranscriptHistory(shown: Transcript[], history: Transcript[]): Transcript[] {
-  const historySequenceIds = new Set(history.map(t => t.sequence_id));
-  const shownOnly = shown.filter(t => !historySequenceIds.has(t.sequence_id));
-  return [...history, ...shownOnly].sort(compareTranscripts);
 }
 
 export function TranscriptProvider({ children }: { children: ReactNode }) {
@@ -501,7 +484,8 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             duration: segment.duration,
           }));
 
-          setTranscripts(prev => mergeTranscriptHistory(prev, formattedTranscripts));
+          // Segments emitted after the backend read its history are only in `prev`.
+          setTranscripts(prev => mergeTranscripts(prev, formattedTranscripts));
           console.log('[Reload Sync] ✅ Transcript history synced successfully');
 
           // Fetch meeting name from backend
