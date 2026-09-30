@@ -1,7 +1,12 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::sleep;
+
+/// Most recent batch results kept; older ones are dropped so a long recording
+/// does not grow memory without bound.
+const MAX_RETAINED_RESULTS: usize = 100;
 
 /// Smart batching processor for reducing operation frequency
 /// Collects operations and executes them in batches to reduce overhead
@@ -13,7 +18,15 @@ pub struct BatchProcessor<T, R> {
     #[allow(dead_code)]
     processor: Arc<dyn Fn(Vec<T>) -> R + Send + Sync>,
     sender: mpsc::UnboundedSender<T>,
-    results: Arc<RwLock<Vec<R>>>,
+    results: Arc<RwLock<VecDeque<R>>>,
+}
+
+async fn retain_result<R>(results: &RwLock<VecDeque<R>>, result: R) {
+    let mut results = results.write().await;
+    if results.len() == MAX_RETAINED_RESULTS {
+        results.pop_front();
+    }
+    results.push_back(result);
 }
 
 impl<T, R> BatchProcessor<T, R>
@@ -32,7 +45,7 @@ where
     {
         let (sender, mut receiver) = mpsc::unbounded_channel::<T>();
         let processor = Arc::new(processor);
-        let results = Arc::new(RwLock::new(Vec::new()));
+        let results = Arc::new(RwLock::new(VecDeque::with_capacity(MAX_RETAINED_RESULTS)));
 
         let processor_clone = Arc::clone(&processor);
         let results_clone = Arc::clone(&results);
@@ -53,7 +66,7 @@ where
                                 // Process batch if full
                                 if batch.len() >= batch_size {
                                     let result = processor_clone(std::mem::take(&mut batch));
-                                    results_clone.write().await.push(result);
+                                    retain_result(&results_clone, result).await;
                                     last_process = Instant::now();
                                 }
                             }
@@ -65,7 +78,7 @@ where
                     _ = sleep(timeout) => {
                         if !batch.is_empty() && last_process.elapsed() >= timeout {
                             let result = processor_clone(std::mem::take(&mut batch));
-                            results_clone.write().await.push(result);
+                            retain_result(&results_clone, result).await;
                             last_process = Instant::now();
                         }
                     }
@@ -75,7 +88,7 @@ where
             // Process any remaining items on shutdown
             if !batch.is_empty() {
                 let result = processor_clone(batch);
-                results_clone.write().await.push(result);
+                retain_result(&results_clone, result).await;
             }
         });
 
@@ -93,10 +106,9 @@ where
         self.sender.send(item)
     }
 
-    /// Get all processed results
+    /// Get the most recent processed results, oldest first
     pub async fn get_results(&self) -> Vec<R> {
-        let results = self.results.read().await;
-        results.clone()
+        self.results.read().await.iter().cloned().collect()
     }
 
     /// Clear processed results
@@ -181,7 +193,7 @@ impl AudioMetricsBatcher {
         self.processor.add(metric)
     }
 
-    /// Get summarized audio metrics
+    /// Get the most recent summarized audio metrics, oldest first
     pub async fn get_summaries(&self) -> Vec<AudioMetricsSummary> {
         self.processor.get_results().await
     }
@@ -213,4 +225,32 @@ macro_rules! batch_audio_metric {
             let _ = batcher.add_metric(metric);
         }
     };
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn only_the_most_recent_results_are_kept() {
+        let batches = MAX_RETAINED_RESULTS + 25;
+        let processor = BatchProcessor::new(1, Duration::from_secs(60), |items: Vec<usize>| items[0]);
+        for item in 0..batches {
+            processor.add(item).unwrap();
+        }
+
+        let results = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let results = processor.get_results().await;
+                if results.last() == Some(&(batches - 1)) {
+                    return results;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every batch is processed");
+
+        assert_eq!(results.len(), MAX_RETAINED_RESULTS);
+        assert_eq!(results.first(), Some(&(batches - MAX_RETAINED_RESULTS)));
+    }
 }
