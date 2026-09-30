@@ -419,11 +419,11 @@ impl RecordingState {
     /// Mark running streams that have stopped delivering callbacks as dead.
     /// Returns the stalled streams; the caller rebuilds them.
     ///
-    /// Linux checks both streams: the stall is cpal's ALSA overrun bug. macOS
-    /// checks only system audio, whose Core Audio stream can die without an
-    /// error; a Bluetooth input there can legitimately deliver nothing for a
-    /// while after start (see the audio wake in recording_manager.rs), so the
-    /// microphone is not rebuilt for being quiet.
+    /// Linux only: the stall is cpal's ALSA overrun bug. On macOS a Bluetooth
+    /// input can legitimately deliver nothing for a while after start (see the
+    /// audio wake in recording_manager.rs), and a ScreenCaptureKit system stream
+    /// is not known to deliver buffers through silence; a Core Audio system
+    /// stream that ends reports itself instead (stream.rs).
     pub fn detect_stalls(&self, now: Instant) -> Vec<DeviceType> {
         let active = self.is_active();
         Self::stall_checked_streams()
@@ -437,8 +437,6 @@ impl RecordingState {
     fn stall_checked_streams() -> &'static [DeviceType] {
         if cfg!(target_os = "linux") {
             &[DeviceType::Microphone, DeviceType::System]
-        } else if cfg!(target_os = "macos") {
-            &[DeviceType::System]
         } else {
             &[]
         }
@@ -795,8 +793,6 @@ mod tests {
         let stalled = state.detect_stalls(later);
         if cfg!(target_os = "linux") {
             assert_eq!(stalled, vec![DeviceType::Microphone, DeviceType::System]);
-        } else if cfg!(target_os = "macos") {
-            assert_eq!(stalled, vec![DeviceType::System], "a quiet Bluetooth mic is not a stall on macOS");
         } else {
             assert!(stalled.is_empty(), "no stall watchdog on this platform");
         }
