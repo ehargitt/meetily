@@ -1778,6 +1778,7 @@ async fn do_stream_swap(
     // stop()/drop on a disconnected device can stall (CoreAudio HAL lock) or
     // panic (ALSA worker join); under RECORDING_MANAGER that would freeze
     // stop_recording (deep-review #2). A teardown failure must not abort the swap.
+    let removed_device = old_stream.as_ref().map(|old| old.device().name.clone());
     if let Some(old) = old_stream {
         old.stop_off_runtime().await;
     }
@@ -1786,9 +1787,16 @@ async fn do_stream_swap(
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     info!("[HOT_SWAP] Creating new {:?} stream for '{}' (lock released)", device_type, device.name);
-    let new_stream = super::stream::AudioStream::create(device.clone(), session.clone(), device_type, None)
-        .await
-        .map_err(|e| format!("Failed to create {:?} stream: {}", device_type, e))?;
+    let new_stream = match super::stream::AudioStream::create(device.clone(), session.clone(), device_type, None).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            let error = format!("Failed to create {:?} stream: {}", device_type, e);
+            if let Some(removed_device) = removed_device.filter(|_| session_live(session)) {
+                stream_supervisor::stream_lost_in_swap(session, device_type, &removed_device, &error);
+            }
+            return Err(error);
+        }
+    };
 
     // Phase 3: Lock briefly — install ONLY if still the same session
     let install_result = {
@@ -1991,7 +1999,7 @@ fn handle_device_event<R: Runtime>(
 
 /// Disconnect fallback: swap the active mic to the system default input
 /// device. Triggered from the background device event processor after the
-/// device monitor's polling threshold (3 × 2s) fires `DeviceDisconnected`
+/// device monitor's polling threshold (2-3 missed polls) fires `DeviceDisconnected`
 /// for the active microphone.
 ///
 /// `disconnected_name` is the device that just died. We keep it to detect
