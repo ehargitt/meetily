@@ -9,7 +9,19 @@ use log::{debug, info, warn, error};
 #[cfg(target_os = "macos")]
 use cidre::{core_audio as ca, os};
 
-use super::devices::{AudioDevice, list_audio_devices};
+use super::devices::AudioDevice;
+use super::devices::discovery::list_audio_devices_blocking;
+
+/// Poll interval while every monitored device is present.
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Poll interval while a monitored device is missing.
+const MISSING_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// A device enumeration still running after this is left to finish on its own.
+const ENUMERATION_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long `stop_monitoring` waits for the monitor loop before aborting it.
+const STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
+type Enumeration = JoinHandle<Result<Vec<AudioDevice>>>;
 
 /// Device monitoring events
 #[derive(Debug, Clone)]
@@ -256,16 +268,65 @@ impl AudioDeviceMonitor {
         Ok(())
     }
 
-    /// Stop monitoring
+    /// Stop monitoring. Waits at most `STOP_TIMEOUT` for the monitor loop (it
+    /// may be waiting on a slow device enumeration), then aborts it.
     pub async fn stop_monitoring(&mut self) {
+        self.stop_monitoring_within(STOP_TIMEOUT).await;
+    }
+
+    async fn stop_monitoring_within(&mut self, timeout: Duration) {
         info!("Stopping device monitor");
         self.stop_signal.notify_one();
 
-        if let Some(handle) = self.monitor_handle.take() {
-            let _ = handle.await;
+        if let Some(mut handle) = self.monitor_handle.take() {
+            if tokio::time::timeout(timeout, &mut handle).await.is_err() {
+                warn!("Device monitor did not stop within {:?}; aborting it", timeout);
+                handle.abort();
+            }
         }
 
         info!("Device monitor stopped");
+    }
+
+    /// The current device list, enumerated on a blocking thread. `None` when
+    /// the enumeration failed or has not finished within `timeout`; an
+    /// unfinished one is kept in `pending` and awaited again next time rather
+    /// than starting another, so a hung sound server holds one thread, not one
+    /// per poll.
+    async fn next_device_list<F>(
+        pending: &mut Option<Enumeration>,
+        enumerate: F,
+        timeout: Duration,
+    ) -> Option<Vec<AudioDevice>>
+    where
+        F: FnOnce() -> Result<Vec<AudioDevice>> + Send + 'static,
+    {
+        let mut enumeration = pending.take().unwrap_or_else(|| tokio::task::spawn_blocking(enumerate));
+        match tokio::time::timeout(timeout, &mut enumeration).await {
+            Ok(Ok(Ok(devices))) => Some(devices),
+            Ok(Ok(Err(e))) => {
+                error!("Failed to list audio devices: {}", e);
+                None
+            }
+            Ok(Err(e)) => {
+                error!("Audio device enumeration failed: {}", e);
+                None
+            }
+            Err(_) => {
+                warn!("Audio device enumeration still running after {:?}; skipping this check", timeout);
+                *pending = Some(enumeration);
+                None
+            }
+        }
+    }
+
+    /// Poll faster while a monitored device is missing.
+    fn poll_interval(monitored_devices: &[MonitoredDevice]) -> Duration {
+        if monitored_devices.iter().any(|d| d.consecutive_missing > 0) {
+            MISSING_POLL_INTERVAL
+        } else {
+            POLL_INTERVAL
+        }
     }
 
     /// Main monitoring loop
@@ -277,7 +338,8 @@ impl AudioDeviceMonitor {
         device_update_mailbox: Arc<std::sync::Mutex<Option<(String, Option<String>)>>>,
     ) {
         let mut last_device_list = Vec::new();
-        let check_interval = Duration::from_secs(2); // Poll every 2 seconds
+        let mut check_interval = Self::poll_interval(&monitored_devices);
+        let mut pending_enumeration: Option<Enumeration> = None;
 
         #[cfg(target_os = "macos")]
         let _listener_guard = register_device_change_listeners(device_change_notify.clone());
@@ -299,12 +361,10 @@ impl AudioDeviceMonitor {
             }
 
             // Get current device list
-            let current_devices = match list_audio_devices().await {
-                Ok(devices) => devices,
-                Err(e) => {
-                    error!("Failed to list audio devices: {}", e);
-                    continue;
-                }
+            let Some(current_devices) =
+                Self::next_device_list(&mut pending_enumeration, list_audio_devices_blocking, ENUMERATION_TIMEOUT).await
+            else {
+                continue;
             };
 
             // Check for hot-swap device update from the mailbox.
@@ -382,17 +442,10 @@ impl AudioDeviceMonitor {
                 }
             }
 
-            // Adjust check interval based on device states
-            // If any device is missing, check more frequently
-            let has_missing = monitored_devices.iter().any(|d| d.consecutive_missing > 0);
-            let next_interval = if has_missing {
-                Duration::from_secs(2) // Fast polling when device missing
-            } else {
-                Duration::from_secs(5) // Slower polling when all devices present
-            };
-
+            let next_interval = Self::poll_interval(&monitored_devices);
             if next_interval != check_interval {
                 debug!("Adjusting monitor interval to {:?}", next_interval);
+                check_interval = next_interval;
             }
         }
     }
@@ -414,6 +467,7 @@ impl Drop for AudioDeviceMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::devices::DeviceType;
 
     #[test]
     fn test_bluetooth_detection() {
@@ -439,5 +493,74 @@ mod tests {
 
         // Stop should be safe even if not started
         monitor.stop_monitoring().await;
+    }
+
+    #[test]
+    fn polling_speeds_up_while_a_device_is_missing() {
+        let mut devices = vec![
+            MonitoredDevice::new("USB mic".to_string(), DeviceMonitorType::Microphone),
+            MonitoredDevice::new("monitor".to_string(), DeviceMonitorType::SystemAudio),
+        ];
+        assert_eq!(AudioDeviceMonitor::poll_interval(&devices), POLL_INTERVAL);
+        devices[1].consecutive_missing = 1;
+        assert_eq!(AudioDeviceMonitor::poll_interval(&devices), MISSING_POLL_INTERVAL);
+    }
+
+    #[tokio::test]
+    async fn a_monitor_loop_that_does_not_stop_is_aborted() {
+        struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = SetOnDrop(dropped.clone());
+
+        let (mut monitor, _receiver) = AudioDeviceMonitor::new();
+        // Stands in for a loop stuck awaiting a hung device enumeration.
+        monitor.monitor_handle = Some(tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        }));
+
+        tokio::time::timeout(Duration::from_secs(1), monitor.stop_monitoring_within(Duration::from_millis(50)))
+            .await
+            .expect("stop waited on the stuck loop");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stuck loop was aborted");
+    }
+
+    #[tokio::test]
+    async fn a_slow_enumeration_is_awaited_again_instead_of_started_twice() {
+        let mut pending = None;
+        let slow = || {
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(vec![AudioDevice::new("USB mic".to_string(), DeviceType::Input)])
+        };
+        let first = AudioDeviceMonitor::next_device_list(&mut pending, slow, Duration::from_millis(20)).await;
+        assert!(first.is_none(), "the check is skipped while enumeration is slow");
+        assert!(pending.is_some());
+
+        let started_again = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = started_again.clone();
+        let second = AudioDeviceMonitor::next_device_list(
+            &mut pending,
+            move || {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(Vec::new())
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        let names: Vec<String> = second.expect("the first enumeration's result").into_iter().map(|d| d.name).collect();
+        assert_eq!(names, vec!["USB mic"]);
+        assert!(!started_again.load(std::sync::atomic::Ordering::SeqCst), "no second enumeration thread");
+        assert!(pending.is_none());
     }
 }
